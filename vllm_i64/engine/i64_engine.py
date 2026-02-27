@@ -200,7 +200,13 @@ class I64Engine:
     ) -> int:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
-        request_id = self.scheduler.add_request(ids, max_new_tokens)
+
+        # Get EOS token ID from model config
+        eos_token_id = 0
+        if self.model is not None and hasattr(self.model, 'config'):
+            eos_token_id = getattr(self.model.config, 'eos_token_id', 0)
+
+        request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
 
         # Set deadline
         t = timeout_s if timeout_s is not None else self.default_timeout_s
@@ -299,18 +305,47 @@ class I64Engine:
         else:
             logits = torch.randn(batch.num_requests, self.vocab_size)
 
-        # 3. Sample (configurable)
+        # 3. Extract last-token logits per request (for prefill: many tokens → 1 logit)
+        if batch.tokens_per_request is not None and logits.shape[0] != batch.num_requests:
+            last_indices = []
+            offset = 0
+            for tpr in batch.tokens_per_request:
+                last_indices.append(offset + int(tpr) - 1)
+                offset += int(tpr)
+            logits = logits[last_indices]  # (num_requests, vocab_size)
+
+        # 3.5. Apply repetition penalty per request (using token history)
+        if self.sampling_params.repetition_penalty != 1.0:
+            penalty = self.sampling_params.repetition_penalty
+            for i, req_id in enumerate(batch.request_ids):
+                req = None
+                for r in self.scheduler.running:
+                    if r.request_id == int(req_id):
+                        req = r
+                        break
+                if req is not None:
+                    past = list(req.prompt_token_ids) + req.output_token_ids
+                    if past:
+                        past_tensor = torch.tensor(past, dtype=torch.long, device=logits.device).unique()
+                        row = logits[i]
+                        row[past_tensor] = torch.where(
+                            row[past_tensor] > 0,
+                            row[past_tensor] / penalty,
+                            row[past_tensor] * penalty,
+                        )
+
+        # 4. Sample (configurable)
         new_token_ids = self._i64_sample(logits)
 
-        # 4. Map back to requests (integer indexing)
+        # 5. Map back to requests (integer indexing)
         result = {}
         for i, req_id in enumerate(batch.request_ids):
             result[int(req_id)] = int(new_token_ids[i])
 
-        # 5. Update scheduler (i64)
+        # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)
 
-        # 6. Free KV slots for finished requests
+        # 7. Free KV slots for finished requests
         for req in self.scheduler.finished:
             self._free_slot(req.request_id)
 
@@ -392,7 +427,13 @@ class I64Engine:
 
             if req is not None:
                 elapsed = (time.perf_counter() - start) * 1000
-                finish_reason = getattr(req, "_finish_reason", "length")
+                # Determine finish reason
+                finish_reason = getattr(req, "_finish_reason", None)
+                if finish_reason is None:
+                    if req.output_token_ids and req.output_token_ids[-1] == req.eos_token_id:
+                        finish_reason = "stop"
+                    else:
+                        finish_reason = "length"
 
                 if self.metrics and metrics_start is not None:
                     self.metrics.on_request_end(
@@ -610,7 +651,12 @@ class AsyncI64Engine:
                         elapsed = (time.perf_counter() - self._request_times.pop(rid, 0)) * 1000
 
                         if isinstance(target, asyncio.Future) and not target.done():
-                            finish_reason = getattr(req, "_finish_reason", "length")
+                            finish_reason = getattr(req, "_finish_reason", None)
+                            if finish_reason is None:
+                                if req.output_token_ids and req.output_token_ids[-1] == req.eos_token_id:
+                                    finish_reason = "stop"
+                                else:
+                                    finish_reason = "length"
                             result = GenerationResult(
                                 request_id=rid,
                                 prompt_tokens=list(req.prompt_token_ids),

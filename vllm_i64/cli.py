@@ -50,9 +50,14 @@ def cmd_serve(args):
     dtype = dtype_map[args.dtype]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # CPU doesn't support FP16 natively — force float32
+    if device == "cpu" and dtype != torch.float32:
+        print(f"  [note] CPU detected — overriding dtype to float32 (FP16 not supported on CPU)")
+        dtype = torch.float32
+
     entry = get_model_entry(args.model)
     print(f"vllm-i64 :: serving {args.model}")
-    print(f"  host={args.host} port={args.port} dtype={args.dtype} device={device}")
+    print(f"  host={args.host} port={args.port} dtype={dtype} device={device}")
 
     # Load model
     model = load_model_by_name(args.model, dtype=dtype, device=device, checkpoint_override=args.checkpoint)
@@ -61,11 +66,23 @@ def cmd_serve(args):
     # Load tokenizer
     tokenizer = load_tokenizer(args.model)
 
-    # Load chat template
+    # Load chat template (explicit path or auto-detect from checkpoint dir)
     chat_template = None
     if args.chat_template:
         with open(args.chat_template) as f:
             chat_template = f.read()
+    else:
+        import os
+        ckpt_path = args.checkpoint or entry.checkpoint
+        if ckpt_path:
+            ckpt_dir = os.path.dirname(ckpt_path) if os.path.isfile(ckpt_path) else ckpt_path
+            for name in ("chat_template.jinja", "chat_template.j2"):
+                tmpl_path = os.path.join(ckpt_dir, name)
+                if os.path.exists(tmpl_path):
+                    with open(tmpl_path) as f:
+                        chat_template = f.read()
+                    print(f"  chat_template: {tmpl_path}")
+                    break
 
     # Create engine + server (async continuous batching)
     engine = I64Engine(

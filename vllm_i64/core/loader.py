@@ -180,7 +180,8 @@ def load_checkpoint(
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
 
-    loaded = set()
+    loaded = set()           # checkpoint keys that were loaded
+    loaded_params = set()    # model param names that received data
     skipped = set()
     missing = set()
 
@@ -221,6 +222,13 @@ def load_checkpoint(
         if name not in params:
             resolved_name = name.replace("model.", "", 1)
 
+        # TP-wrapped layers: checkpoint has "q_proj.weight" but model has
+        # "q_proj.linear.weight" (ColumnParallelLinear / RowParallelLinear)
+        if resolved_name not in params and resolved_name.endswith(".weight"):
+            tp_name = resolved_name[:-len(".weight")] + ".linear.weight"
+            if tp_name in params:
+                resolved_name = tp_name
+
         if resolved_name not in params:
             missing.add(name)
             continue
@@ -229,32 +237,45 @@ def load_checkpoint(
         parent_module = _get_module_for_param(model, resolved_name)
         param_leaf = resolved_name.split(".")[-1]
 
-        if isinstance(parent_module, ColumnParallelLinear) and param_leaf == "weight":
-            # Full weight → take TP shard
-            parent_module.load_full_weight(weight.to(dtype))
-            loaded.add(name)
+        # For TP-wrapped names like "q_proj.linear.weight", check the grandparent
+        tp_parent = None
+        if param_leaf == "weight" and ".linear.weight" in resolved_name:
+            gp_name = resolved_name.rsplit(".linear.weight", 1)[0] + ".dummy"
+            tp_parent = _get_module_for_param(model, gp_name)
 
-        elif isinstance(parent_module, RowParallelLinear) and param_leaf == "weight":
+        if isinstance(tp_parent or parent_module, ColumnParallelLinear) and param_leaf == "weight":
             # Full weight → take TP shard
-            parent_module.load_full_weight(weight.to(dtype))
+            tp_mod = tp_parent if isinstance(tp_parent, ColumnParallelLinear) else parent_module
+            tp_mod.load_full_weight(weight.to(dtype))
             loaded.add(name)
+            loaded_params.add(resolved_name)
+
+        elif isinstance(tp_parent or parent_module, RowParallelLinear) and param_leaf == "weight":
+            # Full weight → take TP shard
+            tp_mod = tp_parent if isinstance(tp_parent, RowParallelLinear) else parent_module
+            tp_mod.load_full_weight(weight.to(dtype))
+            loaded.add(name)
+            loaded_params.add(resolved_name)
 
         elif "gate_up_proj" in resolved_name and "mlp" in resolved_name:
             # Expert MLP gate_up — collect for paired sharding
             prefix = resolved_name.rsplit("gate_up_proj", 1)[0]
             expert_gate_up[prefix] = weight
             loaded.add(name)
+            loaded_params.add(resolved_name)
 
         elif "down_proj" in resolved_name and "mlp" in resolved_name:
             # Expert MLP down — collect for paired sharding
             prefix = resolved_name.rsplit("down_proj", 1)[0]
             expert_down[prefix] = weight
             loaded.add(name)
+            loaded_params.add(resolved_name)
 
         else:
             # Regular parameter (replicated) — direct copy
             params[resolved_name].data.copy_(weight.to(dtype))
             loaded.add(name)
+            loaded_params.add(resolved_name)
 
     # Load expert MLP weight pairs with TP sharding
     for prefix in expert_gate_up:
@@ -278,9 +299,7 @@ def load_checkpoint(
 
     # Check for unloaded model params
     model_params = set(params.keys())
-    unloaded = model_params - loaded
-    # Filter out params that don't need checkpoint (freshly initialized)
-    unloaded = {p for p in unloaded if "mu_router" not in p and "mu_to_" not in p}
+    unloaded = model_params - loaded_params
 
     stats = {
         "loaded": len(loaded),

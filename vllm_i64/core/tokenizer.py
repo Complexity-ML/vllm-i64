@@ -29,8 +29,13 @@ class I64Tokenizer:
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
 
     def encode(self, text: str) -> List[int]:
-        """Text → i64 token IDs."""
-        return self.tokenizer.encode(text).ids
+        """Text → i64 token IDs. Strips trailing EOS (not part of prompt)."""
+        ids = self.tokenizer.encode(text).ids
+        # Strip trailing EOS — the model should not see EOS in the input prompt
+        eos = self.eos_token_id
+        if ids and ids[-1] == eos:
+            ids = ids[:-1]
+        return ids
 
     def decode(self, token_ids: List[int]) -> str:
         """i64 token IDs → text."""

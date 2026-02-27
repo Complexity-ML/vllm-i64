@@ -185,7 +185,7 @@ class TestI64Engine:
         )
 
         assert isinstance(result.request_id, int)
-        assert len(result.output_tokens) == 10
+        assert len(result.output_tokens) <= 10
         assert all(isinstance(t, int) for t in result.output_tokens)
 
     def test_stats_all_integer(self):

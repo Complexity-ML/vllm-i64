@@ -131,6 +131,13 @@ def naive_varlen_attention(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
+    # Align dtypes (CPU ops may upcast q to float32 while k/v stay fp16)
+    compute_dtype = q.dtype
+    if k.dtype != compute_dtype:
+        k = k.to(compute_dtype)
+    if v.dtype != compute_dtype:
+        v = v.to(compute_dtype)
+
     outputs = []
     offset = 0
 
@@ -183,6 +190,13 @@ def naive_cached_attention(
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
     n = q.shape[0]
+
+    # Align dtypes (CPU ops may upcast q to float32 while cache stays fp16)
+    compute_dtype = q.dtype
+    if k_full.dtype != compute_dtype:
+        k_full = k_full.to(compute_dtype)
+    if v_full.dtype != compute_dtype:
+        v_full = v_full.to(compute_dtype)
 
     # GQA expand
     if num_kv_groups > 1:

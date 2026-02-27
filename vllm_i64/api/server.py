@@ -38,10 +38,10 @@ logger = get_logger("vllm_i64.server")
 class CompletionRequest:
     prompt: str
     max_tokens: int = 256
-    temperature: float = 1.0
+    temperature: float = 0.8
     top_k: int = 50
-    top_p: float = 1.0
-    repetition_penalty: float = 1.0
+    top_p: float = 0.9
+    repetition_penalty: float = 1.1
     stream: bool = False
     # Structured output
     response_format: Optional[Dict] = None  # {"type": "json_object"} or {"type": "regex", "pattern": "..."}
@@ -133,7 +133,11 @@ class I64Server:
         if self.chat_template:
             from jinja2 import Template
             tmpl = Template(self.chat_template)
-            return tmpl.render(messages=messages, add_generation_prompt=True)
+            prompt = tmpl.render(messages=messages, add_generation_prompt=True)
+            # Ensure generation prompt is appended (template may not handle add_generation_prompt)
+            if not prompt.rstrip().endswith("Assistant:"):
+                prompt = prompt.rstrip("\n") + "\nAssistant:"
+            return prompt
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -154,7 +158,7 @@ class I64Server:
             choices=[{
                 "text": output_text,
                 "index": 0,
-                "finish_reason": "length",
+                "finish_reason": result.finish_reason,
                 "usage": {
                     "prompt_tokens": len(prompt_ids),
                     "completion_tokens": len(result.output_tokens),
@@ -241,13 +245,19 @@ class I64Server:
                 status=400,
             )
 
+        # Wrap raw prompt in chat template if model is chat-trained
+        if self.chat_template:
+            prompt = self._apply_chat_template([
+                {"role": "user", "content": prompt},
+            ])
+
         req = CompletionRequest(
             prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
-            temperature=body.get("temperature", 1.0),
+            temperature=body.get("temperature", 0.8),
             top_k=body.get("top_k", 50),
-            top_p=body.get("top_p", 1.0),
-            repetition_penalty=body.get("repetition_penalty", 1.0),
+            top_p=body.get("top_p", 0.9),
+            repetition_penalty=body.get("repetition_penalty", 1.1),
             stream=body.get("stream", False),
             response_format=body.get("response_format"),
             stop=body.get("stop"),
@@ -287,9 +297,10 @@ class I64Server:
         req = CompletionRequest(
             prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
-            temperature=body.get("temperature", 1.0),
+            temperature=body.get("temperature", 0.8),
             top_k=body.get("top_k", 50),
-            top_p=body.get("top_p", 1.0),
+            top_p=body.get("top_p", 0.9),
+            repetition_penalty=body.get("repetition_penalty", 1.1),
             stream=body.get("stream", False),
         )
 
@@ -305,10 +316,11 @@ class I64Server:
         result_dict = result.to_dict()
         if result_dict["choices"]:
             text = result_dict["choices"][0]["text"]
+            finish_reason = result_dict["choices"][0].get("finish_reason", "length")
             result_dict["choices"][0] = {
                 "message": {"role": "assistant", "content": text},
                 "index": 0,
-                "finish_reason": "length",
+                "finish_reason": finish_reason,
             }
         result_dict["object"] = "chat.completion"
         return web.json_response(result_dict)

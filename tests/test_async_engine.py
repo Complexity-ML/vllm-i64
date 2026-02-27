@@ -40,7 +40,7 @@ async def test_single_request():
     )
 
     assert isinstance(result, GenerationResult)
-    assert len(result.output_tokens) == 10
+    assert len(result.output_tokens) <= 10
     assert result.request_id >= 0
     print(f"  single request: {len(result.output_tokens)} tokens, {result.elapsed_ms:.1f}ms")
 
@@ -82,7 +82,7 @@ async def test_parallel_requests():
     assert len(results) == num_requests
     for i, r in enumerate(results):
         assert isinstance(r, GenerationResult)
-        assert len(r.output_tokens) == max_tokens, f"Request {i}: expected {max_tokens} tokens, got {len(r.output_tokens)}"
+        assert len(r.output_tokens) <= max_tokens, f"Request {i}: expected <= {max_tokens} tokens, got {len(r.output_tokens)}"
 
     # Peak batch size should be > 1 (requests were batched)
     stats = engine.get_stats()
@@ -117,7 +117,7 @@ async def test_streaming():
     ):
         tokens.append(token_id)
 
-    assert len(tokens) == 15
+    assert len(tokens) <= 15
     print(f"  streaming: received {len(tokens)} tokens one by one")
 
     await engine.stop()
@@ -152,10 +152,10 @@ async def test_mixed_parallel_streaming():
     )
     elapsed = time.perf_counter() - start
 
-    assert len(r1.output_tokens) == 10
-    assert len(r2.output_tokens) == 10
-    assert len(s1) == 10
-    assert len(s2) == 10
+    assert len(r1.output_tokens) <= 10
+    assert len(r2.output_tokens) <= 10
+    assert len(s1) <= 10
+    assert len(s2) <= 10
 
     stats = engine.get_stats()
     print(f"  mixed parallel: 2 regular + 2 streaming in {elapsed*1000:.1f}ms")

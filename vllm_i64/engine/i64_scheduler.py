@@ -76,9 +76,17 @@ class I64Request:
     def total_tokens(self) -> int:
         return self.num_prompt_tokens + self.num_generated
 
+    # EOS token ID (set by engine when adding request)
+    eos_token_id: int = 0
+
     @property
     def is_finished(self) -> bool:
-        return self.num_generated >= self.max_new_tokens
+        if self.num_generated >= self.max_new_tokens:
+            return True
+        # Stop on EOS token
+        if self.output_token_ids and self.output_token_ids[-1] == self.eos_token_id:
+            return True
+        return False
 
     @property
     def prefill_complete(self) -> bool:
@@ -178,10 +186,12 @@ class I64Scheduler:
         prompt_token_ids: np.ndarray,
         max_new_tokens: int = 256,
         priority: int = 0,
+        eos_token_id: int = 0,
     ) -> int:
         """
         Add a new request. Returns integer request_id.
         priority: integer, lower = higher priority (0 = normal, -1 = high, 1 = low)
+        eos_token_id: integer, token ID that signals end of sequence
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -192,6 +202,7 @@ class I64Scheduler:
             max_new_tokens=max_new_tokens,
             priority=priority,
             arrival_step=self.step_counter,
+            eos_token_id=eos_token_id,
         )
         self.pending.append(req)
         # Sort pending by priority, then arrival order (stable sort)

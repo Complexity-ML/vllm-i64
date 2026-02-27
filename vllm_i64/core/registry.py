@@ -113,18 +113,18 @@ register_model(
     name="pacific-prime-chat",
     model_class="vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
     config_loader="vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",
-    config_path="checkpoints/pacific-prime-chat/config.json",
-    checkpoint="checkpoints/pacific-prime-chat/checkpoint_epoch360.pt",
-    parameters="~1.47B",
-    description="Complexity Deep v0.13.0 chat fine-tune",
+    config_path="checkpoints/pacific-prime-chat/converted/fp16/config.json",
+    checkpoint="checkpoints/pacific-prime-chat/converted/fp16",
+    parameters="~1.58B",
+    description="Complexity Deep v0.13.0 chat fine-tune (FP16 safetensors)",
 )
 
 register_model(
     name="pacific-prime-python",
     model_class="vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
     config_loader="vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",
-    config_path="checkpoints/pacific-prime-python/config.json",
-    checkpoint="checkpoints/pacific-prime-python/",
-    parameters="~1.47B",
-    description="Complexity Deep v0.13.0 python fine-tune",
+    config_path="checkpoints/pacific-prime-python/converted/fp16/config.json",
+    checkpoint="checkpoints/pacific-prime-python/converted/fp16",
+    parameters="~1.58B",
+    description="Complexity Deep v0.13.0 python fine-tune (FP16 safetensors)",
 )
