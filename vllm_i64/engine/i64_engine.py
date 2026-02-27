@@ -327,12 +327,16 @@ class I64Engine:
                     past = list(req.prompt_token_ids) + req.output_token_ids
                     if past:
                         past_tensor = torch.tensor(past, dtype=torch.long, device=logits.device).unique()
-                        row = logits[i]
-                        row[past_tensor] = torch.where(
-                            row[past_tensor] > 0,
-                            row[past_tensor] / penalty,
-                            row[past_tensor] * penalty,
-                        )
+                        # Filter out-of-range token IDs (test models may have small vocab)
+                        vocab_size = logits.shape[-1]
+                        past_tensor = past_tensor[past_tensor < vocab_size]
+                        if past_tensor.numel() > 0:
+                            row = logits[i]
+                            row[past_tensor] = torch.where(
+                                row[past_tensor] > 0,
+                                row[past_tensor] / penalty,
+                                row[past_tensor] * penalty,
+                            )
 
         # 4. Sample (configurable)
         new_token_ids = self._i64_sample(logits)
