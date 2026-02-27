@@ -265,16 +265,23 @@ class I64Server:
             best_of=body.get("best_of", 1),
         )
 
-        if req.stream:
-            response = web.StreamResponse()
-            response.content_type = "text/event-stream"
-            await response.prepare(request)
-            async for chunk in self._async_stream(req):
-                await response.write(chunk.encode())
-            return response
+        try:
+            if req.stream:
+                response = web.StreamResponse()
+                response.content_type = "text/event-stream"
+                await response.prepare(request)
+                async for chunk in self._async_stream(req):
+                    await response.write(chunk.encode())
+                return response
 
-        result = await self._async_complete(req)
-        return web.json_response(result.to_dict())
+            result = await self._async_complete(req)
+            return web.json_response(result.to_dict())
+        except Exception as e:
+            logger.error(f"Completion error: {e}", exc_info=True)
+            return web.json_response(
+                {"error": {"message": str(e), "type": "server_error"}},
+                status=500,
+            )
 
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — async continuous batching."""
@@ -304,26 +311,33 @@ class I64Server:
             stream=body.get("stream", False),
         )
 
-        if req.stream:
-            response = web.StreamResponse()
-            response.content_type = "text/event-stream"
-            await response.prepare(request)
-            async for chunk in self._async_stream(req):
-                await response.write(chunk.encode())
-            return response
+        try:
+            if req.stream:
+                response = web.StreamResponse()
+                response.content_type = "text/event-stream"
+                await response.prepare(request)
+                async for chunk in self._async_stream(req):
+                    await response.write(chunk.encode())
+                return response
 
-        result = await self._async_complete(req)
-        result_dict = result.to_dict()
-        if result_dict["choices"]:
-            text = result_dict["choices"][0]["text"]
-            finish_reason = result_dict["choices"][0].get("finish_reason", "length")
-            result_dict["choices"][0] = {
-                "message": {"role": "assistant", "content": text},
-                "index": 0,
-                "finish_reason": finish_reason,
-            }
-        result_dict["object"] = "chat.completion"
-        return web.json_response(result_dict)
+            result = await self._async_complete(req)
+            result_dict = result.to_dict()
+            if result_dict["choices"]:
+                text = result_dict["choices"][0]["text"]
+                finish_reason = result_dict["choices"][0].get("finish_reason", "length")
+                result_dict["choices"][0] = {
+                    "message": {"role": "assistant", "content": text},
+                    "index": 0,
+                    "finish_reason": finish_reason,
+                }
+            result_dict["object"] = "chat.completion"
+            return web.json_response(result_dict)
+        except Exception as e:
+            logger.error(f"Chat completion error: {e}", exc_info=True)
+            return web.json_response(
+                {"error": {"message": str(e), "type": "server_error"}},
+                status=500,
+            )
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health — includes async engine stats."""

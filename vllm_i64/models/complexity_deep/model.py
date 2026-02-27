@@ -363,6 +363,9 @@ class MuGuidedAttention(nn.Module):
             offset += n
 
         out = torch.cat(outputs, dim=0)
+        # Ensure dtype matches o_proj weights (attention ops may upcast to float32)
+        if out.dtype != self.o_proj.linear.weight.dtype:
+            out = out.to(self.o_proj.linear.weight.dtype)
         return self.o_proj(out)
 
 

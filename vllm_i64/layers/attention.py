@@ -211,11 +211,12 @@ def naive_cached_attention(
 
     if n > 1:
         total = k_full.shape[0]
-        q_pos = positions.unsqueeze(1).float()
-        k_pos = torch.arange(total, device=q.device, dtype=torch.float32).unsqueeze(0)
-        causal = torch.where(k_pos <= q_pos, 0.0, float('-inf'))
+        q_pos = positions.unsqueeze(1).to(compute_dtype)
+        k_pos = torch.arange(total, device=q.device, dtype=compute_dtype).unsqueeze(0)
+        causal = torch.where(k_pos <= q_pos, torch.zeros(1, device=q.device, dtype=compute_dtype),
+                             torch.tensor(float('-inf'), device=q.device, dtype=compute_dtype))
         attn = attn + causal.unsqueeze(0)
 
-    attn = F.softmax(attn, dim=-1)
+    attn = F.softmax(attn, dim=-1, dtype=compute_dtype)
     out = torch.bmm(attn, v_t)   # (num_heads, n, head_dim)
     return out.transpose(0, 1)    # (n, num_heads, head_dim)
