@@ -1,7 +1,10 @@
 """
 Model implementations for vllm-i64.
-Token-routed models with pre-computed i64 expert routing.
-"""
 
-from vllm_i64.models.token_routed_model import TokenRoutedModel, TokenRoutedConfig
-from vllm_i64.models.model_registry import get_model, list_models, MODEL_CONFIGS
+Each model has its own subdirectory:
+  models/complexity_deep/    → Complexity Deep (Pacific-Prime)
+  models/your_model/         → add yours here
+
+Generic layers are in layers/ (not here).
+Registry is in registry.py (not here).
+"""
