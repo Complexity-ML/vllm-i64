@@ -27,8 +27,15 @@ class RotaryEmbedding(nn.Module):
 
 
 def apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary embedding to x.
+    x:   (batch, heads, head_dim)
+    cos: (batch, head_dim)  — from RotaryEmbedding.forward()
+    sin: (batch, head_dim)
+    """
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]
-    cos = cos.unsqueeze(1)
-    sin = sin.unsqueeze(1)
+    # cos/sin are (batch, head_dim) = (batch, 2*d), take first half
+    cos = cos[..., :d].unsqueeze(1)  # (batch, 1, d)
+    sin = sin[..., :d].unsqueeze(1)  # (batch, 1, d)
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
