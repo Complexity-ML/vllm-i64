@@ -362,8 +362,14 @@ def load_model_by_name(
     config_module = importlib.import_module(config_module_path)
     config_cls = getattr(config_module, config_class_name)
 
-    # Load config
-    config = config_cls.from_json(entry.config_path)
+    # Load config — use checkpoint dir's config.json if override provided
+    config_path = entry.config_path
+    if checkpoint_override:
+        import os
+        override_config = os.path.join(checkpoint_override, "config.json")
+        if os.path.exists(override_config):
+            config_path = override_config
+    config = config_cls.from_json(config_path)
 
     # Create model — TP layers auto-detect tp_size from global state
     model = model_cls(config)

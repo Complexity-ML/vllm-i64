@@ -63,8 +63,17 @@ def cmd_serve(args):
     model = load_model_by_name(args.model, dtype=dtype, device=device, checkpoint_override=args.checkpoint)
     model.eval()
 
-    # Load tokenizer
-    tokenizer = load_tokenizer(args.model)
+    # Load tokenizer (from checkpoint dir if overridden)
+    tokenizer = None
+    if args.checkpoint:
+        import os
+        tok_path = os.path.join(args.checkpoint, "tokenizer.json")
+        if os.path.exists(tok_path):
+            from vllm_i64.core.tokenizer import I64Tokenizer
+            tokenizer = I64Tokenizer(tok_path)
+            print(f"  tokenizer: {tok_path}")
+    if tokenizer is None:
+        tokenizer = load_tokenizer(args.model)
 
     # Load chat template (explicit path or auto-detect from checkpoint dir)
     chat_template = None
