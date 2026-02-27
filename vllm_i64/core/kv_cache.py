@@ -14,7 +14,8 @@ INL - 2025
 """
 
 import torch
-from typing import Optional, Tuple, List
+import hashlib
+from typing import Optional, Tuple, List, Dict, Set
 
 
 class PagedKVCache:
@@ -104,16 +105,6 @@ class PagedKVCache:
 
         return allocated
 
-    def free_sequence(self, seq_id: int):
-        """Free all blocks for a sequence. Pure integer operation."""
-        blocks = self.block_table[seq_id]
-        for i in range(blocks.shape[0]):
-            block_id = blocks[i].item()
-            if block_id >= 0:
-                self.free_blocks.append(block_id)
-                blocks[i] = -1
-
-        self.seq_lens[seq_id] = 0
 
     def write_kv(
         self,
@@ -213,12 +204,124 @@ class PagedKVCache:
         """Get current sequence lengths. Returns (num_seqs,) int32."""
         return self.seq_lens[seq_ids]
 
+    # =====================================================================
+    # Prefix Caching — reuse KV blocks across requests with same prefix
+    # =====================================================================
+
+    def enable_prefix_caching(self):
+        """Enable prefix caching for this cache instance."""
+        self._prefix_cache_enabled = True
+        # Maps prefix_hash → list of (physical_block_id, layer_idx) that hold this prefix
+        self._prefix_hash_to_blocks: Dict[int, List[int]] = {}
+        # Maps physical_block_id → prefix_hash (for refcounting)
+        self._block_to_prefix: Dict[int, int] = {}
+        # Reference count per prefix hash
+        self._prefix_refcount: Dict[int, int] = {}
+
+    @property
+    def prefix_cache_enabled(self) -> bool:
+        return getattr(self, "_prefix_cache_enabled", False)
+
+    @staticmethod
+    def _hash_token_block(token_ids: List[int]) -> int:
+        """Hash a block of token IDs for prefix matching."""
+        h = hashlib.sha256()
+        for tid in token_ids:
+            h.update(tid.to_bytes(8, "little", signed=True))
+        return int.from_bytes(h.digest()[:8], "little")
+
+    def try_reuse_prefix(
+        self, seq_id: int, token_ids: List[int]
+    ) -> int:
+        """
+        Try to reuse cached prefix blocks for a new sequence.
+
+        Returns the number of prefix tokens that were reused (always a
+        multiple of block_size). The caller can skip computing attention
+        for these positions.
+        """
+        if not self.prefix_cache_enabled:
+            return 0
+
+        reused = 0
+        num_full_blocks = len(token_ids) // self.block_size
+
+        for block_idx in range(num_full_blocks):
+            start = block_idx * self.block_size
+            end = start + self.block_size
+            block_tokens = token_ids[start:end]
+            prefix_hash = self._hash_token_block(block_tokens)
+
+            if prefix_hash in self._prefix_hash_to_blocks:
+                # Reuse: point this seq's block table to existing physical block
+                physical_block = self._prefix_hash_to_blocks[prefix_hash][0]
+                self.block_table[seq_id, block_idx] = physical_block
+                self._prefix_refcount[prefix_hash] = self._prefix_refcount.get(prefix_hash, 1) + 1
+                reused += self.block_size
+            else:
+                break  # Can't skip non-contiguous blocks
+
+        if reused > 0:
+            self.seq_lens[seq_id] = reused
+
+        return reused
+
+    def register_prefix_blocks(self, seq_id: int, token_ids: List[int]):
+        """
+        After computing a full prefill, register the resulting KV blocks
+        as reusable prefix blocks for future requests.
+        """
+        if not self.prefix_cache_enabled:
+            return
+
+        num_full_blocks = len(token_ids) // self.block_size
+
+        for block_idx in range(num_full_blocks):
+            start = block_idx * self.block_size
+            end = start + self.block_size
+            block_tokens = token_ids[start:end]
+            prefix_hash = self._hash_token_block(block_tokens)
+
+            physical_block = self.block_table[seq_id, block_idx].item()
+            if physical_block >= 0 and prefix_hash not in self._prefix_hash_to_blocks:
+                self._prefix_hash_to_blocks[prefix_hash] = [physical_block]
+                self._block_to_prefix[physical_block] = prefix_hash
+                self._prefix_refcount[prefix_hash] = 1
+
+    def free_sequence(self, seq_id: int):
+        """Free all blocks for a sequence. Respects prefix cache refcounts."""
+        blocks = self.block_table[seq_id]
+        for i in range(blocks.shape[0]):
+            block_id = blocks[i].item()
+            if block_id >= 0:
+                # Check if this block is a shared prefix block
+                prefix_hash = getattr(self, "_block_to_prefix", {}).get(block_id)
+                if prefix_hash is not None:
+                    rc = self._prefix_refcount.get(prefix_hash, 1) - 1
+                    if rc <= 0:
+                        # Last user — free the block
+                        self._prefix_hash_to_blocks.pop(prefix_hash, None)
+                        self._block_to_prefix.pop(block_id, None)
+                        self._prefix_refcount.pop(prefix_hash, None)
+                        self.free_blocks.append(block_id)
+                    else:
+                        self._prefix_refcount[prefix_hash] = rc
+                else:
+                    self.free_blocks.append(block_id)
+                blocks[i] = -1
+
+        self.seq_lens[seq_id] = 0
+
     def get_stats(self) -> dict:
         """Cache stats — all integers."""
-        return {
+        stats = {
             "num_blocks": self.num_blocks,
             "used_blocks": self.num_used_blocks,
             "free_blocks": self.num_free_blocks,
             "block_size": self.block_size,
             "active_seqs": int((self.seq_lens > 0).sum().item()),
         }
+        if self.prefix_cache_enabled:
+            stats["prefix_cached_blocks"] = len(getattr(self, "_block_to_prefix", {}))
+            stats["prefix_unique_hashes"] = len(getattr(self, "_prefix_hash_to_blocks", {}))
+        return stats

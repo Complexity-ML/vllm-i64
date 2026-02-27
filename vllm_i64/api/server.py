@@ -21,6 +21,7 @@ INL - 2025
 import json
 import time
 import asyncio
+import signal
 from typing import Optional, List, Dict, AsyncGenerator
 from dataclasses import dataclass, asdict
 
@@ -28,6 +29,9 @@ from aiohttp import web
 
 from vllm_i64.engine.i64_engine import I64Engine, AsyncI64Engine, GenerationResult
 from vllm_i64.core.sampling import SamplingParams
+from vllm_i64.core.logging import get_logger
+
+logger = get_logger("vllm_i64.server")
 
 
 @dataclass
@@ -39,6 +43,12 @@ class CompletionRequest:
     top_p: float = 1.0
     repetition_penalty: float = 1.0
     stream: bool = False
+    # Structured output
+    response_format: Optional[Dict] = None  # {"type": "json_object"} or {"type": "regex", "pattern": "..."}
+    stop: Optional[list] = None  # Stop sequences (strings)
+    # Beam search
+    n: int = 1
+    best_of: int = 1
 
     def to_sampling_params(self) -> SamplingParams:
         """Convert API request to engine sampling params."""
@@ -47,6 +57,8 @@ class CompletionRequest:
             top_k=self.top_k,
             top_p=self.top_p,
             repetition_penalty=self.repetition_penalty,
+            json_mode=bool(self.response_format and self.response_format.get("type") == "json_object"),
+            num_beams=self.best_of if self.best_of > 1 else 1,
         )
 
 
@@ -92,6 +104,7 @@ class I64Server:
         self.async_engine._request_times = {}
         self.async_engine._engine_task = None
         self.async_engine._running = False
+        self.async_engine._draining = False
         self.async_engine.active_requests = 0
         self.async_engine.peak_batch_size = 0
 
@@ -236,6 +249,10 @@ class I64Server:
             top_p=body.get("top_p", 1.0),
             repetition_penalty=body.get("repetition_penalty", 1.0),
             stream=body.get("stream", False),
+            response_format=body.get("response_format"),
+            stop=body.get("stop"),
+            n=body.get("n", 1),
+            best_of=body.get("best_of", 1),
         )
 
         if req.stream:
@@ -333,19 +350,25 @@ class I64Server:
     async def _on_startup(self, app):
         """Start the async engine loop when server starts."""
         await self.async_engine.start()
-        print(f"  engine: continuous batching started")
+        logger.info("Engine started: continuous batching active")
 
     async def _on_cleanup(self, app):
-        """Stop the async engine loop when server shuts down."""
-        await self.async_engine.stop()
+        """Graceful shutdown: drain active requests, then stop engine."""
+        logger.info("Server cleanup: draining requests...")
+        await self.async_engine.stop(drain_timeout=30.0)
+        logger.info("Server cleanup complete")
 
     def run(self):
-        """Start the server with async continuous batching."""
-        print(f"vllm-i64 :: {self.model_name}")
-        print(f"  http://{self.host}:{self.port}")
-        print(f"  POST /v1/completions")
-        print(f"  POST /v1/chat/completions")
-        print(f"  GET  /health")
-        print(f"  mode: async continuous batching")
+        """Start the server with async continuous batching and graceful shutdown."""
+        logger.info(f"vllm-i64 :: {self.model_name}")
+        logger.info(f"  http://{self.host}:{self.port}")
+        logger.info(f"  POST /v1/completions | POST /v1/chat/completions | GET /health")
+        logger.info(f"  mode: async continuous batching")
         app = self.create_app()
+
+        # Graceful shutdown on SIGTERM/SIGINT
+        async def _shutdown_handler(app):
+            logger.info("Received shutdown signal")
+
+        app.on_shutdown.append(_shutdown_handler)
         web.run_app(app, host=self.host, port=self.port, print=None)

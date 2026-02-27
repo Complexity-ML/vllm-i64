@@ -28,11 +28,15 @@ import torch
 import numpy as np
 import time
 import asyncio
-from typing import List, Dict, Optional, Callable
-from dataclasses import dataclass
+import signal
+from typing import List, Dict, Optional, Callable, Set
+from dataclasses import dataclass, field
 
 from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
 from vllm_i64.core.sampling import SamplingParams, sample_batch
+from vllm_i64.core.logging import get_logger
+
+logger = get_logger("vllm_i64.engine")
 
 
 @dataclass
@@ -43,6 +47,7 @@ class GenerationResult:
     output_tokens: List[int]
     num_steps: int
     elapsed_ms: float   # Only float for human-readable timing
+    finish_reason: str = "length"  # "length", "stop", "timeout", "cancelled"
 
 
 class I64Engine:
@@ -110,6 +115,11 @@ class I64Engine:
 
         # === Speculative Decoding ===
         self.speculative_decoder = None
+
+        # === Request management ===
+        self._cancelled_requests: Set[int] = set()
+        self._request_deadlines: Dict[int, float] = {}  # request_id → deadline timestamp
+        self.default_timeout_s: float = 300.0  # 5 min default
 
         # === Metrics ===
         self.metrics = None
@@ -186,16 +196,26 @@ class I64Engine:
         self,
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
+        timeout_s: Optional[float] = None,
     ) -> int:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
         request_id = self.scheduler.add_request(ids, max_new_tokens)
+
+        # Set deadline
+        t = timeout_s if timeout_s is not None else self.default_timeout_s
+        if t > 0:
+            self._request_deadlines[request_id] = time.perf_counter() + t
 
         # Allocate KV cache slot
         if self.kv_cache is not None:
             self._allocate_slot(request_id)
 
         return request_id
+
+    def cancel_request(self, request_id: int):
+        """Cancel a running or pending request."""
+        self._cancelled_requests.add(request_id)
 
     def _i64_sample(self, logits: torch.Tensor) -> np.ndarray:
         """
@@ -204,12 +224,62 @@ class I64Engine:
         token_ids = sample_batch(logits, self.sampling_params)
         return token_ids.cpu().numpy().astype(np.int64)
 
+    def _check_timeouts_and_cancellations(self):
+        """Remove timed-out and cancelled requests from scheduler."""
+        now = time.perf_counter()
+        to_remove = set()
+
+        # Check cancellations
+        for req in self.scheduler.running + self.scheduler.pending:
+            if req.request_id in self._cancelled_requests:
+                to_remove.add(req.request_id)
+
+        # Check timeouts
+        for req in self.scheduler.running:
+            deadline = self._request_deadlines.get(req.request_id)
+            if deadline and now > deadline:
+                to_remove.add(req.request_id)
+                logger.warning(f"Request {req.request_id} timed out")
+
+        # Move to finished with appropriate reason
+        for rid in to_remove:
+            for req in self.scheduler.running[:]:
+                if req.request_id == rid:
+                    req.status = 3  # FINISHED
+                    reason = "cancelled" if rid in self._cancelled_requests else "timeout"
+                    req._finish_reason = reason
+                    self.scheduler.running.remove(req)
+                    self._free_kv_blocks_for(req)
+                    self.scheduler.finished.append(req)
+                    self._free_slot(req.request_id)
+                    break
+            for req in self.scheduler.pending[:]:
+                if req.request_id == rid:
+                    self.scheduler.pending.remove(req)
+                    req.status = 3
+                    req._finish_reason = "cancelled"
+                    self.scheduler.finished.append(req)
+                    break
+
+        self._cancelled_requests -= to_remove
+        for rid in to_remove:
+            self._request_deadlines.pop(rid, None)
+
+    def _free_kv_blocks_for(self, req):
+        """Free KV blocks owned by a request."""
+        if req.kv_block_ids:
+            self.scheduler._free_kv_blocks(req.kv_block_ids)
+            req.kv_block_ids = []
+
     def step(self) -> Dict[int, int]:
         """
         Execute one engine step.
 
         Returns {request_id: generated_token_id} — all integers.
         """
+        # 0. Handle timeouts and cancellations
+        self._check_timeouts_and_cancellations()
+
         # 1. Schedule (i64)
         batch = self.scheduler.schedule()
         if batch is None:
@@ -322,6 +392,7 @@ class I64Engine:
 
             if req is not None:
                 elapsed = (time.perf_counter() - start) * 1000
+                finish_reason = getattr(req, "_finish_reason", "length")
 
                 if self.metrics and metrics_start is not None:
                     self.metrics.on_request_end(
@@ -336,6 +407,7 @@ class I64Engine:
                     output_tokens=req.output_token_ids,
                     num_steps=steps,
                     elapsed_ms=elapsed,
+                    finish_reason=finish_reason,
                 )
 
     def run_continuous(self, callback: Optional[Callable] = None):
@@ -401,6 +473,7 @@ class AsyncI64Engine:
         self._request_times: Dict[int, float] = {}
         self._engine_task: Optional[asyncio.Task] = None
         self._running = False
+        self._draining = False
 
         # Stats
         self.active_requests: int = 0
@@ -411,8 +484,30 @@ class AsyncI64Engine:
         self._running = True
         self._engine_task = asyncio.create_task(self._engine_loop())
 
-    async def stop(self):
-        """Stop the engine loop."""
+    async def stop(self, drain_timeout: float = 30.0):
+        """
+        Graceful shutdown: drain active requests before stopping.
+
+        Args:
+            drain_timeout: max seconds to wait for in-flight requests
+        """
+        logger.info(f"Engine shutdown requested, draining {self.active_requests} requests...")
+        self._draining = True
+
+        # Wait for in-flight requests to finish
+        deadline = time.perf_counter() + drain_timeout
+        while self.active_requests > 0 and time.perf_counter() < deadline:
+            await asyncio.sleep(0.05)
+
+        if self.active_requests > 0:
+            logger.warning(f"Drain timeout: {self.active_requests} requests still active, cancelling")
+            # Cancel remaining futures
+            for rid, target in list(self._pending_futures.items()):
+                if isinstance(target, asyncio.Future) and not target.done():
+                    target.cancel()
+                elif isinstance(target, asyncio.Queue):
+                    await target.put(None)
+
         self._running = False
         if self._engine_task:
             self._engine_task.cancel()
@@ -420,12 +515,18 @@ class AsyncI64Engine:
                 await self._engine_task
             except asyncio.CancelledError:
                 pass
+        logger.info("Engine stopped")
+
+    async def cancel_request(self, request_id: int):
+        """Cancel a running request."""
+        self.engine.cancel_request(request_id)
 
     async def generate(
         self,
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
         sampling_params: Optional[SamplingParams] = None,
+        timeout_s: Optional[float] = None,
     ) -> GenerationResult:
         """
         Submit a request and wait for completion.
@@ -433,6 +534,9 @@ class AsyncI64Engine:
         Multiple concurrent calls are automatically batched together
         by the engine loop for maximum throughput.
         """
+        if self._draining:
+            raise RuntimeError("Engine is shutting down, not accepting new requests")
+
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
@@ -440,7 +544,7 @@ class AsyncI64Engine:
         if sampling_params is not None:
             self.engine.sampling_params = sampling_params
 
-        request_id = self.engine.add_request(prompt_token_ids, max_new_tokens)
+        request_id = self.engine.add_request(prompt_token_ids, max_new_tokens, timeout_s=timeout_s)
         self._pending_futures[request_id] = future
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1
@@ -506,12 +610,14 @@ class AsyncI64Engine:
                         elapsed = (time.perf_counter() - self._request_times.pop(rid, 0)) * 1000
 
                         if isinstance(target, asyncio.Future) and not target.done():
+                            finish_reason = getattr(req, "_finish_reason", "length")
                             result = GenerationResult(
                                 request_id=rid,
                                 prompt_tokens=list(req.prompt_token_ids),
                                 output_tokens=req.output_token_ids,
                                 num_steps=req.num_generated,
                                 elapsed_ms=elapsed,
+                                finish_reason=finish_reason,
                             )
                             target.set_result(result)
                         elif isinstance(target, asyncio.Queue):

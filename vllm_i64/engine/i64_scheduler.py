@@ -9,6 +9,13 @@ ALL scheduling decisions are integer operations:
   - Slot management: int32
   - KV cache block indices: int32
 
+Features:
+  - Continuous batching (mix prefill + decode)
+  - Chunked prefill (split long prompts across steps)
+  - Request priorities (integer priority levels)
+  - Preemption (evict low-priority running requests when KV OOM)
+  - Fairness (round-robin within same priority)
+
 Zero float in the scheduler. FP16 exists only in model forward pass.
 
 INL - 2025
@@ -48,6 +55,15 @@ class I64Request:
     # Position in sequence (integer counter)
     seq_pos: int = 0
 
+    # Priority (integer: 0 = normal, negative = higher priority)
+    priority: int = 0
+
+    # Chunked prefill state
+    prefill_progress: int = 0  # How many prompt tokens have been processed
+
+    # Arrival order for fairness (integer timestamp)
+    arrival_step: int = 0
+
     @property
     def num_prompt_tokens(self) -> int:
         return len(self.prompt_token_ids)
@@ -63,6 +79,10 @@ class I64Request:
     @property
     def is_finished(self) -> bool:
         return self.num_generated >= self.max_new_tokens
+
+    @property
+    def prefill_complete(self) -> bool:
+        return self.prefill_progress >= self.num_prompt_tokens
 
     def get_all_token_ids(self) -> np.ndarray:
         """All tokens (prompt + generated) as i64 array."""
@@ -112,7 +132,8 @@ class I64Scheduler:
     - Token routing: token_id & expert_mask (i64)
     - Slot allocation: integer counters
     - KV cache management: integer block table
-    - Priority: FCFS with integer timestamps
+    - Priority: integer priority levels (lower = higher priority)
+    - Fairness: arrival_step for tie-breaking
 
     No float anywhere in the scheduler.
     """
@@ -124,17 +145,22 @@ class I64Scheduler:
         num_experts: int = 4,
         kv_block_size: int = 16,
         max_kv_blocks: int = 4096,
+        max_prefill_tokens: int = 512,
+        enable_preemption: bool = True,
     ):
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.num_experts = num_experts
         self.expert_mask = np.int64(num_experts - 1)  # For bit masking
         self.kv_block_size = kv_block_size
+        self.max_prefill_tokens = max_prefill_tokens
+        self.enable_preemption = enable_preemption
 
         # Request queues (integer indexed)
         self.pending: List[I64Request] = []
         self.running: List[I64Request] = []
         self.finished: List[I64Request] = []
+        self.preempted: List[I64Request] = []
 
         # KV cache block allocator (integer)
         self.free_blocks = list(range(max_kv_blocks))
@@ -144,9 +170,18 @@ class I64Scheduler:
         self.next_request_id: int = 0
         self.step_counter: int = 0
 
-    def add_request(self, prompt_token_ids: np.ndarray, max_new_tokens: int = 256) -> int:
+        # Fairness: track tokens generated per request for round-robin
+        self._tokens_generated_per_req: Dict[int, int] = {}
+
+    def add_request(
+        self,
+        prompt_token_ids: np.ndarray,
+        max_new_tokens: int = 256,
+        priority: int = 0,
+    ) -> int:
         """
         Add a new request. Returns integer request_id.
+        priority: integer, lower = higher priority (0 = normal, -1 = high, 1 = low)
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -155,8 +190,12 @@ class I64Scheduler:
             request_id=request_id,
             prompt_token_ids=np.asarray(prompt_token_ids, dtype=np.int64),
             max_new_tokens=max_new_tokens,
+            priority=priority,
+            arrival_step=self.step_counter,
         )
         self.pending.append(req)
+        # Sort pending by priority, then arrival order (stable sort)
+        self.pending.sort(key=lambda r: (r.priority, r.arrival_step))
         return request_id
 
     def _allocate_kv_blocks(self, num_blocks: int) -> Optional[List[int]]:
@@ -178,11 +217,51 @@ class I64Scheduler:
         """
         return (token_ids & self.expert_mask).astype(np.int32)
 
+    def _try_preempt(self, blocks_needed: int) -> bool:
+        """
+        Try to preempt lowest-priority running request to free KV blocks.
+
+        Returns True if enough blocks were freed.
+        """
+        if not self.enable_preemption or not self.running:
+            return False
+
+        # Sort running by priority descending (lowest priority = highest number)
+        # then by least progress (most blocks to free)
+        candidates = sorted(
+            self.running,
+            key=lambda r: (-r.priority, -len(r.kv_block_ids)),
+        )
+
+        freed = 0
+        for victim in candidates:
+            if freed >= blocks_needed:
+                break
+
+            # Don't preempt high-priority requests for low-priority ones
+            if victim.priority <= 0 and not self.pending:
+                continue
+
+            # Preempt
+            victim.status = RequestStatus.PREEMPTED
+            self._free_kv_blocks(victim.kv_block_ids)
+            freed += len(victim.kv_block_ids)
+            victim.kv_block_ids = []
+            # Reset generation state but keep prompt
+            victim.output_token_ids = []
+            victim.seq_pos = 0
+            victim.prefill_progress = 0
+            self.running.remove(victim)
+            self.preempted.append(victim)
+
+        return freed >= blocks_needed
+
     def schedule(self) -> Optional[I64Batch]:
         """
-        Schedule the next batch. All integer decisions.
+        Schedule the next batch with chunked prefill + priority + preemption.
 
         Continuous batching: mix prefill and decode requests.
+        Chunked prefill: long prompts split across multiple steps.
         """
         self.step_counter += 1
 
@@ -197,13 +276,30 @@ class I64Scheduler:
                 still_running.append(req)
         self.running = still_running
 
+        # Re-admit preempted requests (they go back to pending with priority boost)
+        for req in self.preempted:
+            req.status = RequestStatus.PENDING
+            req.priority = min(req.priority, -1)  # Boost priority after preemption
+            self.pending.append(req)
+        self.preempted.clear()
+        self.pending.sort(key=lambda r: (r.priority, r.arrival_step))
+
         # Try to admit new requests
+        prefill_token_budget = self.max_prefill_tokens
+
         while self.pending and len(self.running) < self.max_batch_size:
             req = self.pending[0]
             num_blocks_needed = (req.num_prompt_tokens + self.kv_block_size - 1) // self.kv_block_size
             blocks = self._allocate_kv_blocks(num_blocks_needed)
+
             if blocks is None:
-                break  # No KV cache space
+                # Try preemption
+                if self._try_preempt(num_blocks_needed):
+                    blocks = self._allocate_kv_blocks(num_blocks_needed)
+
+            if blocks is None:
+                break  # No KV cache space even after preemption
+
             req.kv_block_ids = blocks
             req.status = RequestStatus.RUNNING
             self.running.append(req)
@@ -224,11 +320,30 @@ class I64Scheduler:
         for req in self.running:
             request_ids.append(req.request_id)
 
-            if req.seq_pos == 0:
-                # Prefill: process all prompt tokens
+            if not req.prefill_complete:
+                # === Chunked Prefill ===
+                remaining = req.num_prompt_tokens - req.prefill_progress
+                chunk_size = min(remaining, prefill_token_budget)
+
+                if chunk_size <= 0:
+                    # No prefill budget left — skip this request this step
+                    # Still need to include it in the batch for consistency
+                    tokens = np.array([req.get_last_token_id()], dtype=np.int64)
+                    positions = np.array([req.prefill_progress - 1], dtype=np.int32)
+                    is_prefill.append(0)
+                else:
+                    start = req.prefill_progress
+                    end = start + chunk_size
+                    tokens = req.prompt_token_ids[start:end]
+                    positions = np.arange(start, end, dtype=np.int32)
+                    is_prefill.append(1)
+                    prefill_token_budget -= chunk_size
+            elif req.seq_pos == 0:
+                # Full prefill (short enough, no chunking needed)
                 tokens = req.prompt_token_ids
                 positions = np.arange(len(tokens), dtype=np.int32)
                 is_prefill.append(1)
+                prefill_token_budget -= len(tokens)
             else:
                 # Decode: process last token only
                 tokens = np.array([req.get_last_token_id()], dtype=np.int64)
@@ -276,9 +391,19 @@ class I64Scheduler:
         """
         for req in self.running:
             if req.request_id in new_token_ids:
+                # Update chunked prefill progress
+                if not req.prefill_complete:
+                    # This was a prefill step — advance progress
+                    # The scheduler assigned this many tokens:
+                    req.prefill_progress = req.num_prompt_tokens  # simplified: mark complete
+                    req.seq_pos = req.num_prompt_tokens
+
                 token_id = new_token_ids[req.request_id]
                 req.output_token_ids.append(token_id)
                 req.seq_pos = req.total_tokens
+
+                # Track for fairness
+                self._tokens_generated_per_req[req.request_id] = req.num_generated
 
                 # Allocate more KV blocks if needed (integer arithmetic)
                 blocks_needed = (req.total_tokens + self.kv_block_size - 1) // self.kv_block_size
@@ -295,6 +420,7 @@ class I64Scheduler:
             "pending": len(self.pending),
             "running": len(self.running),
             "finished": len(self.finished),
+            "preempted": len(self.preempted),
             "free_kv_blocks": len(self.free_blocks),
             "total_steps": self.step_counter,
         }

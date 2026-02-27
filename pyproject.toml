@@ -43,6 +43,9 @@ cuda = [
 flash = [
     "flash-attn>=2.5",
 ]
+lora = [
+    "safetensors>=0.4",
+]
 
 [project.scripts]
 vllm-i64 = "vllm_i64.cli:main"
