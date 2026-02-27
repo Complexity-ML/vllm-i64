@@ -28,6 +28,7 @@ dependencies = [
     "aiohttp>=3.9",
     "tokenizers>=0.15",
     "prometheus-client>=0.17",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +39,9 @@ dev = [
 ]
 cuda = [
     "ninja>=1.11",
+]
+flash = [
+    "flash-attn>=2.5",
 ]
 
 [project.scripts]

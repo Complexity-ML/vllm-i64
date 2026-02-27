@@ -243,36 +243,21 @@ class MuGuidedAttention(nn.Module):
                 q, k, v, kv_cache, layer_idx, seq_ids, tokens_per_seq, positions,
             )
 
-        # === Standard path: batched attention with causal mask ===
-        # GQA: repeat KV heads within this TP shard
-        if self.num_kv_groups > 1:
-            k = k.repeat_interleave(self.num_kv_groups, dim=1)
-            v = v.repeat_interleave(self.num_kv_groups, dim=1)
+        # === Standard path: prefill without cache ===
+        from vllm_i64.layers.attention import (
+            is_flash_attn_available, flash_prefill_attention, naive_varlen_attention,
+        )
 
-        # Attention (on this rank's heads only)
         scale = 1.0 / math.sqrt(self.head_dim)
-        q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
+        tps = tokens_per_seq if tokens_per_seq is not None else [bsz]
 
-        attn = torch.bmm(q, k.transpose(1, 2)) * scale
+        if is_flash_attn_available() and q.is_cuda:
+            out = flash_prefill_attention(q, k, v, tps, softmax_scale=scale)
+        else:
+            out = naive_varlen_attention(q, k, v, tps, self.num_kv_groups, softmax_scale=scale)
 
-        # Causal mask
-        seq_len = q.shape[1]
-        if seq_len > 1:
-            causal_mask = torch.triu(
-                torch.full((seq_len, seq_len), float('-inf'), device=hidden.device),
-                diagonal=1,
-            )
-            attn = attn + causal_mask.unsqueeze(0)
-
-        if mask is not None:
-            attn = attn + mask
-        attn = F.softmax(attn, dim=-1)
-        out = torch.bmm(attn, v)
-
-        # Reshape back: (heads_per_tp, bsz, head_dim) → (bsz, heads_per_tp * head_dim)
-        out = out.transpose(0, 1).reshape(bsz, self.num_heads_per_tp * self.head_dim)
-
-        # RowParallel: matmul + all_reduce across TP ranks
+        # (total_tokens, num_heads_per_tp, head_dim) → (total_tokens, hidden)
+        out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
         return self.o_proj(out)
 
     def _cached_attention(
@@ -286,48 +271,94 @@ class MuGuidedAttention(nn.Module):
         tokens_per_seq: List[int],
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Per-request attention with KV caching."""
+        """
+        Per-request attention with KV caching.
+
+        Dispatches to:
+          - flash_attn_with_kv_cache for pure decode (GPU + flash)
+          - flash_attn_varlen_func for prefill with cache (GPU + flash)
+          - naive per-request bmm fallback (CPU or no flash)
+        """
+        from vllm_i64.layers.attention import (
+            is_flash_attn_available, flash_decode_attention,
+            flash_prefill_with_cache, naive_cached_attention,
+        )
+
         scale = 1.0 / math.sqrt(self.head_dim)
+        use_flash = is_flash_attn_available() and q.is_cuda
+
+        # Step 1: Write new K/V to cache (batch write per sequence)
+        offset = 0
+        for i, seq_id in enumerate(seq_ids):
+            n = tokens_per_seq[i]
+            pos_i = positions[offset:offset + n]
+            k_i = k[offset:offset + n]
+            v_i = v[offset:offset + n]
+            kv_cache.write_kv_batch(layer_idx, seq_id, pos_i, k_i, v_i)
+            offset += n
+
+        is_pure_decode = all(n == 1 for n in tokens_per_seq)
+
+        # === Flash decode: all requests have exactly 1 new token ===
+        if use_flash and is_pure_decode:
+            batch_size = len(seq_ids)
+            q_4d = q.unsqueeze(1)  # (batch, 1, num_heads, head_dim)
+
+            k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
+            block_table = kv_cache.get_block_table_for_seqs(seq_ids).clamp(min=0)
+            cache_seqlens = kv_cache.get_cache_seqlens(seq_ids)
+
+            out = flash_decode_attention(
+                q_4d, k_cache, v_cache,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                softmax_scale=scale,
+            )
+            out = out.squeeze(1)  # (batch, num_heads, head_dim)
+            out = out.reshape(batch_size, self.num_heads_per_tp * self.head_dim)
+            return self.o_proj(out)
+
+        # === Flash prefill with cache ===
+        if use_flash:
+            cu_q = torch.zeros(len(seq_ids) + 1, dtype=torch.int32, device=q.device)
+            cu_k = torch.zeros(len(seq_ids) + 1, dtype=torch.int32, device=q.device)
+            k_parts, v_parts = [], []
+
+            for i, seq_id in enumerate(seq_ids):
+                cu_q[i + 1] = cu_q[i] + tokens_per_seq[i]
+                cached_len = kv_cache.seq_lens[seq_id].item()
+                cu_k[i + 1] = cu_k[i] + cached_len
+                kf, vf = kv_cache.read_kv(layer_idx, seq_id)
+                k_parts.append(kf)
+                v_parts.append(vf)
+
+            k_all = torch.cat(k_parts, dim=0)
+            v_all = torch.cat(v_parts, dim=0)
+
+            out = flash_prefill_with_cache(
+                q, k_all, v_all,
+                cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                max_seqlen_q=max(tokens_per_seq),
+                max_seqlen_k=max(kv_cache.seq_lens[sid].item() for sid in seq_ids),
+                softmax_scale=scale,
+            )
+            total_tokens = q.shape[0]
+            out = out.reshape(total_tokens, self.num_heads_per_tp * self.head_dim)
+            return self.o_proj(out)
+
+        # === Naive fallback ===
         outputs = []
         offset = 0
-
         for i, seq_id in enumerate(seq_ids):
             n = tokens_per_seq[i]
             q_i = q[offset:offset + n]
-            k_i = k[offset:offset + n]
-            v_i = v[offset:offset + n]
+            pos_i = positions[offset:offset + n]
 
-            # Write new K/V to cache at their positions
-            for t in range(n):
-                pos = positions[offset + t].item()
-                kv_cache.write_kv(layer_idx, seq_id, pos, k_i[t], v_i[t])
-
-            # Read all cached K/V (includes what we just wrote)
             k_full, v_full = kv_cache.read_kv(layer_idx, seq_id)
-
-            # GQA expand on cached K/V
-            if self.num_kv_groups > 1:
-                k_full = k_full.repeat_interleave(self.num_kv_groups, dim=1)
-                v_full = v_full.repeat_interleave(self.num_kv_groups, dim=1)
-
-            # Attention: q_i against all cached K/V
-            q_t = q_i.transpose(0, 1)
-            k_t = k_full.transpose(0, 1)
-            v_t = v_full.transpose(0, 1)
-
-            attn = torch.bmm(q_t, k_t.transpose(1, 2)) * scale
-
-            # Causal mask (needed for prefill when n > 1)
-            if n > 1:
-                total = k_full.shape[0]
-                q_pos = positions[offset:offset + n].unsqueeze(1).float()
-                k_pos = torch.arange(total, device=q.device, dtype=torch.float32).unsqueeze(0)
-                causal = torch.where(k_pos <= q_pos, 0.0, float('-inf'))
-                attn = attn + causal.unsqueeze(0)
-
-            attn = F.softmax(attn, dim=-1)
-            out_i = torch.bmm(attn, v_t)
-            out_i = out_i.transpose(0, 1).reshape(n, self.num_heads_per_tp * self.head_dim)
+            out_i = naive_cached_attention(
+                q_i, k_full, v_full, self.num_kv_groups, pos_i, softmax_scale=scale,
+            )
+            out_i = out_i.reshape(n, self.num_heads_per_tp * self.head_dim)
             outputs.append(out_i)
             offset += n
 

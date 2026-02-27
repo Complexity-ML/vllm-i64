@@ -16,15 +16,111 @@ Handles:
 INL - 2025
 """
 
+import json as _json
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Dict
 from pathlib import Path
 
 from vllm_i64.core.registry import get_model_entry
 from vllm_i64.parallel.tensor_parallel import (
     get_tp, ColumnParallelLinear, RowParallelLinear,
 )
+
+
+# =========================================================================
+# Multi-format state_dict loading (safetensors + PyTorch)
+# =========================================================================
+
+def _load_safetensors_file(filepath: str) -> Dict[str, torch.Tensor]:
+    """Load a single .safetensors file."""
+    from safetensors.torch import load_file
+    return load_file(filepath)
+
+
+def _load_pytorch_file(filepath: str) -> Dict[str, torch.Tensor]:
+    """Load a PyTorch checkpoint file and unwrap nested state dicts."""
+    state_dict = torch.load(filepath, map_location="cpu", weights_only=True)
+    if isinstance(state_dict, dict):
+        if "model" in state_dict and "model.layers.0.input_layernorm.weight" not in state_dict:
+            state_dict = state_dict["model"]
+        if "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+    return state_dict
+
+
+def _load_sharded_safetensors(directory: Path) -> Dict[str, torch.Tensor]:
+    """Load sharded safetensors from a HuggingFace model directory."""
+    index_path = directory / "model.safetensors.index.json"
+    with open(index_path, "r") as f:
+        index = _json.load(f)
+
+    weight_map = index.get("weight_map", {})
+    shard_files = sorted(set(weight_map.values()))
+
+    state_dict = {}
+    for shard_name in shard_files:
+        shard_path = directory / shard_name
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Shard not found: {shard_path}")
+        state_dict.update(_load_safetensors_file(str(shard_path)))
+    return state_dict
+
+
+def _load_from_directory(dir_path: Path) -> Dict[str, torch.Tensor]:
+    """
+    Load from a model directory. Priority:
+      1. model.safetensors.index.json (sharded)
+      2. model.safetensors (single file)
+      3. *.safetensors (glob)
+      4. *.pt / *.pth / *.bin (PyTorch)
+    """
+    if (dir_path / "model.safetensors.index.json").exists():
+        return _load_sharded_safetensors(dir_path)
+
+    single_st = dir_path / "model.safetensors"
+    if single_st.exists():
+        return _load_safetensors_file(str(single_st))
+
+    st_files = sorted(dir_path.glob("*.safetensors"))
+    if st_files:
+        state_dict = {}
+        for f in st_files:
+            state_dict.update(_load_safetensors_file(str(f)))
+        return state_dict
+
+    pt_files = sorted(dir_path.glob("*.pt")) + sorted(dir_path.glob("*.pth")) + sorted(dir_path.glob("*.bin"))
+    if pt_files:
+        state_dict = {}
+        for f in pt_files:
+            state_dict.update(_load_pytorch_file(str(f)))
+        return state_dict
+
+    raise FileNotFoundError(f"No checkpoint files found in {dir_path}")
+
+
+def _load_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    """
+    Auto-detect and load state dict from any supported format.
+
+    Supports:
+      - .pt / .pth / .bin (PyTorch)
+      - .safetensors (single or sharded)
+      - Directories (HuggingFace model dirs)
+    """
+    path = Path(checkpoint_path)
+
+    if path.is_dir():
+        return _load_from_directory(path)
+    elif path.suffix == ".safetensors":
+        return _load_safetensors_file(str(path))
+    elif path.suffix in (".pt", ".pth", ".bin"):
+        return _load_pytorch_file(str(path))
+    else:
+        try:
+            return _load_pytorch_file(str(path))
+        except Exception:
+            return _load_safetensors_file(str(path))
 
 
 def _get_module_for_param(model: nn.Module, param_name: str) -> Optional[nn.Module]:
@@ -78,13 +174,7 @@ def load_checkpoint(
     if tp.tp_rank == 0:
         print(f"Loading checkpoint: {checkpoint_path}")
 
-    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-
-    # Unwrap nested state dicts
-    if "model" in state_dict and "model.layers.0.input_layernorm.weight" not in state_dict:
-        state_dict = state_dict["model"]
-    if "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
+    state_dict = _load_state_dict(checkpoint_path)
 
     # Build lookup of model parameters and their parent modules
     params = dict(model.named_parameters())

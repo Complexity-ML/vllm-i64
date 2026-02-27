@@ -21,9 +21,9 @@ class PagedKVCache:
     """
     Paged KV cache with integer block management.
 
-    Memory layout:
-        k_cache: (num_blocks, num_heads, block_size, head_dim) float
-        v_cache: (num_blocks, num_heads, block_size, head_dim) float
+    Memory layout (flash_attn-compatible):
+        k_cache: (num_blocks, block_size, num_heads, head_dim) float
+        v_cache: (num_blocks, block_size, num_heads, head_dim) float
         block_table: (max_seqs, max_blocks_per_seq) i32
 
     Block allocation/deallocation is pure integer.
@@ -52,13 +52,14 @@ class PagedKVCache:
         max_blocks_per_seq = 128  # max sequence length / block_size
 
         # KV tensors (float — the actual cache data)
-        # Per layer: (num_blocks, num_kv_heads, block_size, head_dim)
+        # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
+        # Layout matches flash_attn_with_kv_cache expectations
         self.k_caches = [
-            torch.zeros(num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device)
+            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
             for _ in range(num_layers)
         ]
         self.v_caches = [
-            torch.zeros(num_blocks, num_kv_heads, block_size, head_dim, dtype=dtype, device=device)
+            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
             for _ in range(num_layers)
         ]
 
@@ -138,8 +139,8 @@ class PagedKVCache:
             # Need to allocate
             [physical_block] = self.allocate_blocks(seq_id, 1)
 
-        self.k_caches[layer_idx][physical_block, :, offset, :] = k
-        self.v_caches[layer_idx][physical_block, :, offset, :] = v
+        self.k_caches[layer_idx][physical_block, offset, :, :] = k
+        self.v_caches[layer_idx][physical_block, offset, :, :] = v
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), position + 1)
 
     def read_kv(
@@ -168,10 +169,49 @@ class PagedKVCache:
             physical_block = self.block_table[seq_id, block_idx].item()
 
             if physical_block >= 0:
-                k_out[pos] = self.k_caches[layer_idx][physical_block, :, offset, :]
-                v_out[pos] = self.v_caches[layer_idx][physical_block, :, offset, :]
+                k_out[pos] = self.k_caches[layer_idx][physical_block, offset, :, :]
+                v_out[pos] = self.v_caches[layer_idx][physical_block, offset, :, :]
 
         return k_out, v_out
+
+    def write_kv_batch(
+        self,
+        layer_idx: int,
+        seq_id: int,
+        positions: torch.Tensor,   # (n,) int32
+        k: torch.Tensor,           # (n, num_kv_heads, head_dim)
+        v: torch.Tensor,           # (n, num_kv_heads, head_dim)
+    ):
+        """Batch write K/V for one sequence. Avoids per-token Python loop overhead."""
+        for t in range(positions.shape[0]):
+            pos = positions[t].item()
+            block_idx = pos // self.block_size
+            offset = pos % self.block_size
+            physical_block = self.block_table[seq_id, block_idx].item()
+
+            if physical_block < 0:
+                [physical_block] = self.allocate_blocks(seq_id, 1)
+
+            self.k_caches[layer_idx][physical_block, offset, :, :] = k[t]
+            self.v_caches[layer_idx][physical_block, offset, :, :] = v[t]
+
+        max_pos = positions.max().item() + 1
+        self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), max_pos)
+
+    def get_cache_tensors(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return raw k/v cache tensors for a layer.
+        Shape: (num_blocks, block_size, num_kv_heads, head_dim) — flash_attn compatible.
+        """
+        return self.k_caches[layer_idx], self.v_caches[layer_idx]
+
+    def get_block_table_for_seqs(self, seq_ids: List[int]) -> torch.Tensor:
+        """Extract block table rows for given sequences. Returns (num_seqs, max_blocks_per_seq) int32."""
+        return self.block_table[seq_ids]
+
+    def get_cache_seqlens(self, seq_ids: List[int]) -> torch.Tensor:
+        """Get current sequence lengths. Returns (num_seqs,) int32."""
+        return self.seq_lens[seq_ids]
 
     def get_stats(self) -> dict:
         """Cache stats — all integers."""
