@@ -15,12 +15,14 @@ import asyncio
 import time
 import sys
 import os
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vllm_i64.engine.i64_engine import AsyncI64Engine, I64Engine, GenerationResult
 
 
+@pytest.mark.asyncio
 async def test_single_request():
     """Single request should complete."""
     engine = AsyncI64Engine(
@@ -45,6 +47,7 @@ async def test_single_request():
     await engine.stop()
 
 
+@pytest.mark.asyncio
 async def test_parallel_requests():
     """Multiple requests should be batched and processed concurrently."""
     engine = AsyncI64Engine(
@@ -95,6 +98,7 @@ async def test_parallel_requests():
     await engine.stop()
 
 
+@pytest.mark.asyncio
 async def test_streaming():
     """Streaming should yield tokens one by one."""
     engine = AsyncI64Engine(
@@ -119,6 +123,7 @@ async def test_streaming():
     await engine.stop()
 
 
+@pytest.mark.asyncio
 async def test_mixed_parallel_streaming():
     """Mix of regular and streaming requests in parallel."""
     engine = AsyncI64Engine(
@@ -159,6 +164,7 @@ async def test_mixed_parallel_streaming():
     await engine.stop()
 
 
+@pytest.mark.asyncio
 async def test_sequential_vs_parallel_speedup():
     """Parallel requests should be faster than sequential."""
     engine = AsyncI64Engine(

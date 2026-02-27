@@ -72,10 +72,10 @@ def i64_scatter(
     # Build reverse mapping
     scatter_indices = torch.zeros_like(sorted_indices)
     scatter_indices[sorted_indices] = torch.arange(
-        len(sorted_indices), dtype=torch.int32, device=hidden_states.device
+        len(sorted_indices), dtype=sorted_indices.dtype, device=hidden_states.device
     )
 
-    return scattered, scatter_indices, expert_offsets, expert_counts
+    return scattered, scatter_indices.to(torch.int32), expert_offsets, expert_counts
 
 
 def i64_gather(

@@ -126,6 +126,12 @@ def cmd_check(args):
 
 def cmd_bench(args):
     """Run benchmarks."""
+    import os
+    # benchmarks/ lives at project root, not inside vllm_i64 package
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
     from benchmarks.bench_i64_routing import (
         bench_i64_routing,
         bench_float_routing,
