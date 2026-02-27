@@ -25,7 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from vllm_i64.layers.token_routed_mlp import TokenRoutedMLP
 from vllm_i64.layers.rmsnorm import RMSNorm
@@ -204,6 +204,10 @@ class MuGuidedAttention(nn.Module):
         positions: torch.Tensor,
         mu_prev: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        kv_cache=None,
+        layer_idx: int = 0,
+        seq_ids: Optional[List[int]] = None,
+        tokens_per_seq: Optional[List[int]] = None,
     ) -> torch.Tensor:
         bsz = hidden.shape[0]
 
@@ -233,6 +237,13 @@ class MuGuidedAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
+        # === KV Cache path: per-request attention with caching ===
+        if kv_cache is not None and seq_ids is not None and tokens_per_seq is not None:
+            return self._cached_attention(
+                q, k, v, kv_cache, layer_idx, seq_ids, tokens_per_seq, positions,
+            )
+
+        # === Standard path: batched attention with causal mask ===
         # GQA: repeat KV heads within this TP shard
         if self.num_kv_groups > 1:
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
@@ -243,6 +254,16 @@ class MuGuidedAttention(nn.Module):
         q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
 
         attn = torch.bmm(q, k.transpose(1, 2)) * scale
+
+        # Causal mask
+        seq_len = q.shape[1]
+        if seq_len > 1:
+            causal_mask = torch.triu(
+                torch.full((seq_len, seq_len), float('-inf'), device=hidden.device),
+                diagonal=1,
+            )
+            attn = attn + causal_mask.unsqueeze(0)
+
         if mask is not None:
             attn = attn + mask
         attn = F.softmax(attn, dim=-1)
@@ -252,6 +273,65 @@ class MuGuidedAttention(nn.Module):
         out = out.transpose(0, 1).reshape(bsz, self.num_heads_per_tp * self.head_dim)
 
         # RowParallel: matmul + all_reduce across TP ranks
+        return self.o_proj(out)
+
+    def _cached_attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache,
+        layer_idx: int,
+        seq_ids: List[int],
+        tokens_per_seq: List[int],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-request attention with KV caching."""
+        scale = 1.0 / math.sqrt(self.head_dim)
+        outputs = []
+        offset = 0
+
+        for i, seq_id in enumerate(seq_ids):
+            n = tokens_per_seq[i]
+            q_i = q[offset:offset + n]
+            k_i = k[offset:offset + n]
+            v_i = v[offset:offset + n]
+
+            # Write new K/V to cache at their positions
+            for t in range(n):
+                pos = positions[offset + t].item()
+                kv_cache.write_kv(layer_idx, seq_id, pos, k_i[t], v_i[t])
+
+            # Read all cached K/V (includes what we just wrote)
+            k_full, v_full = kv_cache.read_kv(layer_idx, seq_id)
+
+            # GQA expand on cached K/V
+            if self.num_kv_groups > 1:
+                k_full = k_full.repeat_interleave(self.num_kv_groups, dim=1)
+                v_full = v_full.repeat_interleave(self.num_kv_groups, dim=1)
+
+            # Attention: q_i against all cached K/V
+            q_t = q_i.transpose(0, 1)
+            k_t = k_full.transpose(0, 1)
+            v_t = v_full.transpose(0, 1)
+
+            attn = torch.bmm(q_t, k_t.transpose(1, 2)) * scale
+
+            # Causal mask (needed for prefill when n > 1)
+            if n > 1:
+                total = k_full.shape[0]
+                q_pos = positions[offset:offset + n].unsqueeze(1).float()
+                k_pos = torch.arange(total, device=q.device, dtype=torch.float32).unsqueeze(0)
+                causal = torch.where(k_pos <= q_pos, 0.0, float('-inf'))
+                attn = attn + causal.unsqueeze(0)
+
+            attn = F.softmax(attn, dim=-1)
+            out_i = torch.bmm(attn, v_t)
+            out_i = out_i.transpose(0, 1).reshape(n, self.num_heads_per_tp * self.head_dim)
+            outputs.append(out_i)
+            offset += n
+
+        out = torch.cat(outputs, dim=0)
         return self.o_proj(out)
 
 
@@ -288,10 +368,18 @@ class ComplexityDecoderLayer(nn.Module):
         velocity: torch.Tensor,
         token_ids: Optional[torch.Tensor] = None,
         mu_prev: Optional[torch.Tensor] = None,
+        kv_cache=None,
+        layer_idx: int = 0,
+        seq_ids: Optional[List[int]] = None,
+        tokens_per_seq: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden
         hidden = self.input_layernorm(hidden)
-        hidden = self.self_attn(hidden, positions, mu_prev=mu_prev)
+        hidden = self.self_attn(
+            hidden, positions, mu_prev=mu_prev,
+            kv_cache=kv_cache, layer_idx=layer_idx,
+            seq_ids=seq_ids, tokens_per_seq=tokens_per_seq,
+        )
 
         hidden, velocity, mu_current = self.dynamics(hidden, velocity)
         hidden = residual + hidden
@@ -342,6 +430,9 @@ class ComplexityDeepModel(nn.Module):
         self,
         token_ids: torch.Tensor,
         positions: torch.Tensor,
+        kv_cache=None,
+        seq_ids: Optional[List[int]] = None,
+        tokens_per_seq: Optional[List[int]] = None,
     ) -> torch.Tensor:
         """Returns logits: (batch, vocab_size)."""
         hidden = self.embed_tokens(token_ids.long())
@@ -350,11 +441,15 @@ class ComplexityDeepModel(nn.Module):
         mu_prev = None
         mu_residual = None
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             hidden, velocity, mu_current = layer(
                 hidden, positions, velocity,
                 token_ids=token_ids,
                 mu_prev=mu_prev,
+                kv_cache=kv_cache,
+                layer_idx=layer_idx,
+                seq_ids=seq_ids,
+                tokens_per_seq=tokens_per_seq,
             )
 
             # Mu Residual Highway

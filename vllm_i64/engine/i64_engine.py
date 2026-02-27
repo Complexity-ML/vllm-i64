@@ -5,11 +5,18 @@ Main engine that orchestrates:
   1. Scheduler (i64) — decides what to process
   2. Router (i64) — assigns tokens to experts
   3. Model (fp16) — runs expert MLP + attention
-  4. Sampler (i64 argmax) — picks next token
+  4. Sampler (i64 argmax or configurable) — picks next token
 
 Two modes:
   - I64Engine: synchronous, for single-request or testing
   - AsyncI64Engine: async continuous batching, for production
+
+Integrations:
+  - PagedKVCache: per-request KV caching in attention
+  - SamplingParams: configurable sampling (greedy/top-k/top-p/temperature)
+  - CUDAGraphRunner: captured decode step for reduced kernel launch overhead
+  - SpeculativeDecoder: draft+verify for faster generation
+  - I64Metrics: Prometheus monitoring
 
 Integer-first: the engine loop is 100% integer control flow.
 Float only exists inside model.forward().
@@ -25,6 +32,7 @@ from typing import List, Dict, Optional, Callable
 from dataclasses import dataclass
 
 from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
+from vllm_i64.core.sampling import SamplingParams, sample_batch
 
 
 @dataclass
@@ -39,13 +47,13 @@ class GenerationResult:
 
 class I64Engine:
     """
-    Integer-first inference engine.
+    Integer-first inference engine with KV cache and configurable sampling.
 
     Control flow:
         while has_work:
             batch = scheduler.schedule()       # i64: pick requests, pre-route
             logits = model.forward(batch)      # fp16: the ONLY float step
-            tokens = sampler.sample(logits)    # i64: argmax
+            tokens = sampler.sample(logits)    # i64: argmax or configured
             scheduler.update(tokens)           # i64: update state
 
     The engine never touches float. It passes integer-indexed batches
@@ -84,6 +92,96 @@ class I64Engine:
         self.total_steps: int = 0
         self.total_tokens_generated: int = 0
 
+        # Sampling parameters (configurable, default greedy)
+        self.sampling_params = SamplingParams(temperature=0.0)
+
+        # === KV Cache ===
+        self.kv_cache = None
+        self._slot_pool: List[int] = []
+        self._request_to_slot: Dict[int, int] = {}
+
+        if self.model is not None and hasattr(self.model, 'config'):
+            self._init_kv_cache(max_batch_size)
+
+        # === CUDA Graph Runner ===
+        self.cuda_graph_runner = None
+        if device != "cpu" and self.model is not None:
+            self._init_cuda_graph(max_batch_size)
+
+        # === Speculative Decoding ===
+        self.speculative_decoder = None
+
+        # === Metrics ===
+        self.metrics = None
+
+    def _init_kv_cache(self, max_seqs: int):
+        """Initialize paged KV cache from model config."""
+        from vllm_i64.core.kv_cache import PagedKVCache
+        from vllm_i64.parallel.tensor_parallel import get_tp
+
+        config = self.model.config
+        tp = get_tp()
+        num_kv_heads = config.num_key_value_heads // tp.tp_size
+        dtype = next(self.model.parameters()).dtype
+
+        self.kv_cache = PagedKVCache(
+            num_layers=config.num_hidden_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=config.head_dim,
+            block_size=16,
+            num_blocks=max(256, max_seqs * 8),
+            max_seqs=max_seqs,
+            dtype=dtype,
+            device=self.device,
+        )
+        self._slot_pool = list(range(max_seqs))
+
+    def _init_cuda_graph(self, max_batch_size: int):
+        """Initialize CUDA graph runner for decode steps."""
+        try:
+            from vllm_i64.core.cuda_graph import CUDAGraphRunner
+
+            def _graph_forward(token_ids, positions, expert_ids):
+                return self.model(token_ids=token_ids, positions=positions)
+
+            self.cuda_graph_runner = CUDAGraphRunner(
+                forward_fn=_graph_forward,
+                max_batch_size=max_batch_size,
+                device=self.device,
+            )
+        except Exception:
+            self.cuda_graph_runner = None
+
+    def enable_metrics(self, port: int = 9090, model_name: str = ""):
+        """Enable Prometheus metrics collection."""
+        from vllm_i64.core.metrics import I64Metrics
+        self.metrics = I64Metrics(port=port, model_name=model_name)
+
+    def enable_speculative(self, draft_model, num_speculative: int = 5):
+        """Enable speculative decoding with a draft model."""
+        from vllm_i64.core.speculative import SpeculativeDecoder
+        self.speculative_decoder = SpeculativeDecoder(
+            target_model=self.model,
+            draft_model=draft_model,
+            num_speculative=num_speculative,
+        )
+
+    def _allocate_slot(self, request_id: int) -> int:
+        """Allocate a KV cache slot for a request."""
+        if not self._slot_pool:
+            return -1
+        slot = self._slot_pool.pop(0)
+        self._request_to_slot[request_id] = slot
+        return slot
+
+    def _free_slot(self, request_id: int):
+        """Free a KV cache slot when a request finishes."""
+        if request_id in self._request_to_slot:
+            slot = self._request_to_slot.pop(request_id)
+            if self.kv_cache is not None:
+                self.kv_cache.free_sequence(slot)
+            self._slot_pool.append(slot)
+
     def add_request(
         self,
         prompt_token_ids: List[int],
@@ -91,43 +189,19 @@ class I64Engine:
     ) -> int:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
-        return self.scheduler.add_request(ids, max_new_tokens)
+        request_id = self.scheduler.add_request(ids, max_new_tokens)
+
+        # Allocate KV cache slot
+        if self.kv_cache is not None:
+            self._allocate_slot(request_id)
+
+        return request_id
 
     def _i64_sample(self, logits: torch.Tensor) -> np.ndarray:
         """
-        Sample next tokens from logits.
-
-        Uses argmax (greedy) — returns integer token IDs.
-        This is the boundary: logits come in as float,
-        token IDs go out as int64.
+        Sample next tokens from logits using configured sampling params.
         """
-        token_ids = logits.argmax(dim=-1).cpu().numpy().astype(np.int64)
-        return token_ids
-
-    def _i64_top_k_sample(
-        self,
-        logits: torch.Tensor,
-        k: int = 50,
-        temperature: float = 1.0,
-    ) -> np.ndarray:
-        """
-        Top-k sampling.
-
-        Even here, the heavy lifting is integer:
-        - topk returns integer indices
-        - multinomial returns integer indices
-        - gather uses integer indices
-
-        The only float is the softmax on k values (tiny).
-        """
-        if temperature != 1.0:
-            logits = logits / temperature
-
-        top_k_logits, top_k_indices = torch.topk(logits, k, dim=-1)
-        probs = torch.softmax(top_k_logits, dim=-1)
-        sampled_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
-        token_ids = top_k_indices.gather(-1, sampled_idx.unsqueeze(-1)).squeeze(-1)
-
+        token_ids = sample_batch(logits, self.sampling_params)
         return token_ids.cpu().numpy().astype(np.int64)
 
     def step(self) -> Dict[int, int]:
@@ -141,13 +215,21 @@ class I64Engine:
         if batch is None:
             return {}
 
+        # Update metrics
+        if self.metrics:
+            self.metrics.update_batch_size(batch.num_requests)
+            self.metrics.update_pending(len(self.scheduler.pending))
+            if self.kv_cache:
+                kv_stats = self.kv_cache.get_stats()
+                self.metrics.update_kv_usage(kv_stats["used_blocks"], kv_stats["num_blocks"])
+
         # 2. Model forward (fp16) — the ONLY float step
         if self.model is not None:
             logits = self._model_forward(batch)
         else:
             logits = torch.randn(batch.num_requests, self.vocab_size)
 
-        # 3. Sample (i64 argmax)
+        # 3. Sample (configurable)
         new_token_ids = self._i64_sample(logits)
 
         # 4. Map back to requests (integer indexing)
@@ -158,6 +240,10 @@ class I64Engine:
         # 5. Update scheduler (i64)
         self.scheduler.update_after_step(result)
 
+        # 6. Free KV slots for finished requests
+        for req in self.scheduler.finished:
+            self._free_slot(req.request_id)
+
         # Integer counters
         self.total_steps += 1
         self.total_tokens_generated += len(result)
@@ -166,19 +252,41 @@ class I64Engine:
 
     def _model_forward(self, batch: I64Batch) -> torch.Tensor:
         """
-        Run model forward pass.
-
-        The batch contains pre-computed integer routing (expert_ids).
-        The model uses these integer assignments directly.
+        Run model forward pass with KV cache support.
         """
         token_ids = torch.from_numpy(batch.token_ids).to(self.device)
         positions = torch.from_numpy(batch.positions).to(self.device)
 
+        # Build KV cache metadata
+        seq_ids = None
+        tokens_per_seq = None
+
+        if self.kv_cache is not None and batch.tokens_per_request is not None:
+            seq_ids = [
+                self._request_to_slot.get(int(rid), 0)
+                for rid in batch.request_ids
+            ]
+            tokens_per_seq = batch.tokens_per_request.tolist()
+
+        # Use CUDA graph for pure decode batches
+        use_graph = (
+            self.cuda_graph_runner is not None
+            and self.cuda_graph_runner.is_captured
+            and batch.is_prefill.sum() == 0
+        )
+
         with torch.no_grad():
-            logits = self.model(
-                token_ids=token_ids,
-                positions=positions,
-            )
+            if use_graph:
+                expert_ids = torch.from_numpy(batch.expert_ids).to(self.device)
+                logits = self.cuda_graph_runner.run(token_ids, positions, expert_ids)
+            else:
+                logits = self.model(
+                    token_ids=token_ids,
+                    positions=positions,
+                    kv_cache=self.kv_cache,
+                    seq_ids=seq_ids,
+                    tokens_per_seq=tokens_per_seq,
+                )
 
         return logits
 
@@ -186,9 +294,18 @@ class I64Engine:
         self,
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> GenerationResult:
         """Synchronous generation for a single request."""
+        old_params = self.sampling_params
+        if sampling_params is not None:
+            self.sampling_params = sampling_params
+
         request_id = self.add_request(prompt_token_ids, max_new_tokens)
+
+        metrics_start = None
+        if self.metrics:
+            metrics_start = self.metrics.on_request_start()
 
         start = time.perf_counter()
         steps = 0
@@ -205,6 +322,14 @@ class I64Engine:
 
             if req is not None:
                 elapsed = (time.perf_counter() - start) * 1000
+
+                if self.metrics and metrics_start is not None:
+                    self.metrics.on_request_end(
+                        metrics_start, len(prompt_token_ids), len(req.output_token_ids),
+                    )
+
+                self.sampling_params = old_params
+
                 return GenerationResult(
                     request_id=request_id,
                     prompt_tokens=list(req.prompt_token_ids),
@@ -223,11 +348,14 @@ class I64Engine:
     def get_stats(self) -> Dict[str, int]:
         """Engine stats — all integers."""
         sched_stats = self.scheduler.get_stats()
-        return {
+        stats = {
             **sched_stats,
             "total_steps": self.total_steps,
             "total_tokens_generated": self.total_tokens_generated,
         }
+        if self.kv_cache:
+            stats.update(self.kv_cache.get_stats())
+        return stats
 
 
 # =========================================================================
@@ -246,18 +374,6 @@ class AsyncI64Engine:
 
     This maximizes GPU utilization: multiple requests are batched
     together in each forward pass, achieving higher tok/s.
-
-    Usage:
-        engine = AsyncI64Engine(model, ...)
-        await engine.start()
-
-        # These run concurrently, batched together:
-        r1 = asyncio.create_task(engine.generate([1, 2, 3]))
-        r2 = asyncio.create_task(engine.generate([4, 5, 6]))
-        result1 = await r1
-        result2 = await r2
-
-        await engine.stop()
     """
 
     def __init__(
@@ -309,6 +425,7 @@ class AsyncI64Engine:
         self,
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> GenerationResult:
         """
         Submit a request and wait for completion.
@@ -318,6 +435,10 @@ class AsyncI64Engine:
         """
         loop = asyncio.get_running_loop()
         future = loop.create_future()
+
+        # Apply sampling params if provided
+        if sampling_params is not None:
+            self.engine.sampling_params = sampling_params
 
         request_id = self.engine.add_request(prompt_token_ids, max_new_tokens)
         self._pending_futures[request_id] = future
@@ -330,13 +451,13 @@ class AsyncI64Engine:
         self,
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
+        sampling_params: Optional[SamplingParams] = None,
     ):
         """
         Submit a request and yield tokens as they are generated.
-
-        Yields (token_id: int, is_finished: bool) tuples.
         """
-        loop = asyncio.get_running_loop()
+        if sampling_params is not None:
+            self.engine.sampling_params = sampling_params
 
         request_id = self.engine.add_request(prompt_token_ids, max_new_tokens)
         self._request_times[request_id] = time.perf_counter()
@@ -350,7 +471,6 @@ class AsyncI64Engine:
             while True:
                 item = await token_queue.get()
                 if item is None:
-                    # Generation complete
                     break
                 yield item
         finally:
@@ -358,23 +478,16 @@ class AsyncI64Engine:
             self._request_times.pop(request_id, None)
 
     async def _engine_loop(self):
-        """
-        Continuous batching loop.
-
-        Runs forever, processing whatever requests are in the scheduler.
-        Idle when no requests; immediately picks up new ones.
-        """
+        """Continuous batching loop."""
         while self._running:
             has_work = (
                 self.engine.scheduler.pending or self.engine.scheduler.running
             )
 
             if has_work:
-                # Track batch utilization
                 batch_size = len(self.engine.scheduler.running)
                 self.peak_batch_size = max(self.peak_batch_size, batch_size)
 
-                # Run one step: schedule → forward → sample → update
                 step_results = self.engine.step()
 
                 # Deliver tokens to streaming futures
@@ -402,21 +515,18 @@ class AsyncI64Engine:
                             )
                             target.set_result(result)
                         elif isinstance(target, asyncio.Queue):
-                            await target.put(None)  # Signal end of stream
+                            await target.put(None)
 
                         self.active_requests -= 1
                         finished_ids.add(rid)
 
-                # Clean up finished from scheduler
                 self.engine.scheduler.finished = [
                     r for r in self.engine.scheduler.finished
                     if r.request_id not in finished_ids
                 ]
 
-                # Yield to event loop after each step
                 await asyncio.sleep(0)
             else:
-                # No work — short sleep to avoid busy-waiting
                 await asyncio.sleep(0.001)
 
     def get_stats(self) -> Dict[str, int]:

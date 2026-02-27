@@ -92,6 +92,9 @@ class I64Batch:
     # Prefill vs decode flags (integer)
     is_prefill: np.ndarray           # [batch_size] i32 (0 or 1)
 
+    # Tokens per request in this batch (for KV cache routing)
+    tokens_per_request: np.ndarray = None  # [batch_size] i32
+
     @property
     def num_requests(self) -> int:
         return len(self.request_ids)
@@ -215,6 +218,7 @@ class I64Scheduler:
         all_positions = []
         seq_lens = []
         is_prefill = []
+        toks_per_req = []
         max_blocks_per_seq = 0
 
         for req in self.running:
@@ -234,6 +238,7 @@ class I64Scheduler:
             all_token_ids.append(tokens)
             all_positions.append(positions)
             seq_lens.append(req.total_tokens)
+            toks_per_req.append(len(tokens))
             max_blocks_per_seq = max(max_blocks_per_seq, len(req.kv_block_ids))
 
         # Concatenate (integer arrays)
@@ -260,6 +265,7 @@ class I64Scheduler:
             positions=positions_flat,
             kv_block_table=kv_block_table,
             is_prefill=np.array(is_prefill, dtype=np.int32),
+            tokens_per_request=np.array(toks_per_req, dtype=np.int32),
         )
 
     def update_after_step(self, new_token_ids: Dict[int, int]):

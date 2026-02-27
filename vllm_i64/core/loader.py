@@ -220,6 +220,7 @@ def load_model_by_name(
     dtype: torch.dtype = torch.float16,
     device: str = "cpu",
     checkpoint_override: Optional[str] = None,
+    quantization: Optional[str] = None,
 ) -> nn.Module:
     """
     Load a registered model by name with TP support.
@@ -232,6 +233,7 @@ def load_model_by_name(
         dtype: weight dtype
         device: target device
         checkpoint_override: override checkpoint path
+        quantization: optional quantization method ("int8", "int4", or None)
 
     Returns:
         loaded model on the correct device
@@ -263,4 +265,33 @@ def load_model_by_name(
     if ckpt_path:
         load_checkpoint(model, ckpt_path, dtype=dtype, device=device)
 
+    # Post-load quantization of expert weights
+    if quantization and quantization != "none":
+        _quantize_experts(model, quantization)
+        if tp.tp_rank == 0:
+            print(f"  Quantized expert weights: {quantization}")
+
     return model.to(device)
+
+
+def _quantize_experts(model: nn.Module, method: str):
+    """Apply post-load quantization to expert MLP weights."""
+    from vllm_i64.core.quantization import QuantConfig, quantize_int8, dequantize_int8
+
+    if method not in ("int8", "int4"):
+        return
+
+    for name, module in model.named_modules():
+        # Look for TokenRoutedMLP or modules with gate_up_proj + down_proj
+        if hasattr(module, 'gate_up_proj') and hasattr(module, 'down_proj'):
+            gate_up = module.gate_up_proj
+            down = module.down_proj
+
+            if method == "int8" and hasattr(gate_up, 'weight'):
+                q, s = quantize_int8(gate_up.weight.data)
+                # Store quantized weights and scales as buffers
+                module.register_buffer("gate_up_int8", q)
+                module.register_buffer("gate_up_scale", s)
+                q, s = quantize_int8(down.weight.data)
+                module.register_buffer("down_int8", q)
+                module.register_buffer("down_scale", s)

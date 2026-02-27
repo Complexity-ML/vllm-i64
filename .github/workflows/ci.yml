@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy aiohttp tokenizers prometheus-client
+          pip install pytest pytest-asyncio
+          pip install -e .
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check syntax
+        run: |
+          python -m py_compile vllm_i64/__init__.py
+          python -m py_compile vllm_i64/engine/i64_engine.py
+          python -m py_compile vllm_i64/engine/i64_scheduler.py
+          python -m py_compile vllm_i64/api/server.py
+          python -m py_compile vllm_i64/core/sampling.py
+          python -m py_compile vllm_i64/core/kv_cache.py

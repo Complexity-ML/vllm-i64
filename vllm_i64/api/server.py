@@ -27,6 +27,7 @@ from dataclasses import dataclass, asdict
 from aiohttp import web
 
 from vllm_i64.engine.i64_engine import I64Engine, AsyncI64Engine, GenerationResult
+from vllm_i64.core.sampling import SamplingParams
 
 
 @dataclass
@@ -38,6 +39,15 @@ class CompletionRequest:
     top_p: float = 1.0
     repetition_penalty: float = 1.0
     stream: bool = False
+
+    def to_sampling_params(self) -> SamplingParams:
+        """Convert API request to engine sampling params."""
+        return SamplingParams(
+            temperature=self.temperature,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+        )
 
 
 @dataclass
@@ -149,6 +159,7 @@ class I64Server:
         result = await self.async_engine.generate(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
+            sampling_params=request.to_sampling_params(),
         )
 
         return self._build_response(result, prompt_ids)
@@ -156,21 +167,44 @@ class I64Server:
     async def _async_stream(
         self, request: CompletionRequest
     ) -> AsyncGenerator[str, None]:
-        """Streaming completion via async engine."""
+        """Streaming completion via async engine — OpenAI SSE format."""
         prompt_ids = self._tokenize(request.prompt)
+        self.request_counter += 1
+        stream_id = f"cmpl-{self.request_counter}"
+        created = int(time.time())
 
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
+            sampling_params=request.to_sampling_params(),
         ):
             token_text = self._detokenize([token_id])
             chunk = {
-                "id": f"cmpl-{self.request_counter}",
-                "object": "text_completion.chunk",
-                "choices": [{"text": token_text, "index": 0}],
+                "id": stream_id,
+                "object": "text_completion",
+                "created": created,
+                "model": self.model_name,
+                "choices": [{
+                    "index": 0,
+                    "text": token_text,
+                    "finish_reason": None,
+                }],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
+        # Final chunk with finish_reason
+        final = {
+            "id": stream_id,
+            "object": "text_completion",
+            "created": created,
+            "model": self.model_name,
+            "choices": [{
+                "index": 0,
+                "text": "",
+                "finish_reason": "length",
+            }],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
         yield "data: [DONE]\n\n"
 
     # =====================================================================
@@ -179,9 +213,23 @@ class I64Server:
 
     async def handle_completions(self, request: web.Request) -> web.Response:
         """POST /v1/completions — async continuous batching."""
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        prompt = body.get("prompt")
+        if not prompt:
+            return web.json_response(
+                {"error": {"message": "Missing 'prompt' field", "type": "invalid_request_error"}},
+                status=400,
+            )
+
         req = CompletionRequest(
-            prompt=body.get("prompt", ""),
+            prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
             temperature=body.get("temperature", 1.0),
             top_k=body.get("top_k", 50),
@@ -203,8 +251,20 @@ class I64Server:
 
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — async continuous batching."""
-        body = await request.json()
-        messages = body.get("messages", [])
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        messages = body.get("messages")
+        if not messages:
+            return web.json_response(
+                {"error": {"message": "Missing 'messages' field", "type": "invalid_request_error"}},
+                status=400,
+            )
         prompt = self._apply_chat_template(messages)
 
         req = CompletionRequest(

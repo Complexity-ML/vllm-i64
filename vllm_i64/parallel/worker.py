@@ -107,10 +107,17 @@ def _worker_loop(engine, tp):
     """
     Non-rank-0 worker loop.
 
-    Participates in TP all_reduce calls triggered by rank 0.
-    In the current architecture, all_reduce is called inside
-    RowParallelLinear.forward() and TokenRoutedMLP.expert_forward(),
-    so the worker just needs to be in the same forward pass.
+    Workers participate in TP compute by running the same forward passes
+    as rank 0. Coordination protocol:
+
+      1. Rank 0 broadcasts a control tensor: [opcode, batch_size, seq_len]
+         - opcode 0: shutdown
+         - opcode 1: forward step
+      2. Workers receive control, then broadcast tensor data (token_ids, positions)
+      3. Workers run the same model.forward() → NCCL all_reduce inside RowParallel
+      4. Loop back to step 1
+
+    This replaces the barrier-only approach with real data synchronization.
     """
     import torch.distributed as dist
 
@@ -119,13 +126,37 @@ def _worker_loop(engine, tp):
 
     print(f"[TP worker {tp.tp_rank}] ready, waiting for compute")
 
-    # Workers participate by running the same forward passes
-    # This is coordinated via NCCL all_reduce inside the model
+    device = tp.device
+
     while True:
         try:
-            dist.barrier(group=tp.tp_group)
-        except Exception:
+            # 1. Receive control signal from rank 0
+            control = torch.zeros(3, dtype=torch.int64, device=device)
+            dist.broadcast(control, src=0, group=tp.tp_group)
+
+            opcode = control[0].item()
+            if opcode == 0:
+                # Shutdown
+                print(f"[TP worker {tp.tp_rank}] shutdown signal received")
+                break
+
+            batch_tokens = control[1].item()
+
+            # 2. Receive tensor data
+            token_ids = torch.zeros(batch_tokens, dtype=torch.int64, device=device)
+            positions = torch.zeros(batch_tokens, dtype=torch.int32, device=device)
+            dist.broadcast(token_ids, src=0, group=tp.tp_group)
+            dist.broadcast(positions, src=0, group=tp.tp_group)
+
+            # 3. Run forward pass (participates in all_reduce via RowParallel)
+            with torch.no_grad():
+                engine.model(token_ids=token_ids, positions=positions)
+
+        except Exception as e:
+            print(f"[TP worker {tp.tp_rank}] error: {e}")
             break
+
+    print(f"[TP worker {tp.tp_rank}] exiting")
 
 
 def _run_bench(args: list, tp):
