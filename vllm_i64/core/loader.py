@@ -2,10 +2,15 @@
 vllm-i64 :: Weight Loader
 
 Load checkpoint weights into models.
+TP-aware: detects ColumnParallelLinear / RowParallelLinear and loads
+only the current rank's shard from the full checkpoint.
+
 Handles:
   - Tied embeddings (lm_head.weight → embed_tokens.weight)
-  - Token-routed MLP expert weights (gate_up_proj, down_proj)
-  - token_to_expert buffer
+  - Token-routed MLP expert weights (gate_up_proj, down_proj) — TP sharded
+  - Attention Q/K/V (ColumnParallel) — TP sharded on heads
+  - Attention O (RowParallel) — TP sharded on input dim
+  - token_to_expert buffer (replicated)
   - dtype conversion
 
 INL - 2025
@@ -17,6 +22,23 @@ from typing import Optional
 from pathlib import Path
 
 from vllm_i64.core.registry import get_model_entry
+from vllm_i64.parallel.tensor_parallel import (
+    get_tp, ColumnParallelLinear, RowParallelLinear,
+)
+
+
+def _get_module_for_param(model: nn.Module, param_name: str) -> Optional[nn.Module]:
+    """Walk the module tree to find the module owning a parameter."""
+    parts = param_name.split(".")
+    # The last part is the actual parameter name (e.g. "weight", "bias")
+    # Walk up to the parent module
+    module = model
+    for part in parts[:-1]:
+        if hasattr(module, part):
+            module = getattr(module, part)
+        else:
+            return None
+    return module
 
 
 def load_checkpoint(
@@ -27,16 +49,20 @@ def load_checkpoint(
     strict: bool = False,
 ) -> dict:
     """
-    Load a checkpoint into a model.
+    TP-aware checkpoint loading.
 
-    Handles Pacific-Prime/Complexity Deep specifics:
-      - lm_head.weight → embed_tokens.weight (tied)
-      - token_to_expert → buffer (not parameter)
-      - rotary_emb.inv_freq → skip (computed at init)
+    For ColumnParallelLinear / RowParallelLinear layers, loads the full
+    weight from checkpoint and calls load_full_weight() which takes the
+    current rank's shard.
+
+    For TokenRoutedMLP expert weights, calls load_full_weights() which
+    shards gate_up and down projections.
+
+    Other params are loaded directly (replicated).
 
     Args:
         model: the model to load into
-        checkpoint_path: path to .pt file
+        checkpoint_path: path to .pt file or directory
         dtype: target dtype for weights
         device: target device
         strict: if True, require all keys match
@@ -44,21 +70,23 @@ def load_checkpoint(
     Returns:
         dict with loading stats
     """
+    tp = get_tp()
     path = Path(checkpoint_path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    print(f"Loading checkpoint: {checkpoint_path}")
-    state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if tp.tp_rank == 0:
+        print(f"Loading checkpoint: {checkpoint_path}")
 
-    # If checkpoint wraps in "model" key
+    state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+    # Unwrap nested state dicts
     if "model" in state_dict and "model.layers.0.input_layernorm.weight" not in state_dict:
         state_dict = state_dict["model"]
-
-    # If checkpoint wraps in "state_dict" key
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
 
+    # Build lookup of model parameters and their parent modules
     params = dict(model.named_parameters())
     buffers = dict(model.named_buffers())
 
@@ -66,8 +94,12 @@ def load_checkpoint(
     skipped = set()
     missing = set()
 
+    # Collect expert weight pairs for MLP sharding
+    expert_gate_up = {}  # layer_prefix → tensor
+    expert_down = {}     # layer_prefix → tensor
+
     for name, weight in state_dict.items():
-        # Skip rotary inv_freq (computed)
+        # Skip rotary inv_freq (computed at init)
         if "rotary_emb.inv_freq" in name:
             skipped.add(name)
             continue
@@ -82,52 +114,103 @@ def load_checkpoint(
             continue
 
         # Skip embed_tokens if already loaded via lm_head
-        if name == "embed_tokens.weight" or name == "model.embed_tokens.weight":
+        if name in ("embed_tokens.weight", "model.embed_tokens.weight"):
             if name in loaded:
                 continue
 
-        # Buffer (token_to_expert)
+        # Buffer (token_to_expert — replicated)
         if "token_to_expert" in name:
-            if name in buffers:
-                buffers[name].copy_(weight)
+            buf_name = name.replace("model.", "", 1) if name not in buffers else name
+            if buf_name in buffers:
+                buffers[buf_name].copy_(weight)
                 loaded.add(name)
             continue
 
-        # Regular parameter
-        if name in params:
-            params[name].data.copy_(weight.to(dtype))
+        # Resolve actual param name (strip "model." prefix if needed)
+        resolved_name = name
+        if name not in params:
+            resolved_name = name.replace("model.", "", 1)
+
+        if resolved_name not in params:
+            missing.add(name)
+            continue
+
+        # Check if this belongs to a TP-sharded module
+        parent_module = _get_module_for_param(model, resolved_name)
+        param_leaf = resolved_name.split(".")[-1]
+
+        if isinstance(parent_module, ColumnParallelLinear) and param_leaf == "weight":
+            # Full weight → take TP shard
+            parent_module.load_full_weight(weight.to(dtype))
             loaded.add(name)
+
+        elif isinstance(parent_module, RowParallelLinear) and param_leaf == "weight":
+            # Full weight → take TP shard
+            parent_module.load_full_weight(weight.to(dtype))
+            loaded.add(name)
+
+        elif "gate_up_proj" in resolved_name and "mlp" in resolved_name:
+            # Expert MLP gate_up — collect for paired sharding
+            prefix = resolved_name.rsplit("gate_up_proj", 1)[0]
+            expert_gate_up[prefix] = weight
+            loaded.add(name)
+
+        elif "down_proj" in resolved_name and "mlp" in resolved_name:
+            # Expert MLP down — collect for paired sharding
+            prefix = resolved_name.rsplit("down_proj", 1)[0]
+            expert_down[prefix] = weight
+            loaded.add(name)
+
         else:
-            # Try with "model." prefix stripped
-            stripped = name.replace("model.", "", 1)
-            if stripped in params:
-                params[stripped].data.copy_(weight.to(dtype))
-                loaded.add(name)
-            else:
-                missing.add(name)
+            # Regular parameter (replicated) — direct copy
+            params[resolved_name].data.copy_(weight.to(dtype))
+            loaded.add(name)
+
+    # Load expert MLP weight pairs with TP sharding
+    for prefix in expert_gate_up:
+        if prefix in expert_down:
+            module_path = prefix.rstrip(".")
+            mlp_module = _get_module_for_param(model, module_path + ".gate_up_proj")
+            if mlp_module is None:
+                # Try navigating to the MLP module directly
+                parts = module_path.split(".")
+                mlp = model
+                for p in parts:
+                    if hasattr(mlp, p):
+                        mlp = getattr(mlp, p)
+                mlp_module = mlp
+
+            if hasattr(mlp_module, "load_full_weights"):
+                mlp_module.load_full_weights(
+                    expert_gate_up[prefix].to(dtype),
+                    expert_down[prefix].to(dtype),
+                )
 
     # Check for unloaded model params
     model_params = set(params.keys())
     unloaded = model_params - loaded
-    # Filter out params that don't need checkpoint (e.g. freshly initialized mu_router)
-    unloaded = {p for p in unloaded if "mu_router" not in p}
+    # Filter out params that don't need checkpoint (freshly initialized)
+    unloaded = {p for p in unloaded if "mu_router" not in p and "mu_to_" not in p}
 
     stats = {
         "loaded": len(loaded),
         "skipped": len(skipped),
         "missing_in_model": len(missing),
         "unloaded_params": len(unloaded),
+        "tp_rank": tp.tp_rank,
+        "tp_size": tp.tp_size,
     }
 
-    print(f"  Loaded: {stats['loaded']} tensors")
-    if stats['skipped']:
-        print(f"  Skipped: {stats['skipped']} (rotary inv_freq, etc.)")
-    if stats['missing_in_model']:
-        print(f"  Not in model: {stats['missing_in_model']}")
-    if stats['unloaded_params']:
-        print(f"  Unloaded params: {stats['unloaded_params']}")
-        if strict:
-            raise RuntimeError(f"Missing weights: {unloaded}")
+    if tp.tp_rank == 0:
+        print(f"  Loaded: {stats['loaded']} tensors (TP={tp.tp_size})")
+        if stats['skipped']:
+            print(f"  Skipped: {stats['skipped']} (rotary inv_freq, etc.)")
+        if stats['missing_in_model']:
+            print(f"  Not in model: {stats['missing_in_model']}")
+        if stats['unloaded_params']:
+            print(f"  Unloaded params: {stats['unloaded_params']}")
+            if strict:
+                raise RuntimeError(f"Missing weights: {unloaded}")
 
     return stats
 
@@ -139,7 +222,10 @@ def load_model_by_name(
     checkpoint_override: Optional[str] = None,
 ) -> nn.Module:
     """
-    Load a registered model by name.
+    Load a registered model by name with TP support.
+
+    Each rank creates the model (with TP-aware layers), then
+    load_checkpoint takes the appropriate shard from the full checkpoint.
 
     Args:
         model_name: registered name (e.g. "pacific-prime-chat")
@@ -148,11 +234,12 @@ def load_model_by_name(
         checkpoint_override: override checkpoint path
 
     Returns:
-        loaded model
+        loaded model on the correct device
     """
     import importlib
 
     entry = get_model_entry(model_name)
+    tp = get_tp()
 
     # Import model class dynamically
     module_path, class_name = entry.model_class.rsplit(".", 1)
@@ -167,11 +254,11 @@ def load_model_by_name(
     # Load config
     config = config_cls.from_json(entry.config_path)
 
-    # Create model
+    # Create model — TP layers auto-detect tp_size from global state
     model = model_cls(config)
     model = model.to(dtype)
 
-    # Load weights
+    # Load weights — TP-aware sharding
     ckpt_path = checkpoint_override or entry.checkpoint
     if ckpt_path:
         load_checkpoint(model, ckpt_path, dtype=dtype, device=device)

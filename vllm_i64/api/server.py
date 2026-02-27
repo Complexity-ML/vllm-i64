@@ -2,12 +2,17 @@
 vllm-i64 :: API Server (aiohttp)
 
 OpenAI-compatible API for token-routed inference.
-text → tokenize → i64 → engine → i64 → detokenize → text
+text → tokenize → i64 → async engine → i64 → detokenize → text
+
+Uses AsyncI64Engine for continuous batching:
+  - Multiple concurrent requests are batched together
+  - Each forward pass processes mixed prefill + decode
+  - Maximum GPU utilization and tok/s
 
 Endpoints:
-    POST /v1/completions     → completion
-    POST /v1/chat/completions → chat completion
-    GET  /health             → health check
+    POST /v1/completions     → completion (sync + streaming)
+    POST /v1/chat/completions → chat completion (sync + streaming)
+    GET  /health             → health check + engine stats
     GET  /v1/models          → list models
 
 INL - 2025
@@ -21,7 +26,7 @@ from dataclasses import dataclass, asdict
 
 from aiohttp import web
 
-from vllm_i64.engine.i64_engine import I64Engine, GenerationResult
+from vllm_i64.engine.i64_engine import I64Engine, AsyncI64Engine, GenerationResult
 
 
 @dataclass
@@ -52,7 +57,10 @@ class CompletionResponse:
 
 class I64Server:
     """
-    Inference server wrapping the I64Engine.
+    Inference server with async continuous batching.
+
+    Uses AsyncI64Engine: multiple HTTP requests are automatically
+    batched together for maximum throughput.
 
     All internal operations are integer.
     String handling is only at the API boundary.
@@ -67,7 +75,17 @@ class I64Server:
         host: str = "0.0.0.0",
         port: int = 8000,
     ):
-        self.engine = engine
+        # Wrap sync engine in async engine for continuous batching
+        self.async_engine = AsyncI64Engine.__new__(AsyncI64Engine)
+        self.async_engine.engine = engine
+        self.async_engine._pending_futures = {}
+        self.async_engine._request_times = {}
+        self.async_engine._engine_task = None
+        self.async_engine._running = False
+        self.async_engine.active_requests = 0
+        self.async_engine.peak_batch_size = 0
+
+        self.sync_engine = engine
         self.tokenizer = tokenizer
         self.chat_template = chat_template
         self.model_name = model_name
@@ -93,7 +111,6 @@ class I64Server:
             from jinja2 import Template
             tmpl = Template(self.chat_template)
             return tmpl.render(messages=messages, add_generation_prompt=True)
-        # Fallback: simple concat
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -102,15 +119,8 @@ class I64Server:
         parts.append("<|assistant|>\n")
         return "\n".join(parts)
 
-    def complete(self, request: CompletionRequest) -> CompletionResponse:
-        """Synchronous completion."""
-        prompt_ids = self._tokenize(request.prompt)
-
-        result = self.engine.generate(
-            prompt_token_ids=prompt_ids,
-            max_new_tokens=request.max_tokens,
-        )
-
+    def _build_response(self, result: GenerationResult, prompt_ids: List[int]) -> CompletionResponse:
+        """Build completion response from generation result."""
         output_text = self._detokenize(result.output_tokens)
         self.request_counter += 1
 
@@ -132,43 +142,43 @@ class I64Server:
             }],
         )
 
-    async def stream_complete(
+    async def _async_complete(self, request: CompletionRequest) -> CompletionResponse:
+        """Async completion — batched with other concurrent requests."""
+        prompt_ids = self._tokenize(request.prompt)
+
+        result = await self.async_engine.generate(
+            prompt_token_ids=prompt_ids,
+            max_new_tokens=request.max_tokens,
+        )
+
+        return self._build_response(result, prompt_ids)
+
+    async def _async_stream(
         self, request: CompletionRequest
     ) -> AsyncGenerator[str, None]:
-        """Streaming completion (SSE)."""
+        """Streaming completion via async engine."""
         prompt_ids = self._tokenize(request.prompt)
-        request_id = self.engine.add_request(prompt_ids, request.max_tokens)
 
-        while True:
-            results = self.engine.step()
+        async for token_id in self.async_engine.generate_stream(
+            prompt_token_ids=prompt_ids,
+            max_new_tokens=request.max_tokens,
+        ):
+            token_text = self._detokenize([token_id])
+            chunk = {
+                "id": f"cmpl-{self.request_counter}",
+                "object": "text_completion.chunk",
+                "choices": [{"text": token_text, "index": 0}],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
 
-            if request_id in results:
-                token_id = results[request_id]
-                token_text = self._detokenize([token_id])
-
-                chunk = {
-                    "id": f"cmpl-{self.request_counter}",
-                    "object": "text_completion.chunk",
-                    "choices": [{"text": token_text, "index": 0}],
-                }
-                yield f"data: {json.dumps(chunk)}\n\n"
-
-            done = any(
-                r.request_id == request_id
-                for r in self.engine.scheduler.finished
-            )
-            if done:
-                yield "data: [DONE]\n\n"
-                break
-
-            await asyncio.sleep(0)
+        yield "data: [DONE]\n\n"
 
     # =====================================================================
     # aiohttp handlers
     # =====================================================================
 
     async def handle_completions(self, request: web.Request) -> web.Response:
-        """POST /v1/completions"""
+        """POST /v1/completions — async continuous batching."""
         body = await request.json()
         req = CompletionRequest(
             prompt=body.get("prompt", ""),
@@ -184,15 +194,15 @@ class I64Server:
             response = web.StreamResponse()
             response.content_type = "text/event-stream"
             await response.prepare(request)
-            async for chunk in self.stream_complete(req):
+            async for chunk in self._async_stream(req):
                 await response.write(chunk.encode())
             return response
 
-        result = self.complete(req)
+        result = await self._async_complete(req)
         return web.json_response(result.to_dict())
 
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
-        """POST /v1/chat/completions"""
+        """POST /v1/chat/completions — async continuous batching."""
         body = await request.json()
         messages = body.get("messages", [])
         prompt = self._apply_chat_template(messages)
@@ -210,12 +220,11 @@ class I64Server:
             response = web.StreamResponse()
             response.content_type = "text/event-stream"
             await response.prepare(request)
-            async for chunk in self.stream_complete(req):
+            async for chunk in self._async_stream(req):
                 await response.write(chunk.encode())
             return response
 
-        result = self.complete(req)
-        # Wrap in chat format
+        result = await self._async_complete(req)
         result_dict = result.to_dict()
         if result_dict["choices"]:
             text = result_dict["choices"][0]["text"]
@@ -228,8 +237,8 @@ class I64Server:
         return web.json_response(result_dict)
 
     async def handle_health(self, request: web.Request) -> web.Response:
-        """GET /health"""
-        stats = self.engine.get_stats()
+        """GET /health — includes async engine stats."""
+        stats = self.async_engine.get_stats()
         return web.json_response({
             "status": "ok",
             "model": self.model_name,
@@ -249,20 +258,34 @@ class I64Server:
         })
 
     def create_app(self) -> web.Application:
-        """Create aiohttp application with routes."""
+        """Create aiohttp application with routes and engine lifecycle."""
         app = web.Application()
         app.router.add_post("/v1/completions", self.handle_completions)
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
+
+        # Start/stop async engine with the app
+        app.on_startup.append(self._on_startup)
+        app.on_cleanup.append(self._on_cleanup)
         return app
 
+    async def _on_startup(self, app):
+        """Start the async engine loop when server starts."""
+        await self.async_engine.start()
+        print(f"  engine: continuous batching started")
+
+    async def _on_cleanup(self, app):
+        """Stop the async engine loop when server shuts down."""
+        await self.async_engine.stop()
+
     def run(self):
-        """Start the server."""
+        """Start the server with async continuous batching."""
         print(f"vllm-i64 :: {self.model_name}")
         print(f"  http://{self.host}:{self.port}")
         print(f"  POST /v1/completions")
         print(f"  POST /v1/chat/completions")
         print(f"  GET  /health")
+        print(f"  mode: async continuous batching")
         app = self.create_app()
         web.run_app(app, host=self.host, port=self.port, print=None)

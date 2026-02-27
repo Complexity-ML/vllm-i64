@@ -2,10 +2,14 @@
 vllm-i64 :: CLI
 
 Usage:
-    vllm-i64 serve <model> [--port 8000] [--host 0.0.0.0] [--dtype float16]
-    vllm-i64 bench <model> [--num-tokens 1024]
+    vllm-i64 serve <model> [--port 8000] [--host 0.0.0.0] [--dtype float16] [--tp 1]
+    vllm-i64 bench [--num-experts 4]
     vllm-i64 list
     vllm-i64 check <model>
+
+Multi-GPU:
+    vllm-i64 serve pacific-prime-chat --tp 4
+    → launches 4 workers via torchrun, continuous batching on each
 
 INL - 2025
 """
@@ -15,7 +19,26 @@ import sys
 
 
 def cmd_serve(args):
-    """Start inference server."""
+    """Start inference server (single-GPU or multi-GPU via torchrun)."""
+
+    # If TP > 1, launch via torchrun
+    if args.tp > 1:
+        from vllm_i64.parallel.launcher import launch_distributed
+
+        # Forward all args to the worker
+        forward_args = ["serve", args.model]
+        forward_args += ["--host", args.host]
+        forward_args += ["--port", str(args.port)]
+        forward_args += ["--dtype", args.dtype]
+        if args.checkpoint:
+            forward_args += ["--checkpoint", args.checkpoint]
+        if args.chat_template:
+            forward_args += ["--chat-template", args.chat_template]
+
+        rc = launch_distributed(tp_size=args.tp, args=forward_args)
+        sys.exit(rc)
+
+    # Single-GPU: run directly
     import torch
     from vllm_i64.core.loader import load_model_by_name
     from vllm_i64.engine.i64_engine import I64Engine
@@ -33,6 +56,7 @@ def cmd_serve(args):
 
     # Load model
     model = load_model_by_name(args.model, dtype=dtype, device=device, checkpoint_override=args.checkpoint)
+    model.eval()
 
     # Load tokenizer
     tokenizer = load_tokenizer(args.model)
@@ -43,8 +67,13 @@ def cmd_serve(args):
         with open(args.chat_template) as f:
             chat_template = f.read()
 
-    # Create engine + server
-    engine = I64Engine(model=model, num_experts=4, vocab_size=model.config.vocab_size)
+    # Create engine + server (async continuous batching)
+    engine = I64Engine(
+        model=model,
+        num_experts=model.config.num_experts,
+        vocab_size=model.config.vocab_size,
+        device=device,
+    )
     server = I64Server(
         engine=engine,
         tokenizer=tokenizer,
@@ -118,7 +147,7 @@ def cmd_bench(args):
         print(f"{r_i64['method']:<25} {n_tok:>8} {r_i64['us_per_call']:>10} {r_i64['ns_per_token']:>10}")
         print(f"{r_float['method']:<25} {n_tok:>8} {r_float['us_per_call']:>10} {r_float['ns_per_token']:>10}")
         speedup = r_float['us_per_call'] / max(r_i64['us_per_call'], 0.01)
-        print(f"{'  → speedup':<25} {'':>8} {f'{speedup:.0f}x':>10}")
+        print(f"{'  -> speedup':<25} {'':>8} {f'{speedup:.0f}x':>10}")
         print()
 
     print("\n--- Full pipeline ---")
@@ -142,7 +171,7 @@ def main():
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
-    p_serve.add_argument("--tp", type=int, default=1, help="Tensor parallel size")
+    p_serve.add_argument("--tp", type=int, default=1, help="Tensor parallel size (num GPUs)")
     p_serve.add_argument("--quantization", default=None, choices=["int8", "int4", None])
     p_serve.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     p_serve.add_argument("--chat-template", default=None, help="Path to chat template")

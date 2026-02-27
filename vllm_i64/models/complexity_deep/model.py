@@ -9,6 +9,13 @@ Uses the GENERIC TokenRoutedMLP layer + adds:
   - Mu Residual Highway (accumulated context across layers)
   - GQA, QK Norm
 
+Tensor Parallelism:
+  - Q/K/V projections: ColumnParallel (heads sharded)
+  - O projection: RowParallel + all_reduce
+  - Expert MLP: sharded on intermediate dim (via TokenRoutedMLP)
+  - INL Dynamics: replicated (small controller)
+  - Embeddings: replicated
+
 Other models can use TokenRoutedMLP directly without any of this.
 
 INL - 2025
@@ -24,6 +31,9 @@ from vllm_i64.layers.token_routed_mlp import TokenRoutedMLP
 from vllm_i64.layers.rmsnorm import RMSNorm
 from vllm_i64.layers.rotary import RotaryEmbedding, apply_rotary
 from vllm_i64.models.complexity_deep.config import ComplexityDeepConfig
+from vllm_i64.parallel.tensor_parallel import (
+    get_tp, ColumnParallelLinear, RowParallelLinear,
+)
 
 
 # =========================================================================
@@ -138,40 +148,54 @@ class MuGuidedTokenRoutedMLP(TokenRoutedMLP):
 
 class MuGuidedAttention(nn.Module):
     """
-    Complexity Deep attention.
+    Complexity Deep attention with Tensor Parallelism.
 
-    Generic parts: GQA, QK norm, RoPE
+    TP strategy:
+      - Q/K/V: ColumnParallel — heads sharded across ranks
+      - O: RowParallel — input dim sharded, all_reduce on output
+      - mu_to_q/k/v: ColumnParallel (matches Q/K/V sharding)
+
     Complexity Deep specific: mu biases Q, K, V from previous layer
+    Generic parts: GQA, QK norm, RoPE
     """
 
     def __init__(self, config: ComplexityDeepConfig):
         super().__init__()
+        tp = get_tp()
+
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
-        self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.tp_size = tp.tp_size
 
-        # Q/K/V (separate, not fused — mirrors checkpoint)
-        self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, config.hidden_size, bias=False)
+        # TP-sharded head counts
+        self.num_heads_per_tp = self.num_heads // tp.tp_size
+        self.num_kv_heads_per_tp = self.num_kv_heads // tp.tp_size
+        self.num_kv_groups = self.num_heads_per_tp // self.num_kv_heads_per_tp
 
-        # Mu-guided projections (Complexity Deep specific)
-        self.mu_to_q = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.mu_to_k = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
-        self.mu_to_v = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        # Q/K/V — ColumnParallel (output dim = heads * head_dim, sharded)
+        self.q_proj = ColumnParallelLinear(config.hidden_size, self.num_heads * self.head_dim)
+        self.k_proj = ColumnParallelLinear(config.hidden_size, self.num_kv_heads * self.head_dim)
+        self.v_proj = ColumnParallelLinear(config.hidden_size, self.num_kv_heads * self.head_dim)
+
+        # O — RowParallel (input dim sharded, all_reduce on output)
+        self.o_proj = RowParallelLinear(self.num_heads * self.head_dim, config.hidden_size)
+
+        # Mu-guided projections — ColumnParallel (matches Q/K/V sharding)
+        self.mu_to_q = ColumnParallelLinear(config.hidden_size, self.num_heads * self.head_dim)
+        self.mu_to_k = ColumnParallelLinear(config.hidden_size, self.num_kv_heads * self.head_dim)
+        self.mu_to_v = ColumnParallelLinear(config.hidden_size, self.num_kv_heads * self.head_dim)
         for proj in [self.mu_to_q, self.mu_to_k, self.mu_to_v]:
-            nn.init.normal_(proj.weight, std=0.01)
+            nn.init.normal_(proj.linear.weight, std=0.01)
 
-        # QK Norm
+        # QK Norm (per head_dim, replicated)
         self.use_qk_norm = config.use_qk_norm
         if self.use_qk_norm:
             self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # RoPE
+        # RoPE (replicated)
         self.rope = RotaryEmbedding(self.head_dim, config.max_position_embeddings, config.rope_theta)
 
     def forward(
@@ -183,6 +207,7 @@ class MuGuidedAttention(nn.Module):
     ) -> torch.Tensor:
         bsz = hidden.shape[0]
 
+        # ColumnParallel: output is (bsz, heads_per_tp * head_dim)
         q = self.q_proj(hidden)
         k = self.k_proj(hidden)
         v = self.v_proj(hidden)
@@ -193,9 +218,10 @@ class MuGuidedAttention(nn.Module):
             k = k + self.mu_to_k(mu_prev)
             v = v + self.mu_to_v(mu_prev)
 
-        q = q.view(bsz, self.num_heads, self.head_dim)
-        k = k.view(bsz, self.num_kv_heads, self.head_dim)
-        v = v.view(bsz, self.num_kv_heads, self.head_dim)
+        # Reshape to per-TP head counts
+        q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
+        k = k.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+        v = v.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
 
         # QK Norm
         if self.use_qk_norm:
@@ -207,12 +233,12 @@ class MuGuidedAttention(nn.Module):
         q = apply_rotary(q, cos, sin)
         k = apply_rotary(k, cos, sin)
 
-        # GQA: repeat KV heads
+        # GQA: repeat KV heads within this TP shard
         if self.num_kv_groups > 1:
             k = k.repeat_interleave(self.num_kv_groups, dim=1)
             v = v.repeat_interleave(self.num_kv_groups, dim=1)
 
-        # Attention
+        # Attention (on this rank's heads only)
         scale = 1.0 / math.sqrt(self.head_dim)
         q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
 
@@ -222,7 +248,10 @@ class MuGuidedAttention(nn.Module):
         attn = F.softmax(attn, dim=-1)
         out = torch.bmm(attn, v)
 
-        out = out.transpose(0, 1).reshape(bsz, self.num_heads * self.head_dim)
+        # Reshape back: (heads_per_tp, bsz, head_dim) → (bsz, heads_per_tp * head_dim)
+        out = out.transpose(0, 1).reshape(bsz, self.num_heads_per_tp * self.head_dim)
+
+        # RowParallel: matmul + all_reduce across TP ranks
         return self.o_proj(out)
 
 
