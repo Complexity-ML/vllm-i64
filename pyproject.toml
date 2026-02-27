@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-i64"
+version = "0.1.0"
+description = "Integer-first inference engine for token-routed language models"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+    {name = "INL / Complexity-ML"},
+]
+keywords = ["inference", "llm", "token-routing", "i64", "moe"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "aiohttp>=3.9",
+    "tokenizers>=0.15",
+    "prometheus-client>=0.17",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "httpx>=0.24",
+]
+quantization = [
+    "bitsandbytes>=0.41",
+]
+
+[project.scripts]
+vllm-i64 = "vllm_i64.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Complexity-ML/vllm-i64"
+Repository = "https://github.com/Complexity-ML/vllm-i64"
+
+[tool.setuptools.packages.find]
+include = ["vllm_i64*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
