@@ -102,9 +102,53 @@ def sample_token(
     return token_id
 
 
+def apply_repetition_penalty_batch(
+    logits: torch.Tensor,
+    past_tokens_list: List[List[int]],
+    penalty: float,
+    vocab_size: int,
+) -> torch.Tensor:
+    """
+    Apply repetition penalty to a batch of logits.
+
+    For each request i, penalizes logits[i, token] for all tokens
+    in past_tokens_list[i]. Positive logits are divided by penalty,
+    negative logits are multiplied by penalty.
+
+    Args:
+        logits: (batch, vocab_size) — modified in-place
+        past_tokens_list: per-request token history
+        penalty: repetition penalty factor (1.0 = no penalty)
+        vocab_size: filter out-of-range token IDs
+
+    Returns:
+        logits (modified in-place)
+    """
+    if penalty == 1.0:
+        return logits
+
+    device = logits.device
+    for i in range(logits.shape[0]):
+        past = past_tokens_list[i]
+        if not past:
+            continue
+        past_tensor = torch.tensor(past, dtype=torch.long, device=device).unique()
+        past_tensor = past_tensor[past_tensor < vocab_size]
+        if past_tensor.numel() == 0:
+            continue
+        scores = logits[i, past_tensor]
+        logits[i, past_tensor] = torch.where(
+            scores > 0,
+            scores / penalty,
+            scores * penalty,
+        )
+    return logits
+
+
 def sample_batch(
     logits: torch.Tensor,
     params: SamplingParams,
+    past_tokens_list: Optional[List[List[int]]] = None,
 ) -> torch.Tensor:
     """
     Sample tokens for a batch.
@@ -112,10 +156,18 @@ def sample_batch(
     Args:
         logits: (batch, vocab_size)
         params: sampling parameters
+        past_tokens_list: per-request token history (for repetition penalty)
 
     Returns:
         token_ids: (batch,) i64 tensor
     """
+    # Apply repetition penalty before temperature/sampling
+    if params.repetition_penalty != 1.0 and past_tokens_list is not None:
+        logits = logits.float()
+        apply_repetition_penalty_batch(
+            logits, past_tokens_list, params.repetition_penalty, logits.shape[-1]
+        )
+
     if params.temperature == 0.0:
         return logits.argmax(dim=-1)
 

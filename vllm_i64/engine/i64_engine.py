@@ -33,7 +33,7 @@ from typing import List, Dict, Optional, Callable, Set
 from dataclasses import dataclass, field
 
 from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
-from vllm_i64.core.sampling import SamplingParams, sample_batch
+from vllm_i64.core.sampling import SamplingParams, sample_batch, apply_repetition_penalty_batch
 from vllm_i64.core.logging import get_logger
 
 logger = get_logger("vllm_i64.engine")
@@ -75,12 +75,16 @@ class I64Engine:
         max_seq_len: int = 2048,
         max_kv_blocks: int = 4096,
         device: str = "cuda",
+        enable_prefix_caching: bool = False,
+        kv_cache_dtype: Optional[str] = None,
     ):
         self.model = model
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
         self.device = device
+        self.enable_prefix_caching = enable_prefix_caching
+        self.kv_cache_dtype = kv_cache_dtype
 
         # Integer-only scheduler
         self.scheduler = I64Scheduler(
@@ -143,8 +147,13 @@ class I64Engine:
             max_seqs=max_seqs,
             dtype=dtype,
             device=self.device,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
         self._slot_pool = list(range(max_seqs))
+
+        if self.enable_prefix_caching:
+            self.kv_cache.enable_prefix_caching()
+            logger.info("Prefix caching enabled")
 
     def _init_cuda_graph(self, max_batch_size: int):
         """Initialize CUDA graph runner for decode steps."""
@@ -160,6 +169,19 @@ class I64Engine:
                 device=self.device,
             )
         except Exception:
+            self.cuda_graph_runner = None
+
+    def warmup_and_capture_graphs(self):
+        """Warmup model and capture CUDA graphs for common decode batch sizes."""
+        if self.cuda_graph_runner is None or self.model is None:
+            return
+        if self.device == "cpu":
+            return
+        try:
+            self.cuda_graph_runner.capture_common_sizes()
+            logger.info(f"CUDA graphs captured for sizes: {sorted(self.cuda_graph_runner._captured_sizes)}")
+        except Exception as e:
+            logger.warning(f"CUDA graph capture failed: {e}")
             self.cuda_graph_runner = None
 
     def enable_metrics(self, port: int = 9090, model_name: str = ""):
@@ -217,17 +239,30 @@ class I64Engine:
         if self.kv_cache is not None:
             self._allocate_slot(request_id)
 
+            # Try to reuse prefix from cache
+            if self.kv_cache.prefix_cache_enabled:
+                slot = self._request_to_slot.get(request_id)
+                if slot is not None:
+                    reused = self.kv_cache.try_reuse_prefix(slot, list(ids))
+                    if reused > 0:
+                        for req in self.scheduler.pending:
+                            if req.request_id == request_id:
+                                req.prefill_progress = reused
+                                req.seq_pos = reused
+                                break
+                        logger.info(f"Prefix cache hit: reused {reused} tokens for request {request_id}")
+
         return request_id
 
     def cancel_request(self, request_id: int):
         """Cancel a running or pending request."""
         self._cancelled_requests.add(request_id)
 
-    def _i64_sample(self, logits: torch.Tensor) -> np.ndarray:
+    def _i64_sample(self, logits: torch.Tensor, past_tokens_list=None) -> np.ndarray:
         """
         Sample next tokens from logits using configured sampling params.
         """
-        token_ids = sample_batch(logits, self.sampling_params)
+        token_ids = sample_batch(logits, self.sampling_params, past_tokens_list=past_tokens_list)
         return token_ids.cpu().numpy().astype(np.int64)
 
     def _check_timeouts_and_cancellations(self):
@@ -277,6 +312,39 @@ class I64Engine:
             self.scheduler._free_kv_blocks(req.kv_block_ids)
             req.kv_block_ids = []
 
+    def _speculative_step(self, batch: I64Batch) -> Dict[int, int]:
+        """
+        Speculative decode step for small decode-only batches.
+
+        Uses draft model to generate K tokens, verifies with target model.
+        Multi-token acceptance → fewer forward passes → higher throughput.
+        """
+        result = {}
+        for i, req_id in enumerate(batch.request_ids):
+            rid = int(req_id)
+            req = next((r for r in self.scheduler.running if r.request_id == rid), None)
+            if req is None:
+                continue
+
+            # Build context for speculative decoder
+            ctx = torch.tensor(
+                list(req.prompt_token_ids) + req.output_token_ids,
+                dtype=torch.int64, device=self.device,
+            )
+            pos = torch.arange(len(ctx), dtype=torch.int32, device=self.device)
+
+            accepted, _ = self.speculative_decoder.generate_step(ctx, pos)
+
+            # Feed all accepted tokens except the last into the request directly
+            for token in accepted[:-1]:
+                req.output_token_ids.append(token)
+                req.seq_pos = req.total_tokens
+
+            # Return the last accepted token for normal update_after_step
+            result[rid] = accepted[-1] if accepted else 0
+
+        return result
+
     def step(self) -> Dict[int, int]:
         """
         Execute one engine step.
@@ -299,6 +367,18 @@ class I64Engine:
                 kv_stats = self.kv_cache.get_stats()
                 self.metrics.update_kv_usage(kv_stats["used_blocks"], kv_stats["num_blocks"])
 
+        # 1.5. Speculative decoding for small decode-only batches
+        if (self.speculative_decoder is not None
+                and batch.is_prefill.sum() == 0
+                and batch.num_requests <= 4):
+            result = self._speculative_step(batch)
+            self.scheduler.update_after_step(result)
+            for req in self.scheduler.finished:
+                self._free_slot(req.request_id)
+            self.total_steps += 1
+            self.total_tokens_generated += len(result)
+            return result
+
         # 2. Model forward (fp16) — the ONLY float step
         if self.model is not None:
             logits = self._model_forward(batch)
@@ -314,32 +394,19 @@ class I64Engine:
                 offset += int(tpr)
             logits = logits[last_indices]  # (num_requests, vocab_size)
 
-        # 3.5. Apply repetition penalty per request (using token history)
+        # 3.5. Build per-request token history for repetition penalty
+        past_tokens_list = None
         if self.sampling_params.repetition_penalty != 1.0:
-            penalty = self.sampling_params.repetition_penalty
-            for i, req_id in enumerate(batch.request_ids):
-                req = None
-                for r in self.scheduler.running:
-                    if r.request_id == int(req_id):
-                        req = r
-                        break
+            past_tokens_list = []
+            for req_id in batch.request_ids:
+                req = next((r for r in self.scheduler.running if r.request_id == int(req_id)), None)
                 if req is not None:
-                    past = list(req.prompt_token_ids) + req.output_token_ids
-                    if past:
-                        past_tensor = torch.tensor(past, dtype=torch.long, device=logits.device).unique()
-                        # Filter out-of-range token IDs (test models may have small vocab)
-                        vocab_size = logits.shape[-1]
-                        past_tensor = past_tensor[past_tensor < vocab_size]
-                        if past_tensor.numel() > 0:
-                            row = logits[i]
-                            row[past_tensor] = torch.where(
-                                row[past_tensor] > 0,
-                                row[past_tensor] / penalty,
-                                row[past_tensor] * penalty,
-                            )
+                    past_tokens_list.append(list(req.prompt_token_ids) + req.output_token_ids)
+                else:
+                    past_tokens_list.append([])
 
-        # 4. Sample (configurable)
-        new_token_ids = self._i64_sample(logits)
+        # 4. Sample (configurable, includes repetition penalty)
+        new_token_ids = self._i64_sample(logits, past_tokens_list)
 
         # 5. Map back to requests (integer indexing)
         result = {}
@@ -348,6 +415,14 @@ class I64Engine:
 
         # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)
+
+        # 6.5 Register prefix blocks for requests that just completed prefill
+        if self.kv_cache is not None and self.kv_cache.prefix_cache_enabled:
+            for req in self.scheduler.running:
+                if req.request_id in result and req.prefill_complete and req.num_generated == 1:
+                    slot = self._request_to_slot.get(req.request_id)
+                    if slot is not None:
+                        self.kv_cache.register_prefix_blocks(slot, list(req.prompt_token_ids))
 
         # 7. Free KV slots for finished requests
         for req in self.scheduler.finished:

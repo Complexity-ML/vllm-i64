@@ -99,7 +99,20 @@ def cmd_serve(args):
         num_experts=model.config.num_experts,
         vocab_size=model.config.vocab_size,
         device=device,
+        enable_prefix_caching=getattr(args, 'enable_prefix_caching', False),
+        kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
     )
+
+    # Speculative decoding (optional)
+    if getattr(args, 'speculative_model', None):
+        draft_model = load_model_by_name(args.speculative_model, dtype=dtype, device=device)
+        draft_model.eval()
+        num_spec = getattr(args, 'num_speculative_tokens', 5)
+        engine.enable_speculative(draft_model, num_spec)
+        print(f"  speculative: {args.speculative_model} (K={num_spec})")
+
+    # CUDA graph warmup (captures decode graphs for common batch sizes)
+    engine.warmup_and_capture_graphs()
     server = I64Server(
         engine=engine,
         tokenizer=tokenizer,
@@ -207,6 +220,14 @@ def main():
     p_serve.add_argument("--quantization", default=None, choices=["int8", "int4", None])
     p_serve.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     p_serve.add_argument("--chat-template", default=None, help="Path to chat template")
+    p_serve.add_argument("--enable-prefix-caching", action="store_true",
+                         help="Enable prefix caching for KV cache reuse")
+    p_serve.add_argument("--kv-cache-dtype", default=None, choices=["fp8", "fp8_e5m2"],
+                         help="KV cache quantization (fp8 for 2x memory savings)")
+    p_serve.add_argument("--speculative-model", default=None,
+                         help="Path to draft model for speculative decoding")
+    p_serve.add_argument("--num-speculative-tokens", type=int, default=5,
+                         help="Number of tokens to speculate ahead")
     p_serve.set_defaults(func=cmd_serve)
 
     # list

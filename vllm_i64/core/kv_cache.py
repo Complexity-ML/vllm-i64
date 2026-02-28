@@ -40,6 +40,7 @@ class PagedKVCache:
         max_seqs: int = 64,
         dtype: torch.dtype = torch.float16,
         device: str = "cpu",
+        kv_cache_dtype: Optional[str] = None,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -47,20 +48,29 @@ class PagedKVCache:
         self.block_size = block_size
         self.num_blocks = num_blocks
         self.max_seqs = max_seqs
-        self.dtype = dtype
+        self.compute_dtype = dtype
         self.device = device
+
+        # FP8 quantization: store KV in FP8 for 2x memory savings
+        if kv_cache_dtype == "fp8" and device != "cpu":
+            self.kv_dtype = torch.float8_e4m3fn
+        elif kv_cache_dtype == "fp8_e5m2" and device != "cpu":
+            self.kv_dtype = torch.float8_e5m2
+        else:
+            self.kv_dtype = dtype
+        self.dtype = dtype  # backward compat (read_kv returns this dtype)
 
         max_blocks_per_seq = 128  # max sequence length / block_size
 
-        # KV tensors (float — the actual cache data)
+        # KV tensors (stored in kv_dtype — may be FP8 for memory savings)
         # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
         # Layout matches flash_attn_with_kv_cache expectations
         self.k_caches = [
-            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=device)
             for _ in range(num_layers)
         ]
         self.v_caches = [
-            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=device)
             for _ in range(num_layers)
         ]
 
@@ -130,8 +140,8 @@ class PagedKVCache:
             # Need to allocate
             [physical_block] = self.allocate_blocks(seq_id, 1)
 
-        self.k_caches[layer_idx][physical_block, offset, :, :] = k
-        self.v_caches[layer_idx][physical_block, offset, :, :] = v
+        self.k_caches[layer_idx][physical_block, offset, :, :] = k.to(self.kv_dtype)
+        self.v_caches[layer_idx][physical_block, offset, :, :] = v.to(self.kv_dtype)
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), position + 1)
 
     def read_kv(
@@ -151,8 +161,9 @@ class PagedKVCache:
         if max_len is not None:
             seq_len = min(seq_len, max_len)
 
-        k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.dtype, device=self.device)
-        v_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.dtype, device=self.device)
+        # Always return in compute dtype (dequantize if FP8)
+        k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device)
+        v_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device)
 
         for pos in range(seq_len):
             block_idx = pos // self.block_size
@@ -160,8 +171,8 @@ class PagedKVCache:
             physical_block = self.block_table[seq_id, block_idx].item()
 
             if physical_block >= 0:
-                k_out[pos] = self.k_caches[layer_idx][physical_block, offset, :, :]
-                v_out[pos] = self.v_caches[layer_idx][physical_block, offset, :, :]
+                k_out[pos] = self.k_caches[layer_idx][physical_block, offset, :, :].to(self.compute_dtype)
+                v_out[pos] = self.v_caches[layer_idx][physical_block, offset, :, :].to(self.compute_dtype)
 
         return k_out, v_out
 
@@ -183,8 +194,8 @@ class PagedKVCache:
             if physical_block < 0:
                 [physical_block] = self.allocate_blocks(seq_id, 1)
 
-            self.k_caches[layer_idx][physical_block, offset, :, :] = k[t]
-            self.v_caches[layer_idx][physical_block, offset, :, :] = v[t]
+            self.k_caches[layer_idx][physical_block, offset, :, :] = k[t].to(self.kv_dtype)
+            self.v_caches[layer_idx][physical_block, offset, :, :] = v[t].to(self.kv_dtype)
 
         max_pos = positions.max().item() + 1
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), max_pos)
