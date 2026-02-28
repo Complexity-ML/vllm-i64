@@ -28,6 +28,10 @@ class PagedKVCache:
         block_table: (max_seqs, max_blocks_per_seq) i32
 
     Block allocation/deallocation is pure integer.
+
+    LRU eviction: when the cache is full, the least recently used
+    sequence is evicted to make room — no RuntimeError, no lost requests.
+    All LRU tracking is integer (monotonic counter).
     """
 
     def __init__(
@@ -41,6 +45,7 @@ class PagedKVCache:
         dtype: torch.dtype = torch.float16,
         device: str = "cpu",
         kv_cache_dtype: Optional[str] = None,
+        enable_lru_eviction: bool = True,
     ):
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
@@ -85,6 +90,13 @@ class PagedKVCache:
         # Sequence lengths (integer)
         self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device=device)
 
+        # ── LRU eviction tracking (all integer) ──
+        self.enable_lru_eviction = enable_lru_eviction
+        self._access_counter: int = 0          # monotonic i64 clock
+        self._last_access: Dict[int, int] = {} # seq_id → last access tick
+        self._eviction_count: int = 0          # total evictions performed
+        self._evicted_seq_ids: List[int] = []  # recently evicted (for scheduler)
+
     @property
     def num_free_blocks(self) -> int:
         return len(self.free_blocks)
@@ -93,16 +105,80 @@ class PagedKVCache:
     def num_used_blocks(self) -> int:
         return self.num_blocks - len(self.free_blocks)
 
+    def _touch(self, seq_id: int):
+        """Update LRU access tick for a sequence. Pure integer."""
+        self._access_counter += 1
+        self._last_access[seq_id] = self._access_counter
+
+    def _evict_lru(self, num_blocks_needed: int, protect_seq_id: int = -1) -> int:
+        """
+        Evict least recently used sequences until we have enough free blocks.
+
+        Args:
+            num_blocks_needed: how many blocks we need to free
+            protect_seq_id: don't evict this sequence (the one requesting blocks)
+
+        Returns:
+            Number of blocks freed.
+        """
+        freed = 0
+        self._evicted_seq_ids.clear()
+
+        # Find active sequences (seq_lens > 0), sorted by LRU (oldest access first)
+        active_seqs = []
+        for sid in range(self.max_seqs):
+            if self.seq_lens[sid].item() > 0 and sid != protect_seq_id:
+                tick = self._last_access.get(sid, 0)
+                active_seqs.append((tick, sid))
+
+        # Sort by access tick ascending — least recently used first
+        active_seqs.sort()
+
+        for _tick, victim_sid in active_seqs:
+            if freed >= num_blocks_needed:
+                break
+
+            # Count blocks held by this sequence
+            blocks = self.block_table[victim_sid]
+            victim_blocks = 0
+            for i in range(blocks.shape[0]):
+                if blocks[i].item() >= 0:
+                    victim_blocks += 1
+
+            # Free it
+            self.free_sequence(victim_sid)
+            freed += victim_blocks
+            self._eviction_count += 1
+            self._evicted_seq_ids.append(victim_sid)
+
+        return freed
+
+    def get_evicted_seq_ids(self) -> List[int]:
+        """Return seq_ids evicted in the last allocate_blocks call (for scheduler sync)."""
+        return list(self._evicted_seq_ids)
+
     def allocate_blocks(self, seq_id: int, num_blocks_needed: int) -> List[int]:
         """
         Allocate blocks for a sequence. Pure integer operation.
 
+        With LRU eviction enabled, automatically evicts the least recently
+        used sequences when the cache is full instead of raising OOM.
+
         Returns list of allocated block IDs.
         """
         if num_blocks_needed > len(self.free_blocks):
-            raise RuntimeError(
-                f"OOM: need {num_blocks_needed} blocks, have {len(self.free_blocks)}"
-            )
+            if self.enable_lru_eviction:
+                deficit = num_blocks_needed - len(self.free_blocks)
+                freed = self._evict_lru(deficit, protect_seq_id=seq_id)
+                if freed < deficit:
+                    raise RuntimeError(
+                        f"OOM after LRU eviction: need {num_blocks_needed} blocks, "
+                        f"freed {freed}, have {len(self.free_blocks)}"
+                    )
+            else:
+                raise RuntimeError(
+                    f"OOM: need {num_blocks_needed} blocks, have {len(self.free_blocks)}"
+                )
 
         allocated = []
         current_blocks = (self.block_table[seq_id] >= 0).sum().item()
@@ -113,6 +189,7 @@ class PagedKVCache:
             self.block_table[seq_id, block_idx] = block_id
             allocated.append(block_id)
 
+        self._touch(seq_id)
         return allocated
 
 
@@ -143,6 +220,7 @@ class PagedKVCache:
         self.k_caches[layer_idx][physical_block, offset, :, :] = k.to(self.kv_dtype)
         self.v_caches[layer_idx][physical_block, offset, :, :] = v.to(self.kv_dtype)
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), position + 1)
+        self._touch(seq_id)
 
     def read_kv(
         self,
@@ -157,6 +235,7 @@ class PagedKVCache:
             k: (seq_len, num_kv_heads, head_dim)
             v: (seq_len, num_kv_heads, head_dim)
         """
+        self._touch(seq_id)
         seq_len = self.seq_lens[seq_id].item()
         if max_len is not None:
             seq_len = min(seq_len, max_len)
@@ -199,6 +278,7 @@ class PagedKVCache:
 
         max_pos = positions.max().item() + 1
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), max_pos)
+        self._touch(seq_id)
 
     def get_cache_tensors(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -322,6 +402,7 @@ class PagedKVCache:
                 blocks[i] = -1
 
         self.seq_lens[seq_id] = 0
+        self._last_access.pop(seq_id, None)
 
     def get_stats(self) -> dict:
         """Cache stats — all integers."""
@@ -335,4 +416,7 @@ class PagedKVCache:
         if self.prefix_cache_enabled:
             stats["prefix_cached_blocks"] = len(getattr(self, "_block_to_prefix", {}))
             stats["prefix_unique_hashes"] = len(getattr(self, "_prefix_hash_to_blocks", {}))
+        if self.enable_lru_eviction:
+            stats["lru_evictions_total"] = self._eviction_count
+            stats["lru_tracked_seqs"] = len(self._last_access)
         return stats
