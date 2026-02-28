@@ -363,6 +363,12 @@ class I64Engine:
 
         # 1. Schedule (i64)
         batch = self.scheduler.schedule()
+
+        # Free KV slots for newly finished requests (must run even when batch is None)
+        for req in self.scheduler.finished:
+            self._free_slot(req.request_id)
+            self._request_sampling_params.pop(req.request_id, None)
+
         if batch is None:
             return {}
 
@@ -456,11 +462,6 @@ class I64Engine:
                     slot = self._request_to_slot.get(req.request_id)
                     if slot is not None:
                         self.kv_cache.register_prefix_blocks(slot, list(req.prompt_token_ids))
-
-        # 7. Free KV slots and per-request params for finished requests
-        for req in self.scheduler.finished:
-            self._free_slot(req.request_id)
-            self._request_sampling_params.pop(req.request_id, None)
 
         # Integer counters
         self.total_steps += 1
@@ -775,10 +776,10 @@ class AsyncI64Engine:
                                 finish_reason=finish_reason,
                             )
                             target.set_result(result)
+                            self.active_requests -= 1
                         elif isinstance(target, asyncio.Queue):
+                            # Signal end to generate_stream; its finally block handles active_requests
                             await target.put(None)
-
-                        self.active_requests -= 1
                         finished_ids.add(rid)
 
                 self.engine.scheduler.finished = [
