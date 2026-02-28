@@ -381,11 +381,16 @@ class I64Server:
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
+        app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app
         app.on_startup.append(self._on_startup)
         app.on_cleanup.append(self._on_cleanup)
         return app
+
+    async def handle_root(self, request):
+        """Redirect to demo page."""
+        raise web.HTTPFound("https://complexity-ml.com/demo")
 
     async def _handle_options(self, request):
         """Handle CORS preflight requests."""
