@@ -34,6 +34,8 @@ def cmd_serve(args):
             forward_args += ["--checkpoint", args.checkpoint]
         if args.chat_template:
             forward_args += ["--chat-template", args.chat_template]
+        if args.quantization:
+            forward_args += ["--quantization", args.quantization]
 
         rc = launch_distributed(tp_size=args.tp, args=forward_args)
         sys.exit(rc)
@@ -60,7 +62,11 @@ def cmd_serve(args):
     print(f"  host={args.host} port={args.port} dtype={dtype} device={device}")
 
     # Load model
-    model = load_model_by_name(args.model, dtype=dtype, device=device, checkpoint_override=args.checkpoint)
+    model = load_model_by_name(
+        args.model, dtype=dtype, device=device,
+        checkpoint_override=args.checkpoint,
+        quantization=args.quantization,
+    )
     model.eval()
 
     # Load tokenizer (from checkpoint dir if overridden)

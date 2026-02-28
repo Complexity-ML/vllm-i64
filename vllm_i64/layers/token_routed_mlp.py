@@ -16,10 +16,13 @@ INL - 2025
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
 
 from vllm_i64.parallel.tensor_parallel import get_tp, all_reduce
+from vllm_i64.kernels.fused_experts import (
+    fused_token_routed_forward,
+    fused_token_routed_forward_int8,
+)
 
 
 class TokenRoutedMLP(nn.Module):
@@ -77,38 +80,21 @@ class TokenRoutedMLP(nn.Module):
         return self.token_to_expert[token_ids_clamped]
 
     def expert_forward(self, x: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
-        """Dispatch + SwiGLU + all_reduce."""
-        sorted_indices = expert_ids.argsort(stable=True)
-        sorted_x = x[sorted_indices]
-        sorted_expert_ids = expert_ids[sorted_indices]
-
-        expert_counts = torch.bincount(sorted_expert_ids, minlength=self.num_experts)
-        expert_offsets = torch.zeros(self.num_experts + 1, dtype=torch.long, device=x.device)
-        torch.cumsum(expert_counts, dim=0, out=expert_offsets[1:])
-
-        output = torch.empty(x.shape[0], self.hidden_size, device=x.device, dtype=x.dtype)
-
-        for eid in range(self.num_experts):
-            start = expert_offsets[eid].item()
-            end = expert_offsets[eid + 1].item()
-            if start == end:
-                continue
-
-            chunk = sorted_x[start:end]
-            gu = chunk @ self.gate_up_proj[eid]
-            gate = gu[..., :self.expert_inter]
-            up = gu[..., self.expert_inter:]
-            inter = F.silu(gate) * up
-            output[start:end] = inter @ self.down_proj[eid]  # RowParallel part
-
-        # Unsort
-        final = torch.empty_like(output)
-        final[sorted_indices] = output
-
+        """Dispatch + SwiGLU + all_reduce (fused)."""
+        # INT8 quantized path
+        if hasattr(self, 'gate_up_int8'):
+            output = fused_token_routed_forward_int8(
+                x, self.gate_up_int8, self.gate_up_scale,
+                self.down_int8, self.down_scale,
+                expert_ids, self.num_experts, self.expert_inter,
+            )
+        else:
+            output = fused_token_routed_forward(
+                x, self.gate_up_proj, self.down_proj,
+                expert_ids, self.num_experts, self.expert_inter,
+            )
         # All-reduce across TP ranks (RowParallel equivalent)
-        final = all_reduce(final)
-
-        return final
+        return all_reduce(output)
 
     def forward(self, x, token_ids=None, **kwargs):
         expert_ids = self.route(token_ids, x.shape[0], x.device)

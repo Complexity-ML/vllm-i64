@@ -166,9 +166,9 @@ def i64_full_pipeline(
     num_experts: int,
 ) -> torch.Tensor:
     """
-    Full i64 pipeline: route → scatter → expert → gather.
+    Full i64 pipeline: route → fused expert dispatch.
 
-    Integer operations: route, scatter indices, gather indices, loop control
+    Integer operations: route, scatter indices, gather indices
     Float operations: expert MLP matmuls and SiLU activation ONLY
 
     Args:
@@ -181,21 +181,13 @@ def i64_full_pipeline(
     Returns:
         output: [num_tokens, hidden_dim] fp16
     """
+    from vllm_i64.kernels.fused_experts import fused_token_routed_forward
+
     # 1. ROUTE (i64)
     expert_ids = i64_route_tokens(token_ids, num_experts)
 
-    # 2. SCATTER (i64 indexing, fp16 data)
-    scattered, scatter_indices, expert_offsets, expert_counts = i64_scatter(
-        hidden_states, expert_ids, num_experts
+    # 2. FUSED DISPATCH (sort + expert compute + unsort)
+    return fused_token_routed_forward(
+        hidden_states, gate_up_weights, down_weights,
+        expert_ids.long(), num_experts, down_weights.shape[1],
     )
-
-    # 3. EXPERT MLP (fp16 compute, i64 control)
-    expert_output = i64_expert_forward(
-        scattered, gate_up_weights, down_weights,
-        expert_offsets, expert_counts, num_experts,
-    )
-
-    # 4. GATHER (i64 indexing)
-    output = i64_gather(expert_output, scatter_indices)
-
-    return output

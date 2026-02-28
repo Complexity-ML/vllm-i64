@@ -391,22 +391,33 @@ def load_model_by_name(
 
 def _quantize_experts(model: nn.Module, method: str):
     """Apply post-load quantization to expert MLP weights."""
-    from vllm_i64.core.quantization import QuantConfig, quantize_int8, dequantize_int8
+    from vllm_i64.core.quantization import quantize_int8
 
     if method not in ("int8", "int4"):
         return
 
     for name, module in model.named_modules():
-        # Look for TokenRoutedMLP or modules with gate_up_proj + down_proj
-        if hasattr(module, 'gate_up_proj') and hasattr(module, 'down_proj'):
-            gate_up = module.gate_up_proj
-            down = module.down_proj
+        if not (hasattr(module, 'gate_up_proj') and hasattr(module, 'down_proj')):
+            continue
 
-            if method == "int8" and hasattr(gate_up, 'weight'):
-                q, s = quantize_int8(gate_up.weight.data)
-                # Store quantized weights and scales as buffers
-                module.register_buffer("gate_up_int8", q)
-                module.register_buffer("gate_up_scale", s)
-                q, s = quantize_int8(down.weight.data)
-                module.register_buffer("down_int8", q)
-                module.register_buffer("down_scale", s)
+        gate_up = module.gate_up_proj
+        down = module.down_proj
+
+        # gate_up_proj / down_proj are nn.Parameter (not nn.Linear)
+        gu_data = gate_up.data if isinstance(gate_up, nn.Parameter) else gate_up.weight.data
+        dn_data = down.data if isinstance(down, nn.Parameter) else down.weight.data
+
+        if method == "int8":
+            num_experts = gu_data.shape[0]
+            gu_q, gu_s, dn_q, dn_s = [], [], [], []
+            for e in range(num_experts):
+                q, s = quantize_int8(gu_data[e])
+                gu_q.append(q)
+                gu_s.append(s)
+                q, s = quantize_int8(dn_data[e])
+                dn_q.append(q)
+                dn_s.append(s)
+            module.register_buffer("gate_up_int8", torch.stack(gu_q))
+            module.register_buffer("gate_up_scale", torch.stack(gu_s))
+            module.register_buffer("down_int8", torch.stack(dn_q))
+            module.register_buffer("down_scale", torch.stack(dn_s))
