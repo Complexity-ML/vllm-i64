@@ -360,9 +360,23 @@ class I64Server:
             }],
         })
 
+    @web.middleware
+    async def cors_middleware(self, request, handler):
+        """Add CORS headers to all responses."""
+        if request.method == "OPTIONS":
+            resp = web.Response()
+        else:
+            resp = await handler(request)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        return resp
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
-        app = web.Application()
+        app = web.Application(middlewares=[self.cors_middleware])
+        app.router.add_route("OPTIONS", "/v1/completions", self._handle_options)
+        app.router.add_route("OPTIONS", "/v1/chat/completions", self._handle_options)
         app.router.add_post("/v1/completions", self.handle_completions)
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_get("/health", self.handle_health)
@@ -372,6 +386,10 @@ class I64Server:
         app.on_startup.append(self._on_startup)
         app.on_cleanup.append(self._on_cleanup)
         return app
+
+    async def _handle_options(self, request):
+        """Handle CORS preflight requests."""
+        return web.Response()
 
     async def _on_startup(self, app):
         """Start the async engine loop when server starts."""

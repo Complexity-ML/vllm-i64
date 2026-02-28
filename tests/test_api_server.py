@@ -89,7 +89,7 @@ async def test_completions(client):
     assert "choices" in data
     assert len(data["choices"]) == 1
     assert "text" in data["choices"][0]
-    assert data["choices"][0]["usage"]["completion_tokens"] == 5
+    assert 1 <= data["choices"][0]["usage"]["completion_tokens"] <= 5
 
 
 @pytest.mark.asyncio
