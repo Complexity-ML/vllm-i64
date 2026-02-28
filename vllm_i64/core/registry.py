@@ -130,6 +130,16 @@ register_model(
 )
 
 register_model(
+    name="pacific-chat",
+    model_class="vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
+    config_loader="vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",
+    config_path=None,
+    checkpoint=None,
+    parameters="~1.58B",
+    description="Complexity Deep v0.13.0 chat — alias, use --checkpoint to specify model",
+)
+
+register_model(
     name="pacific-prime-python",
     model_class="vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
     config_loader="vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",
