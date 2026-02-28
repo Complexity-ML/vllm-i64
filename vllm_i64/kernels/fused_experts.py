@@ -18,6 +18,12 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
+from vllm_i64.kernels.triton_fused_expert import (
+    is_triton_available,
+    triton_expert_forward,
+    triton_expert_forward_int8,
+)
+
 
 def fused_token_routed_forward(
     x: torch.Tensor,
@@ -111,6 +117,8 @@ def _chunked_forward(
 
     output = torch.empty(N, x.shape[1], device=x.device, dtype=x.dtype)
 
+    use_triton = is_triton_available() and x.is_cuda
+
     for eid in range(num_experts):
         s = offsets[eid].item()
         e = offsets[eid + 1].item()
@@ -118,6 +126,15 @@ def _chunked_forward(
             continue
 
         chunk = sorted_x[s:e]
+
+        if use_triton:
+            # Triton fused SwiGLU: gate+up → silu(gate)*up → down in one kernel
+            out = triton_expert_forward(chunk, gate_up_proj[eid], down_proj[eid], e - s)
+            if out is not None:
+                output[s:e] = out
+                continue
+
+        # PyTorch fallback
         gu = chunk @ gate_up_proj[eid]
         gate = gu[..., :intermediate_per_tp]
         up = gu[..., intermediate_per_tp:]
@@ -166,6 +183,8 @@ def fused_token_routed_forward_int8(
 
     output = torch.empty(N, x.shape[1], device=x.device, dtype=x.dtype)
 
+    use_triton = is_triton_available() and x.is_cuda
+
     for eid in range(num_experts):
         s = offsets[eid].item()
         e = offsets[eid + 1].item()
@@ -174,7 +193,18 @@ def fused_token_routed_forward_int8(
 
         chunk = sorted_x[s:e]
 
-        # Dequantize gate_up: int8 * scale -> float
+        if use_triton:
+            out = triton_expert_forward_int8(
+                chunk,
+                gate_up_int8[eid], gate_up_scale[eid],
+                down_int8[eid], down_scale[eid],
+                e - s,
+            )
+            if out is not None:
+                output[s:e] = out
+                continue
+
+        # PyTorch fallback: dequantize + matmul
         w_gu = gate_up_int8[eid].float() * gate_up_scale[eid].unsqueeze(-1)
         w_gu = w_gu.to(x.dtype)
 
@@ -183,9 +213,83 @@ def fused_token_routed_forward_int8(
         up = gu[..., intermediate_per_tp:]
         inter = F.silu(gate) * up
 
-        # Dequantize down: int8 * scale -> float
         w_d = down_int8[eid].float() * down_scale[eid].unsqueeze(-1)
         w_d = w_d.to(x.dtype)
+
+        output[s:e] = inter @ w_d
+
+    result = torch.empty_like(output)
+    result[sorted_idx] = output
+    return result
+
+
+def fused_token_routed_forward_int4(
+    x: torch.Tensor,
+    gate_up_int4: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_zero: torch.Tensor,
+    down_int4: torch.Tensor,
+    down_scale: torch.Tensor,
+    down_zero: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_experts: int,
+    intermediate_per_tp: int,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """
+    Fused expert forward with INT4 dequantization on-the-fly.
+
+    Unpacks packed uint8 (2 values per byte), dequantizes per-group,
+    then runs SwiGLU. Chunked mode only.
+
+    Args:
+        gate_up_int4: (num_experts, out, in//2) uint8 — packed
+        gate_up_scale: (num_experts, out, num_groups) float
+        gate_up_zero: (num_experts, out, num_groups) float
+        down_int4: (num_experts, out, in//2) uint8 — packed
+        down_scale: (num_experts, out, num_groups) float
+        down_zero: (num_experts, out, num_groups) float
+    """
+    from vllm_i64.core.quantization import dequantize_int4
+
+    N = x.shape[0]
+    if N == 0:
+        return x
+
+    sorted_idx = expert_ids.argsort(stable=True)
+    sorted_x = x[sorted_idx]
+    sorted_eid = expert_ids[sorted_idx]
+
+    counts = torch.bincount(sorted_eid, minlength=num_experts)
+    offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=x.device)
+    torch.cumsum(counts, dim=0, out=offsets[1:])
+
+    output = torch.empty(N, x.shape[1], device=x.device, dtype=x.dtype)
+
+    for eid in range(num_experts):
+        s = offsets[eid].item()
+        e = offsets[eid + 1].item()
+        if s == e:
+            continue
+
+        chunk = sorted_x[s:e]
+
+        # Dequantize gate_up: int4 packed → float
+        w_gu = dequantize_int4(
+            gate_up_int4[eid], gate_up_scale[eid], gate_up_zero[eid], group_size,
+        )
+        w_gu = w_gu.reshape(gate_up_int4[eid].shape[0], -1).to(x.dtype)
+
+        gu = chunk @ w_gu
+        gate = gu[..., :intermediate_per_tp]
+        up = gu[..., intermediate_per_tp:]
+        inter = F.silu(gate) * up
+
+        # Dequantize down: int4 packed → float
+        w_d = dequantize_int4(
+            down_int4[eid], down_scale[eid], down_zero[eid], group_size,
+        )
+        w_d = w_d.reshape(down_int4[eid].shape[0], -1).to(x.dtype)
 
         output[s:e] = inter @ w_d
 

@@ -1,11 +1,12 @@
 """
-vllm-i64 :: TP Worker
+vllm-i64 :: Distributed Worker
 
 Each worker process is launched by torchrun.
-Initializes distributed, loads the model shard, and serves.
+Initializes distributed (TP + PP), loads the model shard, and serves.
 
 Only rank 0 runs the API server.
-Other ranks participate in TP compute via all_reduce.
+Other ranks participate in TP compute via all_reduce
+and PP via send/recv.
 
 INL - 2025
 """
@@ -18,31 +19,36 @@ import torch
 def main():
     """Worker entry point — called by torchrun."""
     from vllm_i64.parallel.tensor_parallel import init_distributed, get_tp
+    from vllm_i64.parallel.pipeline_parallel import init_pp, get_pp
 
     tp_size = int(os.environ.get("VLLM_I64_TP_SIZE", "1"))
+    pp_size = int(os.environ.get("VLLM_I64_PP_SIZE", "1"))
+
     init_distributed(tp_size=tp_size)
+    init_pp(pp_size=pp_size)
 
     tp = get_tp()
+    pp = get_pp()
 
     # Parse remaining args (same as CLI)
     args = sys.argv[1:]
     if not args:
-        if tp.tp_rank == 0:
+        if tp.tp_rank == 0 and pp.pp_rank == 0:
             print("Usage: worker <serve|bench> [args...]")
         return
 
     command = args[0]
 
     if command == "serve":
-        _run_serve(args[1:], tp)
+        _run_serve(args[1:], tp, pp)
     elif command == "bench":
-        _run_bench(args[1:], tp)
+        _run_bench(args[1:], tp, pp)
     else:
-        if tp.tp_rank == 0:
+        if tp.tp_rank == 0 and pp.pp_rank == 0:
             print(f"Unknown command: {command}")
 
 
-def _run_serve(args: list, tp):
+def _run_serve(args: list, tp, pp):
     """Run the serve command in distributed mode."""
     import argparse
     from vllm_i64.core.loader import load_model_by_name
@@ -56,30 +62,32 @@ def _run_serve(args: list, tp):
     parser.add_argument("--dtype", default="float16")
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--chat-template", default=None)
+    parser.add_argument("--quantization", default=None)
     parsed = parser.parse_args(args)
 
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     dtype = dtype_map[parsed.dtype]
 
-    if tp.tp_rank == 0:
-        print(f"vllm-i64 :: serving {parsed.model} (TP={tp.tp_size})")
+    if tp.tp_rank == 0 and pp.pp_rank == 0:
+        print(f"vllm-i64 :: serving {parsed.model} (TP={tp.tp_size}, PP={pp.pp_size})")
 
-    # Each rank loads its shard
+    # Each rank loads its shard (TP shards weights, PP shards layers)
     model = load_model_by_name(
         parsed.model, dtype=dtype, device=tp.device,
         checkpoint_override=parsed.checkpoint,
+        quantization=parsed.quantization,
     )
     model.eval()
 
     engine = I64Engine(
         model=model,
-        num_experts=4,
+        num_experts=model.config.num_experts,
         vocab_size=model.config.vocab_size,
         device=tp.device,
     )
 
-    if tp.tp_rank == 0:
-        # Only rank 0 runs the API server
+    if tp.tp_rank == 0 and pp.pp_rank == 0:
+        # Only global rank 0 runs the API server
         from vllm_i64.api.server import I64Server
 
         tokenizer = load_tokenizer(parsed.model)
@@ -98,12 +106,11 @@ def _run_serve(args: list, tp):
         )
         server.run()
     else:
-        # Non-rank-0 workers: participate in TP compute
-        # They wait for all_reduce calls from rank 0's forward passes
-        _worker_loop(engine, tp)
+        # Non-rank-0 workers: participate in TP/PP compute
+        _worker_loop(engine, tp, pp)
 
 
-def _worker_loop(engine, tp):
+def _worker_loop(engine, tp, pp):
     """
     Non-rank-0 worker loop.
 
@@ -115,16 +122,18 @@ def _worker_loop(engine, tp):
          - opcode 1: forward step
       2. Workers receive control, then broadcast tensor data (token_ids, positions)
       3. Workers run the same model.forward() → NCCL all_reduce inside RowParallel
-      4. Loop back to step 1
+      4. PP workers send/recv intermediate tensors between stages
+      5. Loop back to step 1
 
     This replaces the barrier-only approach with real data synchronization.
     """
     import torch.distributed as dist
 
-    if tp.tp_rank == 0:
+    global_rank = tp.tp_rank + pp.pp_rank * tp.tp_size
+    if global_rank == 0:
         return
 
-    print(f"[TP worker {tp.tp_rank}] ready, waiting for compute")
+    print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] ready, waiting for compute")
 
     device = tp.device
 
@@ -137,7 +146,7 @@ def _worker_loop(engine, tp):
             opcode = control[0].item()
             if opcode == 0:
                 # Shutdown
-                print(f"[TP worker {tp.tp_rank}] shutdown signal received")
+                print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] shutdown signal received")
                 break
 
             batch_tokens = control[1].item()
@@ -153,15 +162,15 @@ def _worker_loop(engine, tp):
                 engine.model(token_ids=token_ids, positions=positions)
 
         except Exception as e:
-            print(f"[TP worker {tp.tp_rank}] error: {e}")
+            print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] error: {e}")
             break
 
-    print(f"[TP worker {tp.tp_rank}] exiting")
+    print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] exiting")
 
 
-def _run_bench(args: list, tp):
+def _run_bench(args: list, tp, pp):
     """Run benchmarks in distributed mode."""
-    if tp.tp_rank == 0:
+    if tp.tp_rank == 0 and pp.pp_rank == 0:
         from vllm_i64.cli import cmd_bench
         import argparse
         parser = argparse.ArgumentParser()

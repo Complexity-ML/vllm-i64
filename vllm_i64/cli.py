@@ -21,8 +21,8 @@ import sys
 def cmd_serve(args):
     """Start inference server (single-GPU or multi-GPU via torchrun)."""
 
-    # If TP > 1, launch via torchrun
-    if args.tp > 1:
+    # If TP > 1 or PP > 1, launch via torchrun
+    if args.tp > 1 or args.pp > 1:
         from vllm_i64.parallel.launcher import launch_distributed
 
         # Forward all args to the worker
@@ -37,7 +37,7 @@ def cmd_serve(args):
         if args.quantization:
             forward_args += ["--quantization", args.quantization]
 
-        rc = launch_distributed(tp_size=args.tp, args=forward_args)
+        rc = launch_distributed(tp_size=args.tp, pp_size=args.pp, args=forward_args)
         sys.exit(rc)
 
     # Single-GPU: run directly
@@ -223,6 +223,7 @@ def main():
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     p_serve.add_argument("--tp", type=int, default=1, help="Tensor parallel size (num GPUs)")
+    p_serve.add_argument("--pp", type=int, default=1, help="Pipeline parallel size (num stages)")
     p_serve.add_argument("--quantization", default=None, choices=["int8", "int4", None])
     p_serve.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     p_serve.add_argument("--chat-template", default=None, help="Path to chat template")

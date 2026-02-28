@@ -391,7 +391,7 @@ def load_model_by_name(
 
 def _quantize_experts(model: nn.Module, method: str):
     """Apply post-load quantization to expert MLP weights."""
-    from vllm_i64.core.quantization import quantize_int8
+    from vllm_i64.core.quantization import quantize_int8, quantize_int4
 
     if method not in ("int8", "int4"):
         return
@@ -421,3 +421,23 @@ def _quantize_experts(model: nn.Module, method: str):
             module.register_buffer("gate_up_scale", torch.stack(gu_s))
             module.register_buffer("down_int8", torch.stack(dn_q))
             module.register_buffer("down_scale", torch.stack(dn_s))
+
+        elif method == "int4":
+            num_experts = gu_data.shape[0]
+            gu_p, gu_s, gu_z = [], [], []
+            dn_p, dn_s, dn_z = [], [], []
+            for e in range(num_experts):
+                p, s, z = quantize_int4(gu_data[e])
+                gu_p.append(p)
+                gu_s.append(s)
+                gu_z.append(z)
+                p, s, z = quantize_int4(dn_data[e])
+                dn_p.append(p)
+                dn_s.append(s)
+                dn_z.append(z)
+            module.register_buffer("gate_up_int4", torch.stack(gu_p))
+            module.register_buffer("gate_up_scale_int4", torch.stack(gu_s))
+            module.register_buffer("gate_up_zero", torch.stack(gu_z))
+            module.register_buffer("down_int4", torch.stack(dn_p))
+            module.register_buffer("down_scale_int4", torch.stack(dn_s))
+            module.register_buffer("down_zero", torch.stack(dn_z))

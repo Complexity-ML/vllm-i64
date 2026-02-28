@@ -100,6 +100,16 @@ def list_models() -> list:
 # =========================================================================
 
 register_model(
+    name="pacific-i64",
+    model_class="vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
+    config_loader="vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",
+    config_path=None,
+    checkpoint=None,
+    parameters="~1.58B",
+    description="Complexity Deep i64 — generic entry, use --checkpoint to specify model",
+)
+
+register_model(
     name="pacific-prime",
     model_class="vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
     config_loader="vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",

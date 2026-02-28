@@ -22,6 +22,7 @@ from vllm_i64.parallel.tensor_parallel import get_tp, all_reduce
 from vllm_i64.kernels.fused_experts import (
     fused_token_routed_forward,
     fused_token_routed_forward_int8,
+    fused_token_routed_forward_int4,
 )
 
 
@@ -81,8 +82,13 @@ class TokenRoutedMLP(nn.Module):
 
     def expert_forward(self, x: torch.Tensor, expert_ids: torch.Tensor) -> torch.Tensor:
         """Dispatch + SwiGLU + all_reduce (fused)."""
-        # INT8 quantized path
-        if hasattr(self, 'gate_up_int8'):
+        if hasattr(self, 'gate_up_int4'):
+            output = fused_token_routed_forward_int4(
+                x, self.gate_up_int4, self.gate_up_scale_int4, self.gate_up_zero,
+                self.down_int4, self.down_scale_int4, self.down_zero,
+                expert_ids, self.num_experts, self.expert_inter,
+            )
+        elif hasattr(self, 'gate_up_int8'):
             output = fused_token_routed_forward_int8(
                 x, self.gate_up_int8, self.gate_up_scale,
                 self.down_int8, self.down_scale,

@@ -432,7 +432,7 @@ class ComplexityDecoderLayer(nn.Module):
 
 class ComplexityDeepModel(nn.Module):
     """
-    Complexity Deep transformer.
+    Complexity Deep transformer with Pipeline Parallelism support.
 
     Complexity Deep specific:
       - INL Dynamics per layer
@@ -440,24 +440,38 @@ class ComplexityDeepModel(nn.Module):
       - Mu-guided attention and routing
       - Tied embeddings
 
-    Generic (via layers/):
-      - TokenRoutedMLP base (i64 routing, SwiGLU)
-      - RMSNorm, RoPE
+    Parallelism:
+      - TP: expert weights + attention heads sharded (via layers/)
+      - PP: decoder layers distributed across stages (via make_layers)
     """
 
     def __init__(self, config: ComplexityDeepConfig):
         super().__init__()
+        from vllm_i64.parallel.pipeline_parallel import get_pp, is_first_pp_rank, is_last_pp_rank
+        from vllm_i64.parallel.pp_utils import make_layers, PPMissingLayer
+
         self.config = config
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([
-            ComplexityDecoderLayer(config)
-            for _ in range(config.num_hidden_layers)
-        ])
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Embedding only on first PP stage
+        if is_first_pp_rank():
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        else:
+            self.embed_tokens = None
+
+        # PP-aware layer distribution
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx: ComplexityDecoderLayer(config),
+        )
+
+        # Final norm + lm_head only on last PP stage
+        if is_last_pp_rank():
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = None
 
         self.tie_word_embeddings = config.tie_word_embeddings
-        if not config.tie_word_embeddings:
+        if not config.tie_word_embeddings and is_last_pp_rank():
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(
@@ -467,15 +481,29 @@ class ComplexityDeepModel(nn.Module):
         kv_cache=None,
         seq_ids: Optional[List[int]] = None,
         tokens_per_seq: Optional[List[int]] = None,
+        intermediate_tensors=None,
     ) -> torch.Tensor:
-        """Returns logits: (batch, vocab_size)."""
-        hidden = self.embed_tokens(token_ids.long())
-        velocity = torch.zeros_like(hidden)
+        """Returns logits (last stage) or IntermediateTensors (other stages)."""
+        from vllm_i64.parallel.pipeline_parallel import is_first_pp_rank, is_last_pp_rank
+        from vllm_i64.parallel.pp_utils import IntermediateTensors
 
-        mu_prev = None
-        mu_residual = None
+        # First stage: embed tokens
+        if is_first_pp_rank():
+            hidden = self.embed_tokens(token_ids.long())
+            velocity = torch.zeros_like(hidden)
+            mu_prev = None
+            mu_residual = None
+        else:
+            # Receive from previous stage
+            assert intermediate_tensors is not None
+            hidden = intermediate_tensors["hidden_states"]
+            velocity = intermediate_tensors["velocity_states"]
+            mu_prev = intermediate_tensors.get("mu_prev")
+            mu_residual = intermediate_tensors.get("mu_residual")
 
-        for layer_idx, layer in enumerate(self.layers):
+        # Process only our assigned layers
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
             hidden, velocity, mu_current = layer(
                 hidden, positions, velocity,
                 token_ids=token_ids,
@@ -493,12 +521,27 @@ class ComplexityDeepModel(nn.Module):
                 mu_residual = mu_residual + mu_current
             mu_prev = mu_current + 0.1 * mu_residual
 
+        # Not last stage: pass tensors to next stage
+        if not is_last_pp_rank():
+            return IntermediateTensors({
+                "hidden_states": hidden,
+                "velocity_states": velocity,
+                "mu_prev": mu_prev,
+                "mu_residual": mu_residual,
+            })
+
+        # Last stage: norm + logits
         hidden = self.norm(hidden)
 
-        if self.tie_word_embeddings:
+        if self.tie_word_embeddings and self.embed_tokens is not None:
             logits = F.linear(hidden, self.embed_tokens.weight)
-        else:
+        elif hasattr(self, 'lm_head'):
             logits = self.lm_head(hidden)
+        else:
+            logits = F.linear(hidden, torch.zeros(
+                self.config.vocab_size, self.config.hidden_size,
+                device=hidden.device, dtype=hidden.dtype,
+            ))
 
         return logits
 
