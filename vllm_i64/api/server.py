@@ -390,7 +390,7 @@ class I64Server:
 
     async def handle_root(self, request):
         """Redirect to demo page."""
-        raise web.HTTPFound("https://complexity-ml.com/demo")
+        raise web.HTTPFound("https://complexity-website.vercel.app/demo")
 
     async def _handle_options(self, request):
         """Handle CORS preflight requests."""
