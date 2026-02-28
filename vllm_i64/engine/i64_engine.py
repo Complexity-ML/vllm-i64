@@ -103,6 +103,8 @@ class I64Engine:
 
         # Sampling parameters (configurable, default greedy)
         self.sampling_params = SamplingParams(temperature=0.0)
+        # Per-request sampling params for multi-user isolation
+        self._request_sampling_params: Dict[int, SamplingParams] = {}
 
         # === KV Cache ===
         self.kv_cache = None
@@ -219,6 +221,7 @@ class I64Engine:
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
         timeout_s: Optional[float] = None,
+        sampling_params: Optional[SamplingParams] = None,
     ) -> int:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
@@ -229,6 +232,10 @@ class I64Engine:
             eos_token_id = getattr(self.model.config, 'eos_token_id', 0)
 
         request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
+
+        # Store per-request sampling params
+        if sampling_params is not None:
+            self._request_sampling_params[request_id] = sampling_params
 
         # Set deadline
         t = timeout_s if timeout_s is not None else self.default_timeout_s
@@ -394,24 +401,50 @@ class I64Engine:
                 offset += int(tpr)
             logits = logits[last_indices]  # (num_requests, vocab_size)
 
-        # 3.5. Build per-request token history for repetition penalty
-        past_tokens_list = None
-        if self.sampling_params.repetition_penalty != 1.0:
-            past_tokens_list = []
-            for req_id in batch.request_ids:
-                req = next((r for r in self.scheduler.running if r.request_id == int(req_id)), None)
-                if req is not None:
-                    past_tokens_list.append(list(req.prompt_token_ids) + req.output_token_ids)
-                else:
-                    past_tokens_list.append([])
+        # 3.5. Per-request sampling with isolated params
+        # Check if any request has custom sampling params
+        has_custom = any(
+            int(rid) in self._request_sampling_params
+            for rid in batch.request_ids
+        )
 
-        # 4. Sample (configurable, includes repetition penalty)
-        new_token_ids = self._i64_sample(logits, past_tokens_list)
+        if has_custom:
+            # Sample each request individually with its own params
+            result = {}
+            for i, req_id in enumerate(batch.request_ids):
+                rid = int(req_id)
+                params = self._request_sampling_params.get(rid, self.sampling_params)
+                req_logits = logits[i:i+1]
 
-        # 5. Map back to requests (integer indexing)
-        result = {}
-        for i, req_id in enumerate(batch.request_ids):
-            result[int(req_id)] = int(new_token_ids[i])
+                past_tokens = None
+                if params.repetition_penalty != 1.0:
+                    req = next((r for r in self.scheduler.running if r.request_id == rid), None)
+                    if req is not None:
+                        past_tokens = [list(req.prompt_token_ids) + req.output_token_ids]
+                    else:
+                        past_tokens = [[]]
+
+                token_ids = sample_batch(req_logits, params, past_tokens_list=past_tokens)
+                result[rid] = int(token_ids.cpu().numpy().astype(np.int64)[0])
+        else:
+            # Fast path: all requests share the same params
+            past_tokens_list = None
+            if self.sampling_params.repetition_penalty != 1.0:
+                past_tokens_list = []
+                for req_id in batch.request_ids:
+                    req = next((r for r in self.scheduler.running if r.request_id == int(req_id)), None)
+                    if req is not None:
+                        past_tokens_list.append(list(req.prompt_token_ids) + req.output_token_ids)
+                    else:
+                        past_tokens_list.append([])
+
+            # 4. Sample (configurable, includes repetition penalty)
+            new_token_ids = self._i64_sample(logits, past_tokens_list)
+
+            # 5. Map back to requests (integer indexing)
+            result = {}
+            for i, req_id in enumerate(batch.request_ids):
+                result[int(req_id)] = int(new_token_ids[i])
 
         # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)
@@ -424,9 +457,10 @@ class I64Engine:
                     if slot is not None:
                         self.kv_cache.register_prefix_blocks(slot, list(req.prompt_token_ids))
 
-        # 7. Free KV slots for finished requests
+        # 7. Free KV slots and per-request params for finished requests
         for req in self.scheduler.finished:
             self._free_slot(req.request_id)
+            self._request_sampling_params.pop(req.request_id, None)
 
         # Integer counters
         self.total_steps += 1
@@ -481,11 +515,10 @@ class I64Engine:
         sampling_params: Optional[SamplingParams] = None,
     ) -> GenerationResult:
         """Synchronous generation for a single request."""
-        old_params = self.sampling_params
-        if sampling_params is not None:
-            self.sampling_params = sampling_params
-
-        request_id = self.add_request(prompt_token_ids, max_new_tokens)
+        request_id = self.add_request(
+            prompt_token_ids, max_new_tokens,
+            sampling_params=sampling_params,
+        )
 
         metrics_start = None
         if self.metrics:
@@ -518,8 +551,6 @@ class I64Engine:
                     self.metrics.on_request_end(
                         metrics_start, len(prompt_token_ids), len(req.output_token_ids),
                     )
-
-                self.sampling_params = old_params
 
                 return GenerationResult(
                     request_id=request_id,
@@ -660,11 +691,10 @@ class AsyncI64Engine:
         loop = asyncio.get_running_loop()
         future = loop.create_future()
 
-        # Apply sampling params if provided
-        if sampling_params is not None:
-            self.engine.sampling_params = sampling_params
-
-        request_id = self.engine.add_request(prompt_token_ids, max_new_tokens, timeout_s=timeout_s)
+        request_id = self.engine.add_request(
+            prompt_token_ids, max_new_tokens, timeout_s=timeout_s,
+            sampling_params=sampling_params,
+        )
         self._pending_futures[request_id] = future
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1
@@ -680,10 +710,10 @@ class AsyncI64Engine:
         """
         Submit a request and yield tokens as they are generated.
         """
-        if sampling_params is not None:
-            self.engine.sampling_params = sampling_params
-
-        request_id = self.engine.add_request(prompt_token_ids, max_new_tokens)
+        request_id = self.engine.add_request(
+            prompt_token_ids, max_new_tokens,
+            sampling_params=sampling_params,
+        )
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1
 

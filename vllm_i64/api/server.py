@@ -270,12 +270,17 @@ class I64Server:
                 response = web.StreamResponse()
                 response.content_type = "text/event-stream"
                 await response.prepare(request)
-                async for chunk in self._async_stream(req):
-                    await response.write(chunk.encode())
+                try:
+                    async for chunk in self._async_stream(req):
+                        await response.write(chunk.encode())
+                except (ConnectionResetError, ConnectionError):
+                    pass  # client disconnected
                 return response
 
             result = await self._async_complete(req)
             return web.json_response(result.to_dict())
+        except (ConnectionResetError, ConnectionError):
+            pass  # client disconnected
         except Exception as e:
             logger.error(f"Completion error: {e}", exc_info=True)
             return web.json_response(
@@ -316,8 +321,11 @@ class I64Server:
                 response = web.StreamResponse()
                 response.content_type = "text/event-stream"
                 await response.prepare(request)
-                async for chunk in self._async_stream(req):
-                    await response.write(chunk.encode())
+                try:
+                    async for chunk in self._async_stream(req):
+                        await response.write(chunk.encode())
+                except (ConnectionResetError, ConnectionError):
+                    pass  # client disconnected
                 return response
 
             result = await self._async_complete(req)
@@ -332,6 +340,8 @@ class I64Server:
                 }
             result_dict["object"] = "chat.completion"
             return web.json_response(result_dict)
+        except (ConnectionResetError, ConnectionError):
+            pass  # client disconnected during non-stream
         except Exception as e:
             logger.error(f"Chat completion error: {e}", exc_info=True)
             return web.json_response(
