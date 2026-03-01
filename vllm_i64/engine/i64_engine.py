@@ -33,10 +33,44 @@ from typing import List, Dict, Optional, Callable, Set
 from dataclasses import dataclass, field
 
 from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
-from vllm_i64.core.sampling import SamplingParams, sample_batch, apply_repetition_penalty_batch
+from vllm_i64.core.sampling import (
+    SamplingParams, sample_batch, sample_batch_with_logprobs,
+    apply_repetition_penalty_batch, TokenLogprob,
+)
 from vllm_i64.core.logging import get_logger
 
 logger = get_logger("vllm_i64.engine")
+
+
+class AdaptiveBatchSizer:
+    """Dynamically adjust max_batch_size based on throughput."""
+
+    def __init__(self, initial: int, min_size: int = 1, max_size: int = 128, window: int = 20):
+        self.current = initial
+        self.min_size = min_size
+        self.max_size = max_size
+        self._throughputs: List[float] = []
+        self.window = window
+
+    def record(self, tokens: int, elapsed_ms: float):
+        """Record a step's throughput."""
+        tps = tokens / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
+        self._throughputs.append(tps)
+        if len(self._throughputs) > self.window:
+            self._throughputs.pop(0)
+
+    def adjust(self) -> int:
+        """Adjust batch size based on throughput trend."""
+        if len(self._throughputs) < self.window:
+            return self.current
+        avg_tps = sum(self._throughputs) / len(self._throughputs)
+        recent_tps = sum(self._throughputs[-5:]) / 5
+
+        if recent_tps > avg_tps * 1.05:
+            self.current = min(self.current + 1, self.max_size)
+        elif recent_tps < avg_tps * 0.9:
+            self.current = max(self.current - 1, self.min_size)
+        return self.current
 
 
 @dataclass
@@ -48,6 +82,7 @@ class GenerationResult:
     num_steps: int
     elapsed_ms: float   # Only float for human-readable timing
     finish_reason: str = "length"  # "length", "stop", "timeout", "cancelled"
+    token_logprobs: Optional[List[TokenLogprob]] = None
 
 
 class I64Engine:
@@ -126,6 +161,12 @@ class I64Engine:
         self._cancelled_requests: Set[int] = set()
         self._request_deadlines: Dict[int, float] = {}  # request_id → deadline timestamp
         self.default_timeout_s: float = 300.0  # 5 min default
+
+        # === Logprobs tracking ===
+        self._request_logprobs: Dict[int, List[TokenLogprob]] = {}
+
+        # === Logits processors (per-request) ===
+        self._request_processors: Dict[int, list] = {}
 
         # === Metrics ===
         self.metrics = None
@@ -236,6 +277,11 @@ class I64Engine:
         # Store per-request sampling params
         if sampling_params is not None:
             self._request_sampling_params[request_id] = sampling_params
+            # Build logits processors if output constraints are set
+            if sampling_params.output_constraints is not None:
+                processors = sampling_params.output_constraints.build_processors()
+                if processors:
+                    self._request_processors[request_id] = processors
 
         # Set deadline
         t = timeout_s if timeout_s is not None else self.default_timeout_s
@@ -368,6 +414,8 @@ class I64Engine:
         for req in self.scheduler.finished:
             self._free_slot(req.request_id)
             self._request_sampling_params.pop(req.request_id, None)
+            self._request_processors.pop(req.request_id, None)
+            # logprobs are consumed when building GenerationResult, not freed here
 
         if batch is None:
             return {}
@@ -430,8 +478,31 @@ class I64Engine:
                     else:
                         past_tokens = [[]]
 
-                token_ids = sample_batch(req_logits, params, past_tokens_list=past_tokens)
-                result[rid] = int(token_ids.cpu().numpy().astype(np.int64)[0])
+                # Apply logits processors if configured
+                if rid in self._request_processors:
+                    from vllm_i64.core.logits_processor import apply_logits_processors
+                    req = next((r for r in self.scheduler.running if r.request_id == rid), None)
+                    generated = req.output_token_ids if req else []
+                    req_logits = apply_logits_processors(
+                        req_logits.squeeze(0), self._request_processors[rid], generated
+                    ).unsqueeze(0)
+                    # Check stop sequence
+                    for proc in self._request_processors[rid]:
+                        if hasattr(proc, 'should_stop') and proc.should_stop:
+                            if req is not None:
+                                req.status = 3  # FINISHED
+                                req._finish_reason = "stop"
+                            break
+
+                if params.logprobs is not None:
+                    sample_out = sample_batch_with_logprobs(req_logits, params, past_tokens_list=past_tokens)
+                    token_id = int(sample_out.token_ids.cpu().numpy().astype(np.int64)[0])
+                    if sample_out.logprobs:
+                        self._request_logprobs.setdefault(rid, []).append(sample_out.logprobs[0])
+                    result[rid] = token_id
+                else:
+                    token_ids = sample_batch(req_logits, params, past_tokens_list=past_tokens)
+                    result[rid] = int(token_ids.cpu().numpy().astype(np.int64)[0])
         else:
             # Fast path: all requests share the same params
             past_tokens_list = None
@@ -553,6 +624,9 @@ class I64Engine:
                         metrics_start, len(prompt_token_ids), len(req.output_token_ids),
                     )
 
+                # Collect logprobs if tracked
+                token_logprobs = self._request_logprobs.pop(request_id, None)
+
                 return GenerationResult(
                     request_id=request_id,
                     prompt_tokens=list(req.prompt_token_ids),
@@ -560,6 +634,7 @@ class I64Engine:
                     num_steps=steps,
                     elapsed_ms=elapsed,
                     finish_reason=finish_reason,
+                    token_logprobs=token_logprobs if token_logprobs else None,
                 )
 
     def run_continuous(self, callback: Optional[Callable] = None):
@@ -767,6 +842,7 @@ class AsyncI64Engine:
                                     finish_reason = "stop"
                                 else:
                                     finish_reason = "length"
+                            token_logprobs = self.engine._request_logprobs.pop(rid, None)
                             result = GenerationResult(
                                 request_id=rid,
                                 prompt_tokens=list(req.prompt_token_ids),
@@ -774,6 +850,7 @@ class AsyncI64Engine:
                                 num_steps=req.num_generated,
                                 elapsed_ms=elapsed,
                                 finish_reason=finish_reason,
+                                token_logprobs=token_logprobs if token_logprobs else None,
                             )
                             target.set_result(result)
                             self.active_requests -= 1

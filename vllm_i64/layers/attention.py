@@ -220,3 +220,83 @@ def naive_cached_attention(
     attn = F.softmax(attn, dim=-1, dtype=compute_dtype)
     out = torch.bmm(attn, v_t)   # (num_heads, n, head_dim)
     return out.transpose(0, 1)    # (n, num_heads, head_dim)
+
+
+def naive_paged_decode_attention(
+    q: torch.Tensor,              # (batch, num_heads, head_dim)
+    k_cache: torch.Tensor,        # (num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache: torch.Tensor,        # same
+    block_table: torch.Tensor,    # (batch, max_blocks_per_seq) int32
+    cache_seqlens: torch.Tensor,  # (batch,) int32
+    num_kv_groups: int = 1,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Paged decode attention that reads K/V directly from block table.
+
+    For each batch element, gathers K/V from paged blocks and computes
+    single-query attention. No explicit gather into contiguous tensor.
+
+    Args:
+        q: query for each batch element (batch, num_heads, head_dim)
+        k_cache: paged K cache (num_blocks, block_size, num_kv_heads, head_dim)
+        v_cache: paged V cache (same shape)
+        block_table: maps (batch, block_idx) → physical block ID (int32)
+        cache_seqlens: sequence length per batch element (int32)
+        num_kv_groups: GQA groups (num_heads // num_kv_heads)
+        softmax_scale: attention scale factor
+
+    Returns:
+        output: (batch, num_heads, head_dim)
+    """
+    batch = q.shape[0]
+    bs = k_cache.shape[1]  # block_size
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+
+    compute_dtype = q.dtype
+    outputs = []
+
+    for b in range(batch):
+        seq_len = cache_seqlens[b].item()
+        if seq_len == 0:
+            outputs.append(torch.zeros_like(q[b]))
+            continue
+
+        # Gather K/V from blocks
+        num_blocks_needed = (seq_len + bs - 1) // bs
+        k_parts = []
+        v_parts = []
+        for blk_idx in range(num_blocks_needed):
+            block_id = block_table[b, blk_idx].item()
+            if block_id < 0:
+                break
+            # Last block may be partially filled
+            if blk_idx == num_blocks_needed - 1:
+                remainder = seq_len - blk_idx * bs
+                k_parts.append(k_cache[block_id, :remainder].to(compute_dtype))
+                v_parts.append(v_cache[block_id, :remainder].to(compute_dtype))
+            else:
+                k_parts.append(k_cache[block_id].to(compute_dtype))
+                v_parts.append(v_cache[block_id].to(compute_dtype))
+
+        k_seq = torch.cat(k_parts, dim=0)  # (seq_len, num_kv_heads, head_dim)
+        v_seq = torch.cat(v_parts, dim=0)
+
+        # GQA expand
+        if num_kv_groups > 1:
+            k_seq = k_seq.repeat_interleave(num_kv_groups, dim=1)
+            v_seq = v_seq.repeat_interleave(num_kv_groups, dim=1)
+
+        # Single-query attention: q_b (num_heads, 1, head_dim) @ k_seq (num_heads, seq_len, head_dim)
+        q_b = q[b].unsqueeze(1)           # (num_heads, 1, head_dim)
+        k_t = k_seq.transpose(0, 1)       # (num_heads, seq_len, head_dim)
+        v_t = v_seq.transpose(0, 1)
+
+        attn = torch.bmm(q_b, k_t.transpose(1, 2)) * softmax_scale  # (num_heads, 1, seq_len)
+        attn = F.softmax(attn, dim=-1)
+        out_b = torch.bmm(attn, v_t).squeeze(1)  # (num_heads, head_dim)
+        outputs.append(out_b)
+
+    return torch.stack(outputs)  # (batch, num_heads, head_dim)

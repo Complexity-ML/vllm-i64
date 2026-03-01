@@ -29,6 +29,7 @@ from aiohttp import web
 
 from vllm_i64.engine.i64_engine import I64Engine, AsyncI64Engine, GenerationResult
 from vllm_i64.core.sampling import SamplingParams
+from vllm_i64.core.logits_processor import OutputConstraints
 from vllm_i64.core.logging import get_logger
 
 logger = get_logger("vllm_i64.server")
@@ -49,9 +50,48 @@ class CompletionRequest:
     # Beam search
     n: int = 1
     best_of: int = 1
+    # Logprobs
+    logprobs: Optional[int] = None  # Number of top logprobs per token
+
+    def validate(self, max_seq_len: int = 2048) -> Optional[str]:
+        """Validate request parameters. Returns error message or None."""
+        if not self.prompt or not self.prompt.strip():
+            return "prompt must not be empty"
+        if self.max_tokens < 1:
+            return "max_tokens must be >= 1"
+        if self.max_tokens > max_seq_len:
+            return f"max_tokens must be <= {max_seq_len}"
+        if self.temperature < 0:
+            return "temperature must be >= 0"
+        if self.top_k < 0:
+            return "top_k must be >= 0"
+        if self.top_p < 0 or self.top_p > 1:
+            return "top_p must be in [0, 1]"
+        if self.repetition_penalty <= 0:
+            return "repetition_penalty must be > 0"
+        if self.logprobs is not None and (self.logprobs < 0 or self.logprobs > 20):
+            return "logprobs must be between 0 and 20"
+        return None
 
     def to_sampling_params(self) -> SamplingParams:
         """Convert API request to engine sampling params."""
+        # Build output constraints from response_format and stop sequences
+        constraints = None
+        has_constraints = self.response_format or self.stop
+        if has_constraints:
+            stop_seqs = None
+            if self.stop:
+                stop_seqs = [[int(b) for b in s.encode("utf-8")] for s in self.stop]
+            constraints = OutputConstraints(
+                json_mode=bool(self.response_format and self.response_format.get("type") == "json_object"),
+                regex_pattern=(
+                    self.response_format.get("pattern")
+                    if self.response_format and self.response_format.get("type") == "regex"
+                    else None
+                ),
+                stop_sequences=stop_seqs,
+            )
+
         return SamplingParams(
             temperature=self.temperature,
             top_k=self.top_k,
@@ -59,6 +99,8 @@ class CompletionRequest:
             repetition_penalty=self.repetition_penalty,
             json_mode=bool(self.response_format and self.response_format.get("type") == "json_object"),
             num_beams=self.best_of if self.best_of > 1 else 1,
+            logprobs=self.logprobs,
+            output_constraints=constraints,
         )
 
 
@@ -75,6 +117,32 @@ class CompletionResponse:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
+
+
+class TokenBucketRateLimiter:
+    """Per-IP token bucket rate limiter."""
+
+    def __init__(self, requests_per_minute: int):
+        self.rate = requests_per_minute / 60.0
+        self.capacity = requests_per_minute
+        self._buckets: Dict[str, list] = {}  # ip -> [tokens, last_time]
+
+    def allow(self, ip: str) -> bool:
+        now = time.monotonic()
+        bucket = self._buckets.get(ip)
+        if bucket is None:
+            self._buckets[ip] = [self.capacity - 1.0, now]
+            return True
+        tokens, last = bucket
+        elapsed = now - last
+        tokens = min(self.capacity, tokens + elapsed * self.rate)
+        if tokens >= 1.0:
+            bucket[0] = tokens - 1.0
+            bucket[1] = now
+            return True
+        bucket[0] = tokens
+        bucket[1] = now
+        return False
 
 
 class I64Server:
@@ -96,6 +164,8 @@ class I64Server:
         model_name: str = "inl-token-routed",
         host: str = "0.0.0.0",
         port: int = 8000,
+        api_key: Optional[str] = None,
+        rate_limit: int = 0,
     ):
         # Wrap sync engine in async engine for continuous batching
         self.async_engine = AsyncI64Engine.__new__(AsyncI64Engine)
@@ -115,6 +185,8 @@ class I64Server:
         self.host = host
         self.port = port
         self.request_counter: int = 0
+        self.api_key = api_key
+        self._rate_limiter = TokenBucketRateLimiter(rate_limit) if rate_limit > 0 else None
 
     def _tokenize(self, text: str) -> List[int]:
         """Text → i64 token IDs. Boundary operation."""
@@ -151,22 +223,32 @@ class I64Server:
         output_text = self._detokenize(result.output_tokens)
         self.request_counter += 1
 
+        choice = {
+            "text": output_text,
+            "index": 0,
+            "finish_reason": result.finish_reason,
+            "usage": {
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": len(result.output_tokens),
+                "total_tokens": len(prompt_ids) + len(result.output_tokens),
+                "engine_steps": result.num_steps,
+                "elapsed_ms": round(result.elapsed_ms, 2),
+            },
+        }
+
+        # Include logprobs if available
+        if result.token_logprobs:
+            choice["logprobs"] = {
+                "tokens": [self._detokenize([lp.token_id]) for lp in result.token_logprobs],
+                "token_logprobs": [lp.logprob for lp in result.token_logprobs],
+                "top_logprobs": [lp.top_logprobs for lp in result.token_logprobs],
+            }
+
         return CompletionResponse(
             id=f"cmpl-{self.request_counter}",
             created=int(time.time()),
             model=self.model_name,
-            choices=[{
-                "text": output_text,
-                "index": 0,
-                "finish_reason": result.finish_reason,
-                "usage": {
-                    "prompt_tokens": len(prompt_ids),
-                    "completion_tokens": len(result.output_tokens),
-                    "total_tokens": len(prompt_ids) + len(result.output_tokens),
-                    "engine_steps": result.num_steps,
-                    "elapsed_ms": round(result.elapsed_ms, 2),
-                },
-            }],
+            choices=[choice],
         )
 
     async def _async_complete(self, request: CompletionRequest) -> CompletionResponse:
@@ -263,7 +345,16 @@ class I64Server:
             stop=body.get("stop"),
             n=body.get("n", 1),
             best_of=body.get("best_of", 1),
+            logprobs=body.get("logprobs"),
         )
+
+        # Validate request parameters
+        error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
+        if error:
+            return web.json_response(
+                {"error": {"message": error, "type": "invalid_request_error"}},
+                status=400,
+            )
 
         try:
             if req.stream:
@@ -333,8 +424,30 @@ class I64Server:
             if result_dict["choices"]:
                 text = result_dict["choices"][0]["text"]
                 finish_reason = result_dict["choices"][0].get("finish_reason", "length")
+                message = {"role": "assistant", "content": text}
+
+                # Parse tool calls if tools were provided
+                tools = body.get("tools")
+                if tools:
+                    from vllm_i64.core.tool_parser import ToolCallParser
+                    parser = ToolCallParser(tools)
+                    tool_calls = parser.parse(text)
+                    if tool_calls:
+                        message["tool_calls"] = [
+                            {
+                                "id": tc.id,
+                                "type": tc.type,
+                                "function": {
+                                    "name": tc.function_name,
+                                    "arguments": tc.function_arguments,
+                                },
+                            }
+                            for tc in tool_calls
+                        ]
+                        finish_reason = "tool_calls"
+
                 result_dict["choices"][0] = {
-                    "message": {"role": "assistant", "content": text},
+                    "message": message,
                     "index": 0,
                     "finish_reason": finish_reason,
                 }
@@ -370,6 +483,30 @@ class I64Server:
             }],
         })
 
+    async def handle_tokenize(self, request: web.Request) -> web.Response:
+        """POST /v1/tokenize — tokenize text, return token IDs and count."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        text = body.get("text")
+        messages = body.get("messages")
+
+        if messages:
+            text = self._apply_chat_template(messages)
+        elif not text:
+            return web.json_response(
+                {"error": {"message": "Missing 'text' or 'messages'", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        tokens = self._tokenize(text)
+        return web.json_response({"tokens": tokens, "count": len(tokens)})
+
     @web.middleware
     async def cors_middleware(self, request, handler):
         """Add CORS headers to all responses."""
@@ -382,15 +519,46 @@ class I64Server:
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
         return resp
 
+    @web.middleware
+    async def auth_middleware(self, request, handler):
+        """Check Bearer token on /v1/* endpoints."""
+        if self.api_key and request.path.startswith("/v1/"):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth[7:] != self.api_key:
+                return web.json_response(
+                    {"error": {"message": "Invalid API key", "type": "authentication_error"}},
+                    status=401,
+                )
+        return await handler(request)
+
+    @web.middleware
+    async def rate_limit_middleware(self, request, handler):
+        """Per-IP rate limiting on /v1/* endpoints."""
+        if self._rate_limiter and request.path.startswith("/v1/"):
+            ip = request.remote or "unknown"
+            if not self._rate_limiter.allow(ip):
+                return web.json_response(
+                    {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
+                    status=429,
+                    headers={"Retry-After": "60"},
+                )
+        return await handler(request)
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
-        app = web.Application(middlewares=[self.cors_middleware])
+        middlewares = [self.cors_middleware]
+        if self.api_key:
+            middlewares.append(self.auth_middleware)
+        if self._rate_limiter:
+            middlewares.append(self.rate_limit_middleware)
+        app = web.Application(middlewares=middlewares)
         app.router.add_route("OPTIONS", "/v1/completions", self._handle_options)
         app.router.add_route("OPTIONS", "/v1/chat/completions", self._handle_options)
         app.router.add_post("/v1/completions", self.handle_completions)
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
+        app.router.add_post("/v1/tokenize", self.handle_tokenize)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app

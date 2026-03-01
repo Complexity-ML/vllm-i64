@@ -109,6 +109,11 @@ def cmd_serve(args):
         kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
     )
 
+    # Enable swap-to-CPU for KV cache overflow
+    if getattr(args, 'enable_swap', False) and engine.kv_cache is not None:
+        engine.kv_cache.enable_swap()
+        print(f"  swap-to-cpu: enabled")
+
     # Speculative decoding (optional)
     if getattr(args, 'speculative_model', None):
         draft_model = load_model_by_name(args.speculative_model, dtype=dtype, device=device)
@@ -126,6 +131,8 @@ def cmd_serve(args):
         model_name=args.model,
         host=args.host,
         port=args.port,
+        api_key=getattr(args, 'api_key', None),
+        rate_limit=getattr(args, 'rate_limit', 0),
     )
     server.run()
 
@@ -235,6 +242,12 @@ def main():
                          help="Path to draft model for speculative decoding")
     p_serve.add_argument("--num-speculative-tokens", type=int, default=5,
                          help="Number of tokens to speculate ahead")
+    p_serve.add_argument("--enable-swap", action="store_true",
+                         help="Enable swap-to-CPU for KV cache overflow")
+    p_serve.add_argument("--api-key", default=None,
+                         help="API key for bearer token authentication")
+    p_serve.add_argument("--rate-limit", type=int, default=0,
+                         help="Max requests per minute per IP (0 = unlimited)")
     p_serve.set_defaults(func=cmd_serve)
 
     # list

@@ -15,8 +15,23 @@ INL - 2025
 """
 
 import torch
-from typing import Optional, List
-from dataclasses import dataclass
+from typing import Optional, List, Dict
+from dataclasses import dataclass, field
+
+
+@dataclass
+class TokenLogprob:
+    """Log-probability info for a single generated token."""
+    token_id: int
+    logprob: float
+    top_logprobs: Optional[Dict[int, float]] = None  # token_id -> logprob
+
+
+@dataclass
+class SampleOutput:
+    """Result of sampling a batch — token IDs + optional logprobs."""
+    token_ids: torch.Tensor        # (batch,) i64
+    logprobs: Optional[List[Optional[TokenLogprob]]] = None
 
 
 @dataclass
@@ -35,6 +50,12 @@ class SamplingParams:
     # Structured output
     json_mode: bool = False
     stop_token_ids: Optional[List[int]] = None
+
+    # Logprobs
+    logprobs: Optional[int] = None  # Number of top logprobs to return per token
+
+    # Output constraints (logits processors)
+    output_constraints: Optional[object] = None  # OutputConstraints from logits_processor
 
 
 def sample_token(
@@ -193,6 +214,111 @@ def sample_batch(
 
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def sample_batch_with_logprobs(
+    logits: torch.Tensor,
+    params: SamplingParams,
+    past_tokens_list: Optional[List[List[int]]] = None,
+) -> SampleOutput:
+    """
+    Sample tokens for a batch with optional logprob tracking.
+
+    Computes log_softmax BEFORE top-k/top-p filtering so logprobs
+    reflect the true model distribution (matches OpenAI API behavior).
+
+    Args:
+        logits: (batch, vocab_size)
+        params: sampling parameters (with logprobs field)
+        past_tokens_list: per-request token history
+
+    Returns:
+        SampleOutput with token_ids and optional logprobs
+    """
+    # Apply repetition penalty before anything
+    if params.repetition_penalty != 1.0 and past_tokens_list is not None:
+        logits = logits.float()
+        apply_repetition_penalty_batch(
+            logits, past_tokens_list, params.repetition_penalty, logits.shape[-1]
+        )
+
+    if params.temperature == 0.0:
+        # Greedy — compute logprobs from raw logits
+        token_ids = logits.argmax(dim=-1)
+        if params.logprobs is not None:
+            log_probs_all = torch.log_softmax(logits.float(), dim=-1)
+            lp_list = _gather_logprobs(log_probs_all, token_ids, params.logprobs)
+            return SampleOutput(token_ids=token_ids, logprobs=lp_list)
+        return SampleOutput(token_ids=token_ids)
+
+    logits = logits.float()
+
+    if params.temperature != 1.0:
+        logits = logits / params.temperature
+
+    # Compute logprobs BEFORE top-k/top-p filtering (true model distribution)
+    log_probs_all = None
+    if params.logprobs is not None:
+        log_probs_all = torch.log_softmax(logits, dim=-1)
+
+    # Top-k
+    if params.top_k > 0 and params.top_k < logits.shape[-1]:
+        top_k_values, _ = logits.topk(params.top_k, dim=-1)
+        threshold = top_k_values[..., -1:]
+        logits[logits < threshold] = float("-inf")
+
+    # Top-p
+    if params.top_p < 1.0:
+        sorted_logits, sorted_indices = logits.sort(descending=True, dim=-1)
+        probs = torch.softmax(sorted_logits, dim=-1)
+        cumulative = probs.cumsum(dim=-1)
+        mask = (cumulative - probs) > params.top_p
+        sorted_logits[mask] = float("-inf")
+        logits = sorted_logits.scatter(-1, sorted_indices, sorted_logits)
+
+    probs = torch.softmax(logits, dim=-1)
+    token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+    if log_probs_all is not None:
+        lp_list = _gather_logprobs(log_probs_all, token_ids, params.logprobs)
+        return SampleOutput(token_ids=token_ids, logprobs=lp_list)
+
+    return SampleOutput(token_ids=token_ids)
+
+
+def _gather_logprobs(
+    log_probs: torch.Tensor,
+    token_ids: torch.Tensor,
+    num_top: int,
+) -> List[TokenLogprob]:
+    """
+    Gather logprob info for sampled tokens.
+
+    Args:
+        log_probs: (batch, vocab_size) log-softmax output
+        token_ids: (batch,) sampled token IDs
+        num_top: number of top logprobs to include
+
+    Returns:
+        List of TokenLogprob, one per batch element
+    """
+    batch = token_ids.shape[0]
+    results = []
+    for i in range(batch):
+        tid = int(token_ids[i].item())
+        lp = float(log_probs[i, tid].item())
+
+        top_lps = None
+        if num_top > 0:
+            k = min(num_top, log_probs.shape[-1])
+            top_values, top_indices = log_probs[i].topk(k)
+            top_lps = {
+                int(top_indices[j].item()): float(top_values[j].item())
+                for j in range(k)
+            }
+
+        results.append(TokenLogprob(token_id=tid, logprob=lp, top_logprobs=top_lps))
+    return results
 
 
 # =========================================================================

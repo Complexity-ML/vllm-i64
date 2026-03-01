@@ -97,6 +97,15 @@ class PagedKVCache:
         self._eviction_count: int = 0          # total evictions performed
         self._evicted_seq_ids: List[int] = []  # recently evicted (for scheduler)
 
+        # ── Swap-to-CPU ──
+        self._swap_enabled = False
+        self._cpu_k_caches: Optional[List[torch.Tensor]] = None
+        self._cpu_v_caches: Optional[List[torch.Tensor]] = None
+        self._cpu_free_blocks: List[int] = []
+        self._cpu_block_table: Optional[torch.Tensor] = None
+        self._swapped_seqs: Dict[int, dict] = {}  # seq_id → swap metadata
+        self._swap_count: int = 0
+
     @property
     def num_free_blocks(self) -> int:
         return len(self.free_blocks)
@@ -404,6 +413,118 @@ class PagedKVCache:
         self.seq_lens[seq_id] = 0
         self._last_access.pop(seq_id, None)
 
+    # =====================================================================
+    # Swap-to-CPU — preserve KV data in pinned CPU memory
+    # =====================================================================
+
+    def enable_swap(self):
+        """Allocate CPU pinned memory mirror for swap-to-CPU."""
+        if self.device == "cpu":
+            return  # No point swapping CPU→CPU
+        self._swap_enabled = True
+        cpu_num_blocks = self.num_blocks
+        self._cpu_k_caches = [
+            torch.zeros(
+                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
+                dtype=self.kv_dtype, device="cpu",
+            ).pin_memory()
+            for _ in range(self.num_layers)
+        ]
+        self._cpu_v_caches = [
+            torch.zeros(
+                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
+                dtype=self.kv_dtype, device="cpu",
+            ).pin_memory()
+            for _ in range(self.num_layers)
+        ]
+        self._cpu_free_blocks = list(range(cpu_num_blocks))
+        self._cpu_block_table = torch.full(
+            (self.max_seqs, 128), -1, dtype=torch.int32, device="cpu"
+        )
+
+    @property
+    def swap_enabled(self) -> bool:
+        return self._swap_enabled
+
+    def swap_out(self, seq_id: int) -> bool:
+        """
+        Copy KV blocks from GPU to CPU pinned memory, free GPU blocks.
+
+        Returns True on success, False if CPU swap space is full.
+        """
+        if not self._swap_enabled:
+            return False
+
+        # Count GPU blocks held
+        blocks = self.block_table[seq_id]
+        num_blocks = 0
+        for i in range(blocks.shape[0]):
+            if blocks[i].item() >= 0:
+                num_blocks += 1
+            else:
+                break
+
+        if num_blocks == 0:
+            return False
+        if len(self._cpu_free_blocks) < num_blocks:
+            return False
+
+        seq_len = self.seq_lens[seq_id].item()
+        cpu_block_ids = []
+
+        for i in range(num_blocks):
+            gpu_block = blocks[i].item()
+            cpu_block = self._cpu_free_blocks.pop()
+            cpu_block_ids.append(cpu_block)
+
+            for layer in range(self.num_layers):
+                self._cpu_k_caches[layer][cpu_block].copy_(self.k_caches[layer][gpu_block])
+                self._cpu_v_caches[layer][cpu_block].copy_(self.v_caches[layer][gpu_block])
+
+            self._cpu_block_table[seq_id, i] = cpu_block
+            self.free_blocks.append(gpu_block)
+            self.block_table[seq_id, i] = -1
+
+        self._swapped_seqs[seq_id] = {
+            "cpu_blocks": cpu_block_ids,
+            "seq_len": seq_len,
+        }
+        self.seq_lens[seq_id] = 0
+        self._swap_count += 1
+        return True
+
+    def swap_in(self, seq_id: int) -> bool:
+        """
+        Copy KV blocks from CPU back to GPU.
+
+        Returns True on success, False if GPU doesn't have enough free blocks.
+        """
+        if seq_id not in self._swapped_seqs:
+            return False
+
+        meta = self._swapped_seqs[seq_id]
+        cpu_block_ids = meta["cpu_blocks"]
+        num_blocks = len(cpu_block_ids)
+
+        if len(self.free_blocks) < num_blocks:
+            return False
+
+        for i, cpu_block in enumerate(cpu_block_ids):
+            gpu_block = self.free_blocks.pop()
+
+            for layer in range(self.num_layers):
+                self.k_caches[layer][gpu_block].copy_(self._cpu_k_caches[layer][cpu_block])
+                self.v_caches[layer][gpu_block].copy_(self._cpu_v_caches[layer][cpu_block])
+
+            self.block_table[seq_id, i] = gpu_block
+            self._cpu_block_table[seq_id, i] = -1
+            self._cpu_free_blocks.append(cpu_block)
+
+        self.seq_lens[seq_id] = meta["seq_len"]
+        del self._swapped_seqs[seq_id]
+        self._touch(seq_id)
+        return True
+
     def get_stats(self) -> dict:
         """Cache stats — all integers."""
         stats = {
@@ -419,4 +540,8 @@ class PagedKVCache:
         if self.enable_lru_eviction:
             stats["lru_evictions_total"] = self._eviction_count
             stats["lru_tracked_seqs"] = len(self._last_access)
+        if self._swap_enabled:
+            stats["swapped_seqs"] = len(self._swapped_seqs)
+            stats["cpu_free_blocks"] = len(self._cpu_free_blocks)
+            stats["swap_count_total"] = self._swap_count
         return stats
