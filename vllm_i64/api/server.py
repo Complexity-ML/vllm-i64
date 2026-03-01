@@ -119,6 +119,81 @@ class CompletionResponse:
         return json.dumps(self.to_dict())
 
 
+class UsageTracker:
+    """Per-API-key token usage tracking."""
+
+    def __init__(self):
+        self._usage: Dict[str, dict] = {}  # key → {prompt_tokens, completion_tokens, requests}
+
+    def record(self, api_key: str, prompt_tokens: int, completion_tokens: int):
+        if api_key not in self._usage:
+            self._usage[api_key] = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+        self._usage[api_key]["prompt_tokens"] += prompt_tokens
+        self._usage[api_key]["completion_tokens"] += completion_tokens
+        self._usage[api_key]["requests"] += 1
+
+    def get(self, api_key: Optional[str] = None) -> dict:
+        if api_key:
+            return self._usage.get(api_key, {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0})
+        return dict(self._usage)
+
+    def get_total(self) -> dict:
+        total = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+        for v in self._usage.values():
+            total["prompt_tokens"] += v["prompt_tokens"]
+            total["completion_tokens"] += v["completion_tokens"]
+            total["requests"] += v["requests"]
+        return total
+
+
+class RequestCache:
+    """
+    Request deduplication cache.
+    Caches generation results by prompt fingerprint to avoid recomputing identical requests.
+    """
+
+    def __init__(self, max_size: int = 1000, ttl_seconds: float = 300.0):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self._cache: Dict[str, tuple] = {}  # fingerprint → (result_dict, timestamp)
+
+    def _fingerprint(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int) -> str:
+        """Create a cache key from request params. Only cache deterministic requests (temp=0)."""
+        import hashlib
+        if temperature > 0:
+            return ""  # Don't cache non-deterministic requests
+        key = f"{prompt}|{temperature}|{top_k}|{top_p}|{max_tokens}"
+        return hashlib.sha256(key.encode()).hexdigest()
+
+    def get(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int) -> Optional[dict]:
+        fp = self._fingerprint(prompt, temperature, top_k, top_p, max_tokens)
+        if not fp or fp not in self._cache:
+            return None
+        result, ts = self._cache[fp]
+        if time.monotonic() - ts > self.ttl:
+            del self._cache[fp]
+            return None
+        return result
+
+    def put(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int, result: dict):
+        fp = self._fingerprint(prompt, temperature, top_k, top_p, max_tokens)
+        if not fp:
+            return
+        # Evict oldest if at capacity
+        if len(self._cache) >= self.max_size:
+            oldest = min(self._cache, key=lambda k: self._cache[k][1])
+            del self._cache[oldest]
+        self._cache[fp] = (result, time.monotonic())
+
+    @property
+    def size(self) -> int:
+        return len(self._cache)
+
+    @property
+    def hit_rate_info(self) -> dict:
+        return {"cached_entries": len(self._cache), "max_size": self.max_size}
+
+
 class TokenBucketRateLimiter:
     """Per-IP token bucket rate limiter."""
 
@@ -166,6 +241,7 @@ class I64Server:
         port: int = 8000,
         api_key: Optional[str] = None,
         rate_limit: int = 0,
+        max_pending: int = 0,
     ):
         # Wrap sync engine in async engine for continuous batching
         self.async_engine = AsyncI64Engine.__new__(AsyncI64Engine)
@@ -187,6 +263,10 @@ class I64Server:
         self.request_counter: int = 0
         self.api_key = api_key
         self._rate_limiter = TokenBucketRateLimiter(rate_limit) if rate_limit > 0 else None
+        self._max_pending = max_pending
+        self._usage_tracker = UsageTracker()
+        self._request_cache = RequestCache()
+        self._start_time = time.monotonic()
 
     def _tokenize(self, text: str) -> List[int]:
         """Text → i64 token IDs. Boundary operation."""
@@ -251,7 +331,7 @@ class I64Server:
             choices=[choice],
         )
 
-    async def _async_complete(self, request: CompletionRequest) -> CompletionResponse:
+    async def _async_complete(self, request: CompletionRequest, api_key: Optional[str] = None) -> CompletionResponse:
         """Async completion — batched with other concurrent requests."""
         prompt_ids = self._tokenize(request.prompt)
 
@@ -261,7 +341,13 @@ class I64Server:
             sampling_params=request.to_sampling_params(),
         )
 
-        return self._build_response(result, prompt_ids)
+        resp = self._build_response(result, prompt_ids)
+
+        # Track usage
+        if api_key:
+            self._usage_tracker.record(api_key, len(prompt_ids), len(result.output_tokens))
+
+        return resp
 
     async def _async_stream(
         self, request: CompletionRequest
@@ -356,6 +442,10 @@ class I64Server:
                 status=400,
             )
 
+        # Extract API key for usage tracking
+        auth = request.headers.get("Authorization", "")
+        req_api_key = auth[7:] if auth.startswith("Bearer ") else None
+
         try:
             if req.stream:
                 response = web.StreamResponse()
@@ -368,8 +458,18 @@ class I64Server:
                     pass  # client disconnected
                 return response
 
-            result = await self._async_complete(req)
-            return web.json_response(result.to_dict())
+            # Check dedup cache
+            cached = self._request_cache.get(req.prompt, req.temperature, req.top_k, req.top_p, req.max_tokens)
+            if cached is not None:
+                return web.json_response(cached)
+
+            result = await self._async_complete(req, api_key=req_api_key)
+            result_dict = result.to_dict()
+
+            # Store in dedup cache
+            self._request_cache.put(req.prompt, req.temperature, req.top_k, req.top_p, req.max_tokens, result_dict)
+
+            return web.json_response(result_dict)
         except (ConnectionResetError, ConnectionError):
             pass  # client disconnected
         except Exception as e:
@@ -463,14 +563,40 @@ class I64Server:
             )
 
     async def handle_health(self, request: web.Request) -> web.Response:
-        """GET /health — includes async engine stats."""
+        """GET /health — detailed health check with KV cache, GPU memory, queue depth."""
         stats = self.async_engine.get_stats()
-        return web.json_response({
+        uptime_s = int(time.monotonic() - self._start_time)
+        health = {
             "status": "ok",
             "model": self.model_name,
-            "engine": stats,
+            "uptime_seconds": uptime_s,
             "requests_served": self.request_counter,
-        })
+            "engine": stats,
+            "queue": {
+                "pending": len(self.sync_engine.scheduler.pending),
+                "running": len(self.sync_engine.scheduler.running),
+                "active_requests": self.async_engine.active_requests,
+            },
+            "cache": self._request_cache.hit_rate_info,
+            "usage": self._usage_tracker.get_total(),
+        }
+        # GPU memory info
+        try:
+            import torch
+            if torch.cuda.is_available():
+                mem = torch.cuda.mem_get_info()
+                health["gpu"] = {
+                    "free_mb": round(mem[0] / 1e6),
+                    "total_mb": round(mem[1] / 1e6),
+                    "used_mb": round((mem[1] - mem[0]) / 1e6),
+                    "utilization_pct": round((1 - mem[0] / mem[1]) * 100, 1),
+                }
+        except Exception:
+            pass
+        # KV cache stats
+        if self.sync_engine.kv_cache is not None:
+            health["kv_cache"] = self.sync_engine.kv_cache.get_stats()
+        return web.json_response(health)
 
     async def handle_models(self, request: web.Request) -> web.Response:
         """GET /v1/models"""
@@ -506,6 +632,131 @@ class I64Server:
 
         tokens = self._tokenize(text)
         return web.json_response({"tokens": tokens, "count": len(tokens)})
+
+    async def handle_embeddings(self, request: web.Request) -> web.Response:
+        """POST /v1/embeddings — compute embeddings for input text."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        input_data = body.get("input")
+        if not input_data:
+            return web.json_response(
+                {"error": {"message": "Missing 'input' field", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # Normalize to list
+        if isinstance(input_data, str):
+            input_data = [input_data]
+
+        try:
+            embeddings = []
+            for i, text in enumerate(input_data):
+                token_ids = self._tokenize(text)
+                embedding = self.sync_engine.embed(token_ids)
+                embeddings.append({
+                    "object": "embedding",
+                    "index": i,
+                    "embedding": embedding,
+                })
+
+            total_tokens = sum(len(self._tokenize(t)) for t in input_data)
+            return web.json_response({
+                "object": "list",
+                "data": embeddings,
+                "model": self.model_name,
+                "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
+            })
+        except Exception as e:
+            return web.json_response(
+                {"error": {"message": str(e), "type": "server_error"}},
+                status=500,
+            )
+
+    async def handle_usage(self, request: web.Request) -> web.Response:
+        """GET /v1/usage — token usage stats per API key."""
+        api_key = None
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            api_key = auth[7:]
+
+        if api_key:
+            usage = self._usage_tracker.get(api_key)
+        else:
+            usage = self._usage_tracker.get_total()
+
+        return web.json_response({"usage": usage})
+
+    async def handle_lora_load(self, request: web.Request) -> web.Response:
+        """POST /v1/lora/load — load a LoRA adapter."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        adapter_id = body.get("adapter_id")
+        adapter_name = body.get("name", f"adapter-{adapter_id}")
+        adapter_path = body.get("path")
+        scaling = body.get("scaling", 1.0)
+
+        if adapter_id is None or adapter_path is None:
+            return web.json_response(
+                {"error": {"message": "Missing 'adapter_id' or 'path'", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # Enable LoRA on first load
+        if self.sync_engine._lora_manager is None:
+            try:
+                self.sync_engine.enable_lora()
+            except Exception as e:
+                return web.json_response(
+                    {"error": {"message": f"Failed to enable LoRA: {e}", "type": "server_error"}},
+                    status=500,
+                )
+
+        success = self.sync_engine.load_lora_adapter(int(adapter_id), adapter_name, adapter_path, scaling)
+        if success:
+            return web.json_response({"status": "ok", "adapter_id": adapter_id, "name": adapter_name})
+        return web.json_response(
+            {"error": {"message": "Failed to load adapter (no weights found)", "type": "server_error"}},
+            status=500,
+        )
+
+    async def handle_lora_unload(self, request: web.Request) -> web.Response:
+        """POST /v1/lora/unload — unload a LoRA adapter."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        adapter_id = body.get("adapter_id")
+        if adapter_id is None:
+            return web.json_response(
+                {"error": {"message": "Missing 'adapter_id'", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        self.sync_engine.unload_lora_adapter(int(adapter_id))
+        return web.json_response({"status": "ok", "adapter_id": adapter_id})
+
+    async def handle_lora_list(self, request: web.Request) -> web.Response:
+        """GET /v1/lora/list — list loaded LoRA adapters."""
+        adapters = self.sync_engine.list_lora_adapters()
+        return web.json_response({
+            "adapters": [{"id": aid, "name": name} for aid, name in adapters.items()],
+        })
 
     @web.middleware
     async def cors_middleware(self, request, handler):
@@ -544,6 +795,20 @@ class I64Server:
                 )
         return await handler(request)
 
+    @web.middleware
+    async def load_shed_middleware(self, request, handler):
+        """Reject requests when queue is full (503 Service Unavailable)."""
+        if self._max_pending > 0 and request.path.startswith("/v1/"):
+            pending = len(self.sync_engine.scheduler.pending)
+            active = self.async_engine.active_requests
+            if pending + active >= self._max_pending:
+                return web.json_response(
+                    {"error": {"message": "Server overloaded, try again later", "type": "overloaded_error"}},
+                    status=503,
+                    headers={"Retry-After": "5"},
+                )
+        return await handler(request)
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
         middlewares = [self.cors_middleware]
@@ -551,6 +816,8 @@ class I64Server:
             middlewares.append(self.auth_middleware)
         if self._rate_limiter:
             middlewares.append(self.rate_limit_middleware)
+        if self._max_pending > 0:
+            middlewares.append(self.load_shed_middleware)
         app = web.Application(middlewares=middlewares)
         app.router.add_route("OPTIONS", "/v1/completions", self._handle_options)
         app.router.add_route("OPTIONS", "/v1/chat/completions", self._handle_options)
@@ -559,6 +826,11 @@ class I64Server:
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
         app.router.add_post("/v1/tokenize", self.handle_tokenize)
+        app.router.add_post("/v1/embeddings", self.handle_embeddings)
+        app.router.add_get("/v1/usage", self.handle_usage)
+        app.router.add_post("/v1/lora/load", self.handle_lora_load)
+        app.router.add_post("/v1/lora/unload", self.handle_lora_unload)
+        app.router.add_get("/v1/lora/list", self.handle_lora_list)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app

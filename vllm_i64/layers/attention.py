@@ -123,10 +123,12 @@ def naive_varlen_attention(
     tokens_per_seq: List[int],
     num_kv_groups: int,
     softmax_scale: Optional[float] = None,
+    sliding_window: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Naive variable-length attention fallback.
     Processes each sequence independently for correct causal masking.
+    Optional sliding_window limits attention span to last N positions.
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -163,6 +165,13 @@ def naive_varlen_attention(
                 torch.full((n, n), float('-inf'), device=q.device, dtype=q.dtype),
                 diagonal=1,
             )
+            # Sliding window: mask out positions beyond window size
+            if sliding_window is not None:
+                sw_mask = torch.tril(
+                    torch.full((n, n), float('-inf'), device=q.device, dtype=q.dtype),
+                    diagonal=-sliding_window,
+                )
+                causal_mask = causal_mask + sw_mask
             attn = attn + causal_mask.unsqueeze(0)
 
         attn = F.softmax(attn, dim=-1)
@@ -181,10 +190,12 @@ def naive_cached_attention(
     num_kv_groups: int,
     positions: torch.Tensor,   # (n_tokens,) int32
     softmax_scale: Optional[float] = None,
+    sliding_window: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Naive cached attention fallback for a single request.
     Q attends to all of k_full/v_full with causal masking.
+    Optional sliding_window limits attention to last N positions.
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
@@ -209,13 +220,22 @@ def naive_cached_attention(
 
     attn = torch.bmm(q_t, k_t.transpose(1, 2)) * softmax_scale
 
-    if n > 1:
-        total = k_full.shape[0]
-        q_pos = positions.unsqueeze(1).to(compute_dtype)
-        k_pos = torch.arange(total, device=q.device, dtype=compute_dtype).unsqueeze(0)
-        causal = torch.where(k_pos <= q_pos, torch.zeros(1, device=q.device, dtype=compute_dtype),
-                             torch.tensor(float('-inf'), device=q.device, dtype=compute_dtype))
-        attn = attn + causal.unsqueeze(0)
+    total = k_full.shape[0]
+    q_pos = positions.unsqueeze(1).to(compute_dtype)
+    k_pos = torch.arange(total, device=q.device, dtype=compute_dtype).unsqueeze(0)
+
+    # Causal mask
+    causal = torch.where(k_pos <= q_pos, torch.zeros(1, device=q.device, dtype=compute_dtype),
+                         torch.tensor(float('-inf'), device=q.device, dtype=compute_dtype))
+
+    # Sliding window: mask positions outside window
+    if sliding_window is not None:
+        sw_mask = torch.where(q_pos - k_pos < sliding_window,
+                              torch.zeros(1, device=q.device, dtype=compute_dtype),
+                              torch.tensor(float('-inf'), device=q.device, dtype=compute_dtype))
+        causal = causal + sw_mask
+
+    attn = attn + causal.unsqueeze(0)
 
     attn = F.softmax(attn, dim=-1, dtype=compute_dtype)
     out = torch.bmm(attn, v_t)   # (num_heads, n, head_dim)

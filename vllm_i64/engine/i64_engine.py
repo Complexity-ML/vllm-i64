@@ -171,6 +171,9 @@ class I64Engine:
         # === Metrics ===
         self.metrics = None
 
+        # === LoRA Manager ===
+        self._lora_manager = None
+
     def _init_kv_cache(self, max_seqs: int):
         """Initialize paged KV cache from model config."""
         from vllm_i64.core.kv_cache import PagedKVCache
@@ -256,6 +259,85 @@ class I64Engine:
             if self.kv_cache is not None:
                 self.kv_cache.free_sequence(slot)
             self._slot_pool.append(slot)
+
+    def enable_lora(self, target_names: Optional[List[str]] = None):
+        """Enable LoRA adapter support by wrapping model layers."""
+        if self.model is None:
+            raise RuntimeError("No model loaded")
+        from vllm_i64.layers.lora import LoRAManager
+        self._lora_manager = LoRAManager(self.model)
+        self._lora_manager.auto_wrap(target_names)
+        logger.info(f"LoRA enabled: {len(self._lora_manager._lora_modules)} modules wrapped")
+
+    def load_lora_adapter(
+        self,
+        adapter_id: int,
+        adapter_name: str,
+        adapter_path: str,
+        scaling: float = 1.0,
+    ) -> bool:
+        """Load a LoRA adapter from safetensors or PyTorch file."""
+        if self._lora_manager is None:
+            return False
+        import os
+        weights = {}
+        if adapter_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            weights = load_file(adapter_path)
+        elif adapter_path.endswith((".pt", ".pth", ".bin")):
+            weights = torch.load(adapter_path, map_location="cpu", weights_only=True)
+        elif os.path.isdir(adapter_path):
+            # Try safetensors in directory
+            for fname in os.listdir(adapter_path):
+                if fname.endswith(".safetensors"):
+                    from safetensors.torch import load_file
+                    weights.update(load_file(os.path.join(adapter_path, fname)))
+        if not weights:
+            return False
+        self._lora_manager.load_adapter(adapter_id, adapter_name, weights, scaling=scaling)
+        logger.info(f"LoRA adapter loaded: {adapter_name} (id={adapter_id})")
+        return True
+
+    def unload_lora_adapter(self, adapter_id: int):
+        """Unload a LoRA adapter."""
+        if self._lora_manager is not None:
+            self._lora_manager.unload_adapter(adapter_id)
+
+    def set_active_lora(self, adapter_id: Optional[int]):
+        """Set the active LoRA adapter (None = base model)."""
+        if self._lora_manager is not None:
+            self._lora_manager.set_active_adapter(adapter_id)
+
+    def list_lora_adapters(self) -> Dict[int, str]:
+        """List loaded LoRA adapters."""
+        if self._lora_manager is None:
+            return {}
+        return self._lora_manager.list_adapters()
+
+    def embed(self, token_ids: List[int]) -> List[float]:
+        """
+        Compute embeddings for token IDs.
+        Uses model's embedding layer + final norm, then mean-pools.
+        Returns a flat list of floats.
+        """
+        if self.model is None:
+            raise RuntimeError("No model loaded")
+
+        ids = torch.tensor(token_ids, dtype=torch.long, device=self.device)
+        with torch.no_grad():
+            if hasattr(self.model, 'embed_tokens') and self.model.embed_tokens is not None:
+                hidden = self.model.embed_tokens(ids)
+            else:
+                raise RuntimeError("Model has no embedding layer")
+
+            # Apply final norm if available
+            if hasattr(self.model, 'norm') and self.model.norm is not None:
+                hidden = self.model.norm(hidden)
+
+            # Mean pool over token dimension
+            embedding = hidden.mean(dim=0)
+
+        return embedding.cpu().float().tolist()
 
     def add_request(
         self,

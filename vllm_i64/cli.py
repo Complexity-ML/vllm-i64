@@ -133,6 +133,7 @@ def cmd_serve(args):
         port=args.port,
         api_key=getattr(args, 'api_key', None),
         rate_limit=getattr(args, 'rate_limit', 0),
+        max_pending=getattr(args, 'max_pending', 0),
     )
     server.run()
 
@@ -248,6 +249,8 @@ def main():
                          help="API key for bearer token authentication")
     p_serve.add_argument("--rate-limit", type=int, default=0,
                          help="Max requests per minute per IP (0 = unlimited)")
+    p_serve.add_argument("--max-pending", type=int, default=0,
+                         help="Max pending requests before rejecting (0 = unlimited)")
     p_serve.set_defaults(func=cmd_serve)
 
     # list
