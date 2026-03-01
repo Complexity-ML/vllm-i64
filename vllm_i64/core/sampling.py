@@ -57,6 +57,16 @@ class SamplingParams:
     # Output constraints (logits processors)
     output_constraints: Optional[object] = None  # OutputConstraints from logits_processor
 
+    # Seed for reproducible generation
+    seed: Optional[int] = None
+
+    # Logit bias — {token_id: bias} to boost/suppress tokens before sampling
+    logit_bias: Optional[Dict[int, float]] = None
+
+    # Frequency/presence penalties (OpenAI-compatible, separate from repetition_penalty)
+    frequency_penalty: float = 0.0   # Penalize tokens proportional to their count
+    presence_penalty: float = 0.0    # Penalize tokens that appear at all
+
 
 def sample_token(
     logits: torch.Tensor,
@@ -166,6 +176,59 @@ def apply_repetition_penalty_batch(
     return logits
 
 
+def apply_logit_bias(logits: torch.Tensor, logit_bias: Dict[int, float]) -> torch.Tensor:
+    """Apply per-token logit bias. Modifies logits in-place."""
+    if not logit_bias:
+        return logits
+    vocab_size = logits.shape[-1]
+    for token_id, bias in logit_bias.items():
+        if 0 <= token_id < vocab_size:
+            logits[..., token_id] += bias
+    return logits
+
+
+def apply_frequency_presence_penalty_batch(
+    logits: torch.Tensor,
+    past_tokens_list: List[List[int]],
+    frequency_penalty: float,
+    presence_penalty: float,
+    vocab_size: int,
+) -> torch.Tensor:
+    """
+    Apply frequency and presence penalties (OpenAI-style).
+
+    frequency_penalty: penalize tokens proportional to how many times they appear
+    presence_penalty: penalize tokens that appear at all (binary)
+
+    logits[i, t] -= frequency_penalty * count(t) + presence_penalty * (1 if t in past else 0)
+    """
+    if frequency_penalty == 0.0 and presence_penalty == 0.0:
+        return logits
+    device = logits.device
+    for i in range(logits.shape[0]):
+        past = past_tokens_list[i]
+        if not past:
+            continue
+        # Count occurrences
+        counts = {}
+        for t in past:
+            if 0 <= t < vocab_size:
+                counts[t] = counts.get(t, 0) + 1
+        if not counts:
+            continue
+        token_ids = torch.tensor(list(counts.keys()), dtype=torch.long, device=device)
+        freq = torch.tensor(list(counts.values()), dtype=logits.dtype, device=device)
+        presence = (freq > 0).to(logits.dtype)
+        logits[i, token_ids] -= frequency_penalty * freq + presence_penalty * presence
+    return logits
+
+
+def _apply_seed(params: SamplingParams):
+    """Set torch RNG seed if specified."""
+    if params.seed is not None:
+        torch.manual_seed(params.seed)
+
+
 def sample_batch(
     logits: torch.Tensor,
     params: SamplingParams,
@@ -182,17 +245,26 @@ def sample_batch(
     Returns:
         token_ids: (batch,) i64 tensor
     """
+    logits = logits.float()
+
     # Apply repetition penalty before temperature/sampling
     if params.repetition_penalty != 1.0 and past_tokens_list is not None:
-        logits = logits.float()
         apply_repetition_penalty_batch(
             logits, past_tokens_list, params.repetition_penalty, logits.shape[-1]
         )
 
+    # Apply frequency/presence penalties
+    if past_tokens_list is not None and (params.frequency_penalty != 0.0 or params.presence_penalty != 0.0):
+        apply_frequency_presence_penalty_batch(
+            logits, past_tokens_list, params.frequency_penalty, params.presence_penalty, logits.shape[-1]
+        )
+
+    # Apply logit bias
+    if params.logit_bias:
+        apply_logit_bias(logits, params.logit_bias)
+
     if params.temperature == 0.0:
         return logits.argmax(dim=-1)
-
-    logits = logits.float()
 
     if params.temperature != 1.0:
         logits = logits / params.temperature
@@ -211,6 +283,9 @@ def sample_batch(
         mask = (cumulative - probs) > params.top_p
         sorted_logits[mask] = float("-inf")
         logits = sorted_logits.scatter(-1, sorted_indices, sorted_logits)
+
+    # Seed for reproducibility
+    _apply_seed(params)
 
     probs = torch.softmax(logits, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
@@ -235,23 +310,32 @@ def sample_batch_with_logprobs(
     Returns:
         SampleOutput with token_ids and optional logprobs
     """
+    logits = logits.float()
+
     # Apply repetition penalty before anything
     if params.repetition_penalty != 1.0 and past_tokens_list is not None:
-        logits = logits.float()
         apply_repetition_penalty_batch(
             logits, past_tokens_list, params.repetition_penalty, logits.shape[-1]
         )
+
+    # Apply frequency/presence penalties
+    if past_tokens_list is not None and (params.frequency_penalty != 0.0 or params.presence_penalty != 0.0):
+        apply_frequency_presence_penalty_batch(
+            logits, past_tokens_list, params.frequency_penalty, params.presence_penalty, logits.shape[-1]
+        )
+
+    # Apply logit bias
+    if params.logit_bias:
+        apply_logit_bias(logits, params.logit_bias)
 
     if params.temperature == 0.0:
         # Greedy — compute logprobs from raw logits
         token_ids = logits.argmax(dim=-1)
         if params.logprobs is not None:
-            log_probs_all = torch.log_softmax(logits.float(), dim=-1)
+            log_probs_all = torch.log_softmax(logits, dim=-1)
             lp_list = _gather_logprobs(log_probs_all, token_ids, params.logprobs)
             return SampleOutput(token_ids=token_ids, logprobs=lp_list)
         return SampleOutput(token_ids=token_ids)
-
-    logits = logits.float()
 
     if params.temperature != 1.0:
         logits = logits / params.temperature
@@ -275,6 +359,9 @@ def sample_batch_with_logprobs(
         mask = (cumulative - probs) > params.top_p
         sorted_logits[mask] = float("-inf")
         logits = sorted_logits.scatter(-1, sorted_indices, sorted_logits)
+
+    # Seed for reproducibility
+    _apply_seed(params)
 
     probs = torch.softmax(logits, dim=-1)
     token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)

@@ -22,8 +22,11 @@ import json
 import time
 import asyncio
 import signal
+import math
+import logging
 from typing import Optional, List, Dict, AsyncGenerator
 from dataclasses import dataclass, asdict
+from collections import deque
 
 from aiohttp import web
 
@@ -52,6 +55,15 @@ class CompletionRequest:
     best_of: int = 1
     # Logprobs
     logprobs: Optional[int] = None  # Number of top logprobs per token
+    # Reproducibility
+    seed: Optional[int] = None
+    # Logit bias — {token_id_str: bias_float}
+    logit_bias: Optional[Dict[str, float]] = None
+    # Frequency/presence penalties (OpenAI-compatible)
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    # Priority (higher = sooner)
+    priority: int = 0
 
     def validate(self, max_seq_len: int = 2048) -> Optional[str]:
         """Validate request parameters. Returns error message or None."""
@@ -71,6 +83,16 @@ class CompletionRequest:
             return "repetition_penalty must be > 0"
         if self.logprobs is not None and (self.logprobs < 0 or self.logprobs > 20):
             return "logprobs must be between 0 and 20"
+        if self.frequency_penalty < -2.0 or self.frequency_penalty > 2.0:
+            return "frequency_penalty must be in [-2.0, 2.0]"
+        if self.presence_penalty < -2.0 or self.presence_penalty > 2.0:
+            return "presence_penalty must be in [-2.0, 2.0]"
+        if self.logit_bias:
+            for k, v in self.logit_bias.items():
+                if not k.lstrip('-').isdigit():
+                    return f"logit_bias keys must be token ID strings, got '{k}'"
+                if v < -100 or v > 100:
+                    return f"logit_bias values must be in [-100, 100], got {v}"
         return None
 
     def to_sampling_params(self) -> SamplingParams:
@@ -92,6 +114,11 @@ class CompletionRequest:
                 stop_sequences=stop_seqs,
             )
 
+        # Convert logit_bias from {str: float} to {int: float}
+        logit_bias = None
+        if self.logit_bias:
+            logit_bias = {int(k): v for k, v in self.logit_bias.items()}
+
         return SamplingParams(
             temperature=self.temperature,
             top_k=self.top_k,
@@ -101,6 +128,10 @@ class CompletionRequest:
             num_beams=self.best_of if self.best_of > 1 else 1,
             logprobs=self.logprobs,
             output_constraints=constraints,
+            seed=self.seed,
+            logit_bias=logit_bias,
+            frequency_penalty=self.frequency_penalty,
+            presence_penalty=self.presence_penalty,
         )
 
 
@@ -194,6 +225,101 @@ class RequestCache:
         return {"cached_entries": len(self._cache), "max_size": self.max_size}
 
 
+class LatencyTracker:
+    """Track request latencies for percentile computation (p50/p95/p99)."""
+
+    def __init__(self, max_window: int = 1000):
+        self.max_window = max_window
+        self._latencies: deque = deque(maxlen=max_window)
+        self._per_endpoint: Dict[str, deque] = {}
+
+    def record(self, endpoint: str, latency_ms: float):
+        """Record a request latency."""
+        self._latencies.append(latency_ms)
+        if endpoint not in self._per_endpoint:
+            self._per_endpoint[endpoint] = deque(maxlen=self.max_window)
+        self._per_endpoint[endpoint].append(latency_ms)
+
+    def percentiles(self, endpoint: Optional[str] = None) -> Dict[str, float]:
+        """Compute p50/p95/p99 from recent latencies."""
+        data = list(self._per_endpoint.get(endpoint, [])) if endpoint else list(self._latencies)
+        if not data:
+            return {"p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "count": 0}
+        data.sort()
+        n = len(data)
+        return {
+            "p50_ms": round(data[int(n * 0.50)], 2),
+            "p95_ms": round(data[min(int(n * 0.95), n - 1)], 2),
+            "p99_ms": round(data[min(int(n * 0.99), n - 1)], 2),
+            "count": n,
+            "avg_ms": round(sum(data) / n, 2),
+        }
+
+    def get_all_endpoints(self) -> Dict[str, Dict[str, float]]:
+        """Get percentiles for all endpoints."""
+        result = {"overall": self.percentiles()}
+        for ep in self._per_endpoint:
+            result[ep] = self.percentiles(ep)
+        return result
+
+
+class RequestLogger:
+    """Structured JSON request logging."""
+
+    def __init__(self, enabled: bool = True, max_log: int = 10000):
+        self.enabled = enabled
+        self._log: deque = deque(maxlen=max_log)
+        self._json_logger = logging.getLogger("vllm_i64.requests")
+
+    def log_request(
+        self,
+        endpoint: str,
+        status: int,
+        latency_ms: float,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        api_key: Optional[str] = None,
+        error: Optional[str] = None,
+    ):
+        if not self.enabled:
+            return
+        entry = {
+            "ts": time.time(),
+            "endpoint": endpoint,
+            "status": status,
+            "latency_ms": round(latency_ms, 2),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "api_key": api_key[:8] + "..." if api_key and len(api_key) > 8 else api_key,
+        }
+        if error:
+            entry["error"] = error
+        self._log.append(entry)
+        self._json_logger.info(json.dumps(entry))
+
+    def get_recent(self, n: int = 50) -> List[dict]:
+        """Get last N log entries."""
+        return list(self._log)[-n:]
+
+
+class PriorityManager:
+    """API key priority levels for request scheduling."""
+
+    def __init__(self):
+        self._priorities: Dict[str, int] = {}  # api_key → priority (higher = sooner)
+
+    def set_priority(self, api_key: str, priority: int):
+        self._priorities[api_key] = priority
+
+    def get_priority(self, api_key: Optional[str], request_priority: int = 0) -> int:
+        """Get effective priority: max of key-level and request-level."""
+        key_prio = self._priorities.get(api_key, 0) if api_key else 0
+        return max(key_prio, request_priority)
+
+    def get_all(self) -> Dict[str, int]:
+        return dict(self._priorities)
+
+
 class TokenBucketRateLimiter:
     """Per-IP token bucket rate limiter."""
 
@@ -267,6 +393,10 @@ class I64Server:
         self._usage_tracker = UsageTracker()
         self._request_cache = RequestCache()
         self._start_time = time.monotonic()
+        self._latency_tracker = LatencyTracker()
+        self._request_logger = RequestLogger()
+        self._priority_manager = PriorityManager()
+        self._shutting_down = False
 
     def _tokenize(self, text: str) -> List[int]:
         """Text → i64 token IDs. Boundary operation."""
@@ -331,8 +461,9 @@ class I64Server:
             choices=[choice],
         )
 
-    async def _async_complete(self, request: CompletionRequest, api_key: Optional[str] = None) -> CompletionResponse:
+    async def _async_complete(self, request: CompletionRequest, api_key: Optional[str] = None, endpoint: str = "/v1/completions") -> CompletionResponse:
         """Async completion — batched with other concurrent requests."""
+        t0 = time.monotonic()
         prompt_ids = self._tokenize(request.prompt)
 
         result = await self.async_engine.generate(
@@ -342,10 +473,21 @@ class I64Server:
         )
 
         resp = self._build_response(result, prompt_ids)
+        latency_ms = (time.monotonic() - t0) * 1000
 
         # Track usage
         if api_key:
             self._usage_tracker.record(api_key, len(prompt_ids), len(result.output_tokens))
+
+        # Track latency
+        self._latency_tracker.record(endpoint, latency_ms)
+
+        # Log request
+        self._request_logger.log_request(
+            endpoint=endpoint, status=200, latency_ms=latency_ms,
+            prompt_tokens=len(prompt_ids), completion_tokens=len(result.output_tokens),
+            api_key=api_key,
+        )
 
         return resp
 
@@ -432,6 +574,11 @@ class I64Server:
             n=body.get("n", 1),
             best_of=body.get("best_of", 1),
             logprobs=body.get("logprobs"),
+            seed=body.get("seed"),
+            logit_bias=body.get("logit_bias"),
+            frequency_penalty=body.get("frequency_penalty", 0.0),
+            presence_penalty=body.get("presence_penalty", 0.0),
+            priority=body.get("priority", 0),
         )
 
         # Validate request parameters
@@ -579,6 +726,7 @@ class I64Server:
             },
             "cache": self._request_cache.hit_rate_info,
             "usage": self._usage_tracker.get_total(),
+            "latency": self._latency_tracker.percentiles(),
         }
         # GPU memory info
         try:
@@ -758,6 +906,161 @@ class I64Server:
             "adapters": [{"id": aid, "name": name} for aid, name in adapters.items()],
         })
 
+    async def handle_batch(self, request: web.Request) -> web.Response:
+        """POST /v1/batch — submit multiple prompts, return all results."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        requests_data = body.get("requests")
+        if not requests_data or not isinstance(requests_data, list):
+            return web.json_response(
+                {"error": {"message": "Missing 'requests' array", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        if len(requests_data) > 128:
+            return web.json_response(
+                {"error": {"message": "Max 128 requests per batch", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # Extract API key
+        auth = request.headers.get("Authorization", "")
+        req_api_key = auth[7:] if auth.startswith("Bearer ") else None
+
+        # Build all CompletionRequests
+        completion_reqs = []
+        for i, rd in enumerate(requests_data):
+            prompt = rd.get("prompt")
+            if not prompt:
+                return web.json_response(
+                    {"error": {"message": f"Request {i}: missing 'prompt'", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            req = CompletionRequest(
+                prompt=prompt,
+                max_tokens=rd.get("max_tokens", 256),
+                temperature=rd.get("temperature", 0.8),
+                top_k=rd.get("top_k", 50),
+                top_p=rd.get("top_p", 0.9),
+                repetition_penalty=rd.get("repetition_penalty", 1.1),
+                seed=rd.get("seed"),
+                logit_bias=rd.get("logit_bias"),
+                frequency_penalty=rd.get("frequency_penalty", 0.0),
+                presence_penalty=rd.get("presence_penalty", 0.0),
+            )
+            error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
+            if error:
+                return web.json_response(
+                    {"error": {"message": f"Request {i}: {error}", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            completion_reqs.append(req)
+
+        # Submit all concurrently via async engine
+        tasks = [
+            self._async_complete(req, api_key=req_api_key, endpoint="/v1/batch")
+            for req in completion_reqs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Build response
+        responses = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                responses.append({"index": i, "error": str(r)})
+            else:
+                responses.append({"index": i, "result": r.to_dict()})
+
+        return web.json_response({"responses": responses})
+
+    async def handle_model_info(self, request: web.Request) -> web.Response:
+        """GET /v1/models/{model_id} — detailed model information."""
+        model_id = request.match_info.get("model_id", "")
+        if model_id != self.model_name:
+            return web.json_response(
+                {"error": {"message": f"Model '{model_id}' not found", "type": "not_found_error"}},
+                status=404,
+            )
+
+        info = {
+            "id": self.model_name,
+            "object": "model",
+            "owned_by": "inl",
+            "created": int(self._start_time),
+        }
+
+        # Add model config details if available
+        if self.sync_engine.model is not None and hasattr(self.sync_engine.model, 'config'):
+            config = self.sync_engine.model.config
+            info["config"] = {
+                "num_experts": getattr(config, 'num_experts', None),
+                "vocab_size": getattr(config, 'vocab_size', None),
+                "hidden_size": getattr(config, 'hidden_size', None),
+                "num_hidden_layers": getattr(config, 'num_hidden_layers', None),
+                "num_attention_heads": getattr(config, 'num_attention_heads', None),
+                "num_key_value_heads": getattr(config, 'num_key_value_heads', None),
+                "head_dim": getattr(config, 'head_dim', None),
+            }
+            # Count parameters
+            total_params = sum(p.numel() for p in self.sync_engine.model.parameters())
+            info["parameters"] = total_params
+            info["dtype"] = str(next(self.sync_engine.model.parameters()).dtype)
+
+        # Engine info
+        info["engine"] = {
+            "max_batch_size": self.sync_engine.scheduler.max_batch_size,
+            "max_seq_len": self.sync_engine.scheduler.max_seq_len,
+            "kv_cache": self.sync_engine.kv_cache is not None,
+            "speculative": self.sync_engine.speculative_decoder is not None,
+            "lora": self.sync_engine._lora_manager is not None,
+        }
+
+        return web.json_response(info)
+
+    async def handle_metrics(self, request: web.Request) -> web.Response:
+        """GET /v1/metrics — latency percentiles and request stats."""
+        metrics = {
+            "latency": self._latency_tracker.get_all_endpoints(),
+            "usage": self._usage_tracker.get_total(),
+            "cache": self._request_cache.hit_rate_info,
+            "uptime_seconds": int(time.monotonic() - self._start_time),
+            "requests_served": self.request_counter,
+        }
+        # Engine stats
+        metrics["engine"] = self.async_engine.get_stats()
+        return web.json_response(metrics)
+
+    async def handle_request_log(self, request: web.Request) -> web.Response:
+        """GET /v1/logs — recent request log entries."""
+        n = int(request.query.get("n", "50"))
+        entries = self._request_logger.get_recent(n)
+        return web.json_response({"entries": entries, "count": len(entries)})
+
+    async def handle_priority(self, request: web.Request) -> web.Response:
+        """POST /v1/priority — set API key priority level."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}},
+                status=400,
+            )
+        api_key = body.get("api_key")
+        priority = body.get("priority", 0)
+        if not api_key:
+            return web.json_response(
+                {"error": {"message": "Missing 'api_key'", "type": "invalid_request_error"}},
+                status=400,
+            )
+        self._priority_manager.set_priority(api_key, int(priority))
+        return web.json_response({"status": "ok", "api_key": api_key, "priority": priority})
+
     @web.middleware
     async def cors_middleware(self, request, handler):
         """Add CORS headers to all responses."""
@@ -825,12 +1128,17 @@ class I64Server:
         app.router.add_post("/v1/chat/completions", self.handle_chat_completions)
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/v1/models", self.handle_models)
+        app.router.add_get("/v1/models/{model_id}", self.handle_model_info)
         app.router.add_post("/v1/tokenize", self.handle_tokenize)
         app.router.add_post("/v1/embeddings", self.handle_embeddings)
         app.router.add_get("/v1/usage", self.handle_usage)
         app.router.add_post("/v1/lora/load", self.handle_lora_load)
         app.router.add_post("/v1/lora/unload", self.handle_lora_unload)
         app.router.add_get("/v1/lora/list", self.handle_lora_list)
+        app.router.add_post("/v1/batch", self.handle_batch)
+        app.router.add_get("/v1/metrics", self.handle_metrics)
+        app.router.add_get("/v1/logs", self.handle_request_log)
+        app.router.add_post("/v1/priority", self.handle_priority)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app
@@ -862,12 +1170,29 @@ class I64Server:
         logger.info(f"vllm-i64 :: {self.model_name}")
         logger.info(f"  http://{self.host}:{self.port}")
         logger.info(f"  POST /v1/completions | POST /v1/chat/completions | GET /health")
+        logger.info(f"  POST /v1/batch | GET /v1/models/{{id}} | GET /v1/metrics | GET /v1/logs")
         logger.info(f"  mode: async continuous batching")
         app = self.create_app()
 
-        # Graceful shutdown on SIGTERM/SIGINT
-        async def _shutdown_handler(app):
-            logger.info("Received shutdown signal")
+        # Graceful shutdown: drain requests before stopping
+        async def _graceful_shutdown(app):
+            logger.info("Graceful shutdown: stopping new requests...")
+            self._shutting_down = True
+            # The engine's stop() method handles draining
+            logger.info("Graceful shutdown complete")
 
-        app.on_shutdown.append(_shutdown_handler)
+        app.on_shutdown.append(_graceful_shutdown)
+
+        # Register SIGTERM handler for container/systemd environments
+        def _sigterm_handler():
+            logger.info("SIGTERM received, initiating graceful shutdown")
+            self._shutting_down = True
+
+        try:
+            import signal as sig
+            loop = asyncio.new_event_loop()
+            loop.add_signal_handler(sig.SIGTERM, _sigterm_handler)
+        except (NotImplementedError, OSError):
+            pass  # Windows doesn't support add_signal_handler
+
         web.run_app(app, host=self.host, port=self.port, print=None)
