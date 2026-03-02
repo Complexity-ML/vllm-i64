@@ -492,12 +492,14 @@ class I64Engine:
         # 1. Schedule (i64)
         batch = self.scheduler.schedule()
 
-        # Free KV slots for newly finished requests (must run even when batch is None)
+        # Free KV slots + clean ALL per-request state for finished requests
         for req in self.scheduler.finished:
             self._free_slot(req.request_id)
             self._request_sampling_params.pop(req.request_id, None)
             self._request_processors.pop(req.request_id, None)
-            # logprobs are consumed when building GenerationResult, not freed here
+            self._request_deadlines.pop(req.request_id, None)
+            self._request_logprobs.pop(req.request_id, None)
+            self.scheduler._tokens_generated_per_req.pop(req.request_id, None)
 
         if batch is None:
             return {}
@@ -890,7 +892,10 @@ class AsyncI64Engine:
             self._request_times.pop(request_id, None)
 
     async def _engine_loop(self):
-        """Continuous batching loop."""
+        """Continuous batching loop with crash recovery."""
+        _consecutive_errors = 0
+        _MAX_CONSECUTIVE_ERRORS = 10
+
         while self._running:
             has_work = (
                 self.engine.scheduler.pending or self.engine.scheduler.running
@@ -900,7 +905,36 @@ class AsyncI64Engine:
                 batch_size = len(self.engine.scheduler.running)
                 self.peak_batch_size = max(self.peak_batch_size, batch_size)
 
-                step_results = self.engine.step()
+                try:
+                    step_results = self.engine.step()
+                    _consecutive_errors = 0  # Reset on success
+                except Exception as e:
+                    _consecutive_errors += 1
+                    logger.error(f"Engine step failed ({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}): {e}")
+
+                    # Fail stuck requests so clients get an error response
+                    for req in list(self.engine.scheduler.running):
+                        rid = req.request_id
+                        if rid in self._pending_futures:
+                            target = self._pending_futures.pop(rid)
+                            if isinstance(target, asyncio.Future) and not target.done():
+                                target.set_exception(RuntimeError(f"Engine error: {e}"))
+                                self.active_requests -= 1
+                            elif isinstance(target, asyncio.Queue):
+                                await target.put(None)
+                        self.engine._free_slot(rid)
+                        self.engine._request_deadlines.pop(rid, None)
+                        self.engine._request_sampling_params.pop(rid, None)
+                        self.engine._request_processors.pop(rid, None)
+                        self.engine._request_logprobs.pop(rid, None)
+                    self.engine.scheduler.running.clear()
+
+                    if _consecutive_errors >= _MAX_CONSECUTIVE_ERRORS:
+                        logger.error("Too many consecutive errors, engine loop stopping")
+                        break
+
+                    await asyncio.sleep(0.1)
+                    continue
 
                 # Deliver tokens to streaming futures
                 for req_id, token_id in step_results.items():
@@ -940,6 +974,19 @@ class AsyncI64Engine:
                             # Signal end to generate_stream; its finally block handles active_requests
                             await target.put(None)
                         finished_ids.add(rid)
+                    else:
+                        # Orphan finished request (no future) — clean it up
+                        finished_ids.add(rid)
+                        self.engine._free_slot(rid)
+                        self._request_times.pop(rid, None)
+
+                # Clean up finished + all associated engine state
+                for rid in finished_ids:
+                    self.engine._request_deadlines.pop(rid, None)
+                    self.engine._request_sampling_params.pop(rid, None)
+                    self.engine._request_processors.pop(rid, None)
+                    self.engine._request_logprobs.pop(rid, None)
+                    self.engine.scheduler._tokens_generated_per_req.pop(rid, None)
 
                 self.engine.scheduler.finished = [
                     r for r in self.engine.scheduler.finished
