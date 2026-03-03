@@ -31,6 +31,7 @@ import asyncio
 import signal
 from typing import List, Dict, Optional, Callable, Set
 from dataclasses import dataclass, field
+from collections import deque
 
 from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
 from vllm_i64.core.sampling import (
@@ -49,15 +50,13 @@ class AdaptiveBatchSizer:
         self.current = initial
         self.min_size = min_size
         self.max_size = max_size
-        self._throughputs: List[float] = []
+        self._throughputs: deque = deque(maxlen=window)
         self.window = window
 
     def record(self, tokens: int, elapsed_ms: float):
         """Record a step's throughput."""
         tps = tokens / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
         self._throughputs.append(tps)
-        if len(self._throughputs) > self.window:
-            self._throughputs.pop(0)
 
     def adjust(self) -> int:
         """Adjust batch size based on throughput trend."""
@@ -143,7 +142,7 @@ class I64Engine:
 
         # === KV Cache ===
         self.kv_cache = None
-        self._slot_pool: List[int] = []
+        self._slot_pool: deque = deque()
         self._request_to_slot: Dict[int, int] = {}
 
         if self.model is not None and hasattr(self.model, 'config'):
@@ -195,7 +194,7 @@ class I64Engine:
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,
         )
-        self._slot_pool = list(range(max_seqs))
+        self._slot_pool = deque(range(max_seqs))
 
         if self.enable_prefix_caching:
             self.kv_cache.enable_prefix_caching()
@@ -248,7 +247,7 @@ class I64Engine:
         """Allocate a KV cache slot for a request."""
         if not self._slot_pool:
             return -1
-        slot = self._slot_pool.pop(0)
+        slot = self._slot_pool.popleft()
         self._request_to_slot[request_id] = slot
         return slot
 
@@ -402,44 +401,48 @@ class I64Engine:
         return token_ids.cpu().numpy().astype(np.int64)
 
     def _check_timeouts_and_cancellations(self):
-        """Remove timed-out and cancelled requests from scheduler."""
+        """Remove timed-out and cancelled requests from scheduler. Single-pass O(n)."""
         now = time.perf_counter()
-        to_remove = set()
+        removed = set()
 
-        # Check cancellations
-        for req in self.scheduler.running + self.scheduler.pending:
-            if req.request_id in self._cancelled_requests:
-                to_remove.add(req.request_id)
-
-        # Check timeouts
+        # Single pass over running: check both cancellations and timeouts
+        still_running = []
         for req in self.scheduler.running:
-            deadline = self._request_deadlines.get(req.request_id)
-            if deadline and now > deadline:
-                to_remove.add(req.request_id)
-                logger.warning(f"Request {req.request_id} timed out")
+            rid = req.request_id
+            is_cancelled = rid in self._cancelled_requests
+            is_timed_out = False
+            if not is_cancelled:
+                deadline = self._request_deadlines.get(rid)
+                is_timed_out = deadline is not None and now > deadline
 
-        # Move to finished with appropriate reason
-        for rid in to_remove:
-            for req in self.scheduler.running[:]:
-                if req.request_id == rid:
-                    req.status = 3  # FINISHED
-                    reason = "cancelled" if rid in self._cancelled_requests else "timeout"
-                    req._finish_reason = reason
-                    self.scheduler.running.remove(req)
-                    self._free_kv_blocks_for(req)
-                    self.scheduler.finished.append(req)
-                    self._free_slot(req.request_id)
-                    break
-            for req in self.scheduler.pending[:]:
-                if req.request_id == rid:
-                    self.scheduler.pending.remove(req)
+            if is_cancelled or is_timed_out:
+                req.status = 3  # FINISHED
+                req._finish_reason = "cancelled" if is_cancelled else "timeout"
+                if is_timed_out:
+                    logger.warning(f"Request {rid} timed out")
+                self._free_kv_blocks_for(req)
+                self.scheduler.finished.append(req)
+                self._free_slot(rid)
+                removed.add(rid)
+            else:
+                still_running.append(req)
+        self.scheduler.running = still_running
+
+        # Single pass over pending: only cancellations apply
+        if self._cancelled_requests:
+            still_pending = []
+            for req in self.scheduler.pending:
+                if req.request_id in self._cancelled_requests:
                     req.status = 3
                     req._finish_reason = "cancelled"
                     self.scheduler.finished.append(req)
-                    break
+                    removed.add(req.request_id)
+                else:
+                    still_pending.append(req)
+            self.scheduler.pending = still_pending
 
-        self._cancelled_requests -= to_remove
-        for rid in to_remove:
+        self._cancelled_requests -= removed
+        for rid in removed:
             self._request_deadlines.pop(rid, None)
 
     def _free_kv_blocks_for(self, req):
@@ -448,17 +451,19 @@ class I64Engine:
             self.scheduler._free_kv_blocks(req.kv_block_ids)
             req.kv_block_ids = []
 
-    def _speculative_step(self, batch: I64Batch) -> Dict[int, int]:
+    def _speculative_step(self, batch: I64Batch, _running_index: Optional[Dict[int, I64Request]] = None) -> Dict[int, int]:
         """
         Speculative decode step for small decode-only batches.
 
         Uses draft model to generate K tokens, verifies with target model.
         Multi-token acceptance → fewer forward passes → higher throughput.
         """
+        if _running_index is None:
+            _running_index = {req.request_id: req for req in self.scheduler.running}
         result = {}
         for i, req_id in enumerate(batch.request_ids):
             rid = int(req_id)
-            req = next((r for r in self.scheduler.running if r.request_id == rid), None)
+            req = _running_index.get(rid)
             if req is None:
                 continue
 
@@ -487,13 +492,9 @@ class I64Engine:
 
         Returns {request_id: generated_token_id} — all integers.
         """
-        # 0. Handle timeouts and cancellations
-        self._check_timeouts_and_cancellations()
-
-        # 1. Schedule (i64)
-        batch = self.scheduler.schedule()
-
-        # Free KV slots + clean ALL per-request state for finished requests
+        # 0. Clean up finished from PREVIOUS step (free slots, clear per-request state)
+        #    Must happen before schedule() so that newly finished requests remain
+        #    visible to callers (generate(), _engine_loop) after this step returns.
         for req in self.scheduler.finished:
             self._free_slot(req.request_id)
             self._request_sampling_params.pop(req.request_id, None)
@@ -501,8 +502,13 @@ class I64Engine:
             self._request_deadlines.pop(req.request_id, None)
             self._request_logprobs.pop(req.request_id, None)
             self.scheduler._tokens_generated_per_req.pop(req.request_id, None)
-        # Clear finished list to prevent double-free on next step
         self.scheduler.finished.clear()
+
+        # 1. Handle timeouts and cancellations
+        self._check_timeouts_and_cancellations()
+
+        # 2. Schedule (i64) — moves is_finished requests to scheduler.finished
+        batch = self.scheduler.schedule()
 
         if batch is None:
             return {}
@@ -515,14 +521,18 @@ class I64Engine:
                 kv_stats = self.kv_cache.get_stats()
                 self.metrics.update_kv_usage(kv_stats["used_blocks"], kv_stats["num_blocks"])
 
+        # Build request index for O(1) lookups (instead of O(n) linear scans)
+        _running_index: Dict[int, I64Request] = {
+            req.request_id: req for req in self.scheduler.running
+        }
+
         # 1.5. Speculative decoding for small decode-only batches
         if (self.speculative_decoder is not None
                 and batch.is_prefill.sum() == 0
                 and batch.num_requests <= 4):
-            result = self._speculative_step(batch)
+            result = self._speculative_step(batch, _running_index)
             self.scheduler.update_after_step(result)
-            for req in self.scheduler.finished:
-                self._free_slot(req.request_id)
+            # NOTE: finished request cleanup (slot freeing) happens at top of next step()
             self.total_steps += 1
             self.total_tokens_generated += len(result)
             return result
@@ -557,7 +567,7 @@ class I64Engine:
                 params = self._request_sampling_params.get(rid, self.sampling_params)
                 req_logits = logits[i:i+1]
 
-                req = next((r for r in self.scheduler.running if r.request_id == rid), None)
+                req = _running_index.get(rid)
 
                 # Apply min_tokens: suppress EOS until minimum tokens generated
                 if params.min_tokens > 0 and req is not None:
@@ -578,7 +588,6 @@ class I64Engine:
                 # Apply logits processors if configured
                 if rid in self._request_processors:
                     from vllm_i64.core.logits_processor import apply_logits_processors
-                    req = next((r for r in self.scheduler.running if r.request_id == rid), None)
                     generated = req.output_token_ids if req else []
                     req_logits = apply_logits_processors(
                         req_logits.squeeze(0), self._request_processors[rid], generated
@@ -606,7 +615,7 @@ class I64Engine:
             if self.sampling_params.repetition_penalty != 1.0:
                 past_tokens_list = []
                 for req_id in batch.request_ids:
-                    req = next((r for r in self.scheduler.running if r.request_id == int(req_id)), None)
+                    req = _running_index.get(int(req_id))
                     if req is not None:
                         past_tokens_list.append(list(req.prompt_token_ids) + req.output_token_ids)
                     else:
@@ -802,6 +811,20 @@ class AsyncI64Engine:
         # Stats
         self.active_requests: int = 0
         self.peak_batch_size: int = 0
+
+    @classmethod
+    def from_sync_engine(cls, engine: 'I64Engine') -> 'AsyncI64Engine':
+        """Create an AsyncI64Engine wrapping an existing sync engine."""
+        instance = cls.__new__(cls)
+        instance.engine = engine
+        instance._pending_futures = {}
+        instance._request_times = {}
+        instance._engine_task = None
+        instance._running = False
+        instance._draining = False
+        instance.active_requests = 0
+        instance.peak_batch_size = 0
+        return instance
 
     async def start(self):
         """Start the continuous batching background loop."""

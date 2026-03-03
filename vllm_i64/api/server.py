@@ -21,12 +21,9 @@ INL - 2025
 import json
 import time
 import asyncio
-import signal
-import math
-import logging
+import itertools
 from typing import Optional, List, Dict, AsyncGenerator
 from dataclasses import dataclass, asdict
-from collections import deque
 
 from aiohttp import web
 
@@ -34,6 +31,20 @@ from vllm_i64.engine.i64_engine import I64Engine, AsyncI64Engine, GenerationResu
 from vllm_i64.core.sampling import SamplingParams
 from vllm_i64.core.logits_processor import OutputConstraints
 from vllm_i64.core.logging import get_logger
+from vllm_i64.api.middleware import (
+    TokenBucketRateLimiter,
+    make_cors_middleware,
+    make_auth_middleware,
+    make_rate_limit_middleware,
+    make_load_shed_middleware,
+)
+from vllm_i64.api.tracking import (
+    UsageTracker,
+    RequestCache,
+    LatencyTracker,
+    RequestLogger,
+    PriorityManager,
+)
 
 logger = get_logger("vllm_i64.server")
 
@@ -104,14 +115,18 @@ class CompletionRequest:
                     return f"logit_bias values must be in [-100, 100], got {v}"
         return None
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, tokenizer=None) -> SamplingParams:
         """Convert API request to engine sampling params."""
         # Build output constraints from response_format and stop sequences
         constraints = None
         has_constraints = self.response_format or self.stop
         if has_constraints:
             stop_seqs = None
-            if self.stop:
+            if self.stop and tokenizer is not None:
+                # Encode stop sequences using the tokenizer for correct token-level matching
+                stop_seqs = [tokenizer.encode(s) for s in self.stop]
+            elif self.stop:
+                # Fallback: byte-level encoding (works for byte-level tokenizers)
                 stop_seqs = [[int(b) for b in s.encode("utf-8")] for s in self.stop]
             constraints = OutputConstraints(
                 json_mode=bool(self.response_format and self.response_format.get("type") == "json_object"),
@@ -155,207 +170,15 @@ class CompletionResponse:
     model: str = "inl-token-routed"
     choices: List[Dict] = None
 
+    def __post_init__(self):
+        if self.choices is None:
+            self.choices = []
+
     def to_dict(self) -> dict:
         return asdict(self)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
-
-
-class UsageTracker:
-    """Per-API-key token usage tracking."""
-
-    def __init__(self):
-        self._usage: Dict[str, dict] = {}  # key → {prompt_tokens, completion_tokens, requests}
-
-    def record(self, api_key: str, prompt_tokens: int, completion_tokens: int):
-        if api_key not in self._usage:
-            self._usage[api_key] = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
-        self._usage[api_key]["prompt_tokens"] += prompt_tokens
-        self._usage[api_key]["completion_tokens"] += completion_tokens
-        self._usage[api_key]["requests"] += 1
-
-    def get(self, api_key: Optional[str] = None) -> dict:
-        if api_key:
-            return self._usage.get(api_key, {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0})
-        return dict(self._usage)
-
-    def get_total(self) -> dict:
-        total = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
-        for v in self._usage.values():
-            total["prompt_tokens"] += v["prompt_tokens"]
-            total["completion_tokens"] += v["completion_tokens"]
-            total["requests"] += v["requests"]
-        return total
-
-
-class RequestCache:
-    """
-    Request deduplication cache.
-    Caches generation results by prompt fingerprint to avoid recomputing identical requests.
-    """
-
-    def __init__(self, max_size: int = 1000, ttl_seconds: float = 300.0):
-        self.max_size = max_size
-        self.ttl = ttl_seconds
-        self._cache: Dict[str, tuple] = {}  # fingerprint → (result_dict, timestamp)
-
-    def _fingerprint(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int) -> str:
-        """Create a cache key from request params. Only cache deterministic requests (temp=0)."""
-        import hashlib
-        if temperature > 0:
-            return ""  # Don't cache non-deterministic requests
-        key = f"{prompt}|{temperature}|{top_k}|{top_p}|{max_tokens}"
-        return hashlib.sha256(key.encode()).hexdigest()
-
-    def get(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int) -> Optional[dict]:
-        fp = self._fingerprint(prompt, temperature, top_k, top_p, max_tokens)
-        if not fp or fp not in self._cache:
-            return None
-        result, ts = self._cache[fp]
-        if time.monotonic() - ts > self.ttl:
-            del self._cache[fp]
-            return None
-        return result
-
-    def put(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int, result: dict):
-        fp = self._fingerprint(prompt, temperature, top_k, top_p, max_tokens)
-        if not fp:
-            return
-        # Evict oldest if at capacity
-        if len(self._cache) >= self.max_size:
-            oldest = min(self._cache, key=lambda k: self._cache[k][1])
-            del self._cache[oldest]
-        self._cache[fp] = (result, time.monotonic())
-
-    @property
-    def size(self) -> int:
-        return len(self._cache)
-
-    @property
-    def hit_rate_info(self) -> dict:
-        return {"cached_entries": len(self._cache), "max_size": self.max_size}
-
-
-class LatencyTracker:
-    """Track request latencies for percentile computation (p50/p95/p99)."""
-
-    def __init__(self, max_window: int = 1000):
-        self.max_window = max_window
-        self._latencies: deque = deque(maxlen=max_window)
-        self._per_endpoint: Dict[str, deque] = {}
-
-    def record(self, endpoint: str, latency_ms: float):
-        """Record a request latency."""
-        self._latencies.append(latency_ms)
-        if endpoint not in self._per_endpoint:
-            self._per_endpoint[endpoint] = deque(maxlen=self.max_window)
-        self._per_endpoint[endpoint].append(latency_ms)
-
-    def percentiles(self, endpoint: Optional[str] = None) -> Dict[str, float]:
-        """Compute p50/p95/p99 from recent latencies."""
-        data = list(self._per_endpoint.get(endpoint, [])) if endpoint else list(self._latencies)
-        if not data:
-            return {"p50_ms": 0.0, "p95_ms": 0.0, "p99_ms": 0.0, "count": 0}
-        data.sort()
-        n = len(data)
-        return {
-            "p50_ms": round(data[int(n * 0.50)], 2),
-            "p95_ms": round(data[min(int(n * 0.95), n - 1)], 2),
-            "p99_ms": round(data[min(int(n * 0.99), n - 1)], 2),
-            "count": n,
-            "avg_ms": round(sum(data) / n, 2),
-        }
-
-    def get_all_endpoints(self) -> Dict[str, Dict[str, float]]:
-        """Get percentiles for all endpoints."""
-        result = {"overall": self.percentiles()}
-        for ep in self._per_endpoint:
-            result[ep] = self.percentiles(ep)
-        return result
-
-
-class RequestLogger:
-    """Structured JSON request logging."""
-
-    def __init__(self, enabled: bool = True, max_log: int = 10000):
-        self.enabled = enabled
-        self._log: deque = deque(maxlen=max_log)
-        self._json_logger = logging.getLogger("vllm_i64.requests")
-
-    def log_request(
-        self,
-        endpoint: str,
-        status: int,
-        latency_ms: float,
-        prompt_tokens: int = 0,
-        completion_tokens: int = 0,
-        api_key: Optional[str] = None,
-        error: Optional[str] = None,
-    ):
-        if not self.enabled:
-            return
-        entry = {
-            "ts": time.time(),
-            "endpoint": endpoint,
-            "status": status,
-            "latency_ms": round(latency_ms, 2),
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "api_key": api_key[:8] + "..." if api_key and len(api_key) > 8 else api_key,
-        }
-        if error:
-            entry["error"] = error
-        self._log.append(entry)
-        self._json_logger.info(json.dumps(entry))
-
-    def get_recent(self, n: int = 50) -> List[dict]:
-        """Get last N log entries."""
-        return list(self._log)[-n:]
-
-
-class PriorityManager:
-    """API key priority levels for request scheduling."""
-
-    def __init__(self):
-        self._priorities: Dict[str, int] = {}  # api_key → priority (higher = sooner)
-
-    def set_priority(self, api_key: str, priority: int):
-        self._priorities[api_key] = priority
-
-    def get_priority(self, api_key: Optional[str], request_priority: int = 0) -> int:
-        """Get effective priority: max of key-level and request-level."""
-        key_prio = self._priorities.get(api_key, 0) if api_key else 0
-        return max(key_prio, request_priority)
-
-    def get_all(self) -> Dict[str, int]:
-        return dict(self._priorities)
-
-
-class TokenBucketRateLimiter:
-    """Per-IP token bucket rate limiter."""
-
-    def __init__(self, requests_per_minute: int):
-        self.rate = requests_per_minute / 60.0
-        self.capacity = requests_per_minute
-        self._buckets: Dict[str, list] = {}  # ip -> [tokens, last_time]
-
-    def allow(self, ip: str) -> bool:
-        now = time.monotonic()
-        bucket = self._buckets.get(ip)
-        if bucket is None:
-            self._buckets[ip] = [self.capacity - 1.0, now]
-            return True
-        tokens, last = bucket
-        elapsed = now - last
-        tokens = min(self.capacity, tokens + elapsed * self.rate)
-        if tokens >= 1.0:
-            bucket[0] = tokens - 1.0
-            bucket[1] = now
-            return True
-        bucket[0] = tokens
-        bucket[1] = now
-        return False
 
 
 class I64Server:
@@ -381,16 +204,8 @@ class I64Server:
         rate_limit: int = 0,
         max_pending: int = 0,
     ):
-        # Wrap sync engine in async engine for continuous batching
-        self.async_engine = AsyncI64Engine.__new__(AsyncI64Engine)
-        self.async_engine.engine = engine
-        self.async_engine._pending_futures = {}
-        self.async_engine._request_times = {}
-        self.async_engine._engine_task = None
-        self.async_engine._running = False
-        self.async_engine._draining = False
-        self.async_engine.active_requests = 0
-        self.async_engine.peak_batch_size = 0
+        # Create AsyncI64Engine properly wrapping the sync engine
+        self.async_engine = AsyncI64Engine.from_sync_engine(engine)
 
         self.sync_engine = engine
         self.tokenizer = tokenizer
@@ -398,7 +213,9 @@ class I64Server:
         self.model_name = model_name
         self.host = host
         self.port = port
-        self.request_counter: int = 0
+        # Thread-safe atomic request counter
+        self._request_counter = itertools.count(1)
+        self.request_counter: int = 0  # For stats display
         self.api_key = api_key
         self._rate_limiter = TokenBucketRateLimiter(rate_limit) if rate_limit > 0 else None
         self._max_pending = max_pending
@@ -409,6 +226,12 @@ class I64Server:
         self._request_logger = RequestLogger()
         self._priority_manager = PriorityManager()
         self._shutting_down = False
+
+    def _next_request_id(self) -> str:
+        """Generate a unique request ID (race-free)."""
+        n = next(self._request_counter)
+        self.request_counter = n  # Update for stats
+        return f"cmpl-{n}"
 
     def _tokenize(self, text: str) -> List[int]:
         """Text → i64 token IDs. Boundary operation."""
@@ -443,7 +266,7 @@ class I64Server:
     def _build_response(self, result: GenerationResult, prompt_ids: List[int]) -> CompletionResponse:
         """Build completion response from generation result."""
         output_text = self._detokenize(result.output_tokens)
-        self.request_counter += 1
+        req_id = self._next_request_id()
 
         choice = {
             "text": output_text,
@@ -467,7 +290,7 @@ class I64Server:
             }
 
         return CompletionResponse(
-            id=f"cmpl-{self.request_counter}",
+            id=req_id,
             created=int(time.time()),
             model=self.model_name,
             choices=[choice],
@@ -481,7 +304,7 @@ class I64Server:
         result = await self.async_engine.generate(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
-            sampling_params=request.to_sampling_params(),
+            sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         )
 
         resp = self._build_response(result, prompt_ids)
@@ -508,14 +331,13 @@ class I64Server:
     ) -> AsyncGenerator[str, None]:
         """Streaming completion via async engine — OpenAI SSE format."""
         prompt_ids = self._tokenize(request.prompt)
-        self.request_counter += 1
-        stream_id = f"cmpl-{self.request_counter}"
+        stream_id = self._next_request_id()
         created = int(time.time())
 
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
-            sampling_params=request.to_sampling_params(),
+            sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
             token_text = self._detokenize([token_id])
             chunk = {
@@ -731,8 +553,44 @@ class I64Server:
         """GET /health — detailed health check with KV cache, GPU memory, queue depth."""
         stats = self.async_engine.get_stats()
         uptime_s = int(time.monotonic() - self._start_time)
+
+        # Determine overall status
+        status = "ok"
+        checks = {}
+
+        # Check model loaded
+        model_loaded = self.sync_engine.model is not None
+        checks["model_loaded"] = model_loaded
+
+        # Check KV cache health
+        if self.sync_engine.kv_cache is not None:
+            kv_stats = self.sync_engine.kv_cache.get_stats()
+            kv_usage = kv_stats["used_blocks"] / max(kv_stats["num_blocks"], 1)
+            checks["kv_cache_usage_pct"] = round(kv_usage * 100, 1)
+            if kv_usage > 0.95:
+                status = "degraded"
+
+        # Check CUDA health
+        try:
+            import torch
+            if torch.cuda.is_available():
+                mem = torch.cuda.mem_get_info()
+                gpu_info = {
+                    "free_mb": round(mem[0] / 1e6),
+                    "total_mb": round(mem[1] / 1e6),
+                    "used_mb": round((mem[1] - mem[0]) / 1e6),
+                    "utilization_pct": round((1 - mem[0] / mem[1]) * 100, 1),
+                }
+                checks["gpu"] = gpu_info
+                if mem[0] / mem[1] < 0.05:  # Less than 5% free
+                    status = "degraded"
+            else:
+                checks["gpu"] = "not_available"
+        except Exception:
+            checks["gpu"] = "error"
+
         health = {
-            "status": "ok",
+            "status": status,
             "model": self.model_name,
             "uptime_seconds": uptime_s,
             "requests_served": self.request_counter,
@@ -742,23 +600,11 @@ class I64Server:
                 "running": len(self.sync_engine.scheduler.running),
                 "active_requests": self.async_engine.active_requests,
             },
+            "checks": checks,
             "cache": self._request_cache.hit_rate_info,
             "usage": self._usage_tracker.get_total(),
             "latency": self._latency_tracker.percentiles(),
         }
-        # GPU memory info
-        try:
-            import torch
-            if torch.cuda.is_available():
-                mem = torch.cuda.mem_get_info()
-                health["gpu"] = {
-                    "free_mb": round(mem[0] / 1e6),
-                    "total_mb": round(mem[1] / 1e6),
-                    "used_mb": round((mem[1] - mem[0]) / 1e6),
-                    "utilization_pct": round((1 - mem[0] / mem[1]) * 100, 1),
-                }
-        except Exception:
-            pass
         # KV cache stats
         if self.sync_engine.kv_cache is not None:
             health["kv_cache"] = self.sync_engine.kv_cache.get_stats()
@@ -1082,66 +928,18 @@ class I64Server:
         self._priority_manager.set_priority(api_key, int(priority))
         return web.json_response({"status": "ok", "api_key": api_key, "priority": priority})
 
-    @web.middleware
-    async def cors_middleware(self, request, handler):
-        """Add CORS headers to all responses."""
-        if request.method == "OPTIONS":
-            resp = web.Response()
-        else:
-            resp = await handler(request)
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-        return resp
-
-    @web.middleware
-    async def auth_middleware(self, request, handler):
-        """Check Bearer token on /v1/* endpoints."""
-        if self.api_key and request.path.startswith("/v1/"):
-            auth = request.headers.get("Authorization", "")
-            if not auth.startswith("Bearer ") or auth[7:] != self.api_key:
-                return web.json_response(
-                    {"error": {"message": "Invalid API key", "type": "authentication_error"}},
-                    status=401,
-                )
-        return await handler(request)
-
-    @web.middleware
-    async def rate_limit_middleware(self, request, handler):
-        """Per-IP rate limiting on /v1/* endpoints."""
-        if self._rate_limiter and request.path.startswith("/v1/"):
-            ip = request.remote or "unknown"
-            if not self._rate_limiter.allow(ip):
-                return web.json_response(
-                    {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
-                    status=429,
-                    headers={"Retry-After": "60"},
-                )
-        return await handler(request)
-
-    @web.middleware
-    async def load_shed_middleware(self, request, handler):
-        """Reject requests when queue is full (503 Service Unavailable)."""
-        if self._max_pending > 0 and request.path.startswith("/v1/"):
-            pending = len(self.sync_engine.scheduler.pending)
-            active = self.async_engine.active_requests
-            if pending + active >= self._max_pending:
-                return web.json_response(
-                    {"error": {"message": "Server overloaded, try again later", "type": "overloaded_error"}},
-                    status=503,
-                    headers={"Retry-After": "5"},
-                )
-        return await handler(request)
-
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
-        middlewares = [self.cors_middleware]
+        middlewares = [make_cors_middleware()]
         if self.api_key:
-            middlewares.append(self.auth_middleware)
+            middlewares.append(make_auth_middleware(self.api_key))
         if self._rate_limiter:
-            middlewares.append(self.rate_limit_middleware)
+            middlewares.append(make_rate_limit_middleware(self._rate_limiter))
         if self._max_pending > 0:
-            middlewares.append(self.load_shed_middleware)
+            def _get_load():
+                return len(self.sync_engine.scheduler.pending) + self.async_engine.active_requests
+            middlewares.append(make_load_shed_middleware(_get_load, self._max_pending))
+
         app = web.Application(middlewares=middlewares)
         app.router.add_route("OPTIONS", "/v1/completions", self._handle_options)
         app.router.add_route("OPTIONS", "/v1/chat/completions", self._handle_options)
@@ -1183,6 +981,7 @@ class I64Server:
     async def _on_cleanup(self, app):
         """Graceful shutdown: drain active requests, then stop engine."""
         logger.info("Server cleanup: draining requests...")
+        self._shutting_down = True
         await self.async_engine.stop(drain_timeout=30.0)
         logger.info("Server cleanup complete")
 

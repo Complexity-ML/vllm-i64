@@ -65,7 +65,9 @@ class PagedKVCache:
             self.kv_dtype = dtype
         self.dtype = dtype  # backward compat (read_kv returns this dtype)
 
-        max_blocks_per_seq = 128  # max sequence length / block_size
+        # Derive from a reasonable max sequence length (2048 default, configurable)
+        max_blocks_per_seq = max(128, (num_blocks * block_size) // block_size)
+        self.max_blocks_per_seq = max_blocks_per_seq
 
         # KV tensors (stored in kv_dtype — may be FP8 for memory savings)
         # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
@@ -147,12 +149,8 @@ class PagedKVCache:
             if freed >= num_blocks_needed:
                 break
 
-            # Count blocks held by this sequence
-            blocks = self.block_table[victim_sid]
-            victim_blocks = 0
-            for i in range(blocks.shape[0]):
-                if blocks[i].item() >= 0:
-                    victim_blocks += 1
+            # Count blocks held by this sequence (vectorized)
+            victim_blocks = int((self.block_table[victim_sid] >= 0).sum().item())
 
             # Free it
             self.free_sequence(victim_sid)
@@ -238,7 +236,7 @@ class PagedKVCache:
         max_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Read all K/V for a sequence.
+        Read all K/V for a sequence. Vectorized by block to avoid per-token Python loops.
 
         Returns:
             k: (seq_len, num_kv_heads, head_dim)
@@ -249,18 +247,34 @@ class PagedKVCache:
         if max_len is not None:
             seq_len = min(seq_len, max_len)
 
+        if seq_len == 0:
+            return (
+                torch.zeros(0, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device),
+                torch.zeros(0, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device),
+            )
+
         # Always return in compute dtype (dequantize if FP8)
         k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device)
         v_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device)
 
-        for pos in range(seq_len):
-            block_idx = pos // self.block_size
-            offset = pos % self.block_size
-            physical_block = self.block_table[seq_id, block_idx].item()
+        # Vectorized by block — copy entire block slices instead of per-token
+        num_full_blocks = seq_len // self.block_size
+        remainder = seq_len % self.block_size
 
+        for block_idx in range(num_full_blocks):
+            physical_block = self.block_table[seq_id, block_idx].item()
             if physical_block >= 0:
-                k_out[pos] = self.k_caches[layer_idx][physical_block, offset, :, :].to(self.compute_dtype)
-                v_out[pos] = self.v_caches[layer_idx][physical_block, offset, :, :].to(self.compute_dtype)
+                start = block_idx * self.block_size
+                end = start + self.block_size
+                k_out[start:end] = self.k_caches[layer_idx][physical_block, :self.block_size, :, :].to(self.compute_dtype)
+                v_out[start:end] = self.v_caches[layer_idx][physical_block, :self.block_size, :, :].to(self.compute_dtype)
+
+        if remainder > 0:
+            physical_block = self.block_table[seq_id, num_full_blocks].item()
+            if physical_block >= 0:
+                start = num_full_blocks * self.block_size
+                k_out[start:seq_len] = self.k_caches[layer_idx][physical_block, :remainder, :, :].to(self.compute_dtype)
+                v_out[start:seq_len] = self.v_caches[layer_idx][physical_block, :remainder, :, :].to(self.compute_dtype)
 
         return k_out, v_out
 
@@ -272,20 +286,33 @@ class PagedKVCache:
         k: torch.Tensor,           # (n, num_kv_heads, head_dim)
         v: torch.Tensor,           # (n, num_kv_heads, head_dim)
     ):
-        """Batch write K/V for one sequence. Avoids per-token Python loop overhead."""
-        for t in range(positions.shape[0]):
-            pos = positions[t].item()
-            block_idx = pos // self.block_size
-            offset = pos % self.block_size
-            physical_block = self.block_table[seq_id, block_idx].item()
+        """Batch write K/V for one sequence. Groups writes by block for efficiency."""
+        n = positions.shape[0]
+        if n == 0:
+            return
 
+        pos_np = positions.cpu().numpy()
+        block_indices = pos_np // self.block_size
+        offsets = pos_np % self.block_size
+
+        # Pre-allocate any missing blocks
+        unique_blocks = set(int(b) for b in block_indices)
+        for bidx in sorted(unique_blocks):
+            physical_block = self.block_table[seq_id, bidx].item()
             if physical_block < 0:
-                [physical_block] = self.allocate_blocks(seq_id, 1)
+                self.allocate_blocks(seq_id, 1)
 
-            self.k_caches[layer_idx][physical_block, offset, :, :] = k[t].to(self.kv_dtype)
-            self.v_caches[layer_idx][physical_block, offset, :, :] = v[t].to(self.kv_dtype)
+        # Group writes by block for fewer tensor operations
+        k_kv = k.to(self.kv_dtype)
+        v_kv = v.to(self.kv_dtype)
+        for t in range(n):
+            bidx = int(block_indices[t])
+            off = int(offsets[t])
+            physical_block = self.block_table[seq_id, bidx].item()
+            self.k_caches[layer_idx][physical_block, off, :, :] = k_kv[t]
+            self.v_caches[layer_idx][physical_block, off, :, :] = v_kv[t]
 
-        max_pos = positions.max().item() + 1
+        max_pos = int(pos_np.max()) + 1
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), max_pos)
         self._touch(seq_id)
 
