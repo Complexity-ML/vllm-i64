@@ -5,8 +5,8 @@ Optimized expert forward pass for i64 token-routed models.
 Replaces Python per-expert loop with batched operations.
 
 Two modes (auto-selected by batch size):
-  - BMM mode  (N <= threshold): torch.bmm, fully parallel, zero loops
-  - Chunked mode (N > threshold): sort-by-expert, memory-efficient
+  - BMM mode  (N <= 64): torch.bmm, fully parallel, zero loops, CUDA graph safe
+  - Chunked mode (N > 64): sort-by-expert, memory-efficient (prefill only)
 
 Since routing is deterministic (token_id % num_experts), no learned
 gating is needed — dispatch is pure integer indexing.
@@ -32,7 +32,7 @@ def fused_token_routed_forward(
     expert_ids: torch.Tensor,
     num_experts: int,
     intermediate_per_tp: int,
-    bmm_threshold: int = 48,
+    bmm_threshold: int = 64,
 ) -> torch.Tensor:
     """
     Fused expert forward with SwiGLU activation.
@@ -44,7 +44,9 @@ def fused_token_routed_forward(
         expert_ids: (num_tokens,) long — expert assignment per token
         num_experts: number of local experts
         intermediate_per_tp: intermediate dimension per TP shard
-        bmm_threshold: max tokens for BMM mode (above → chunked)
+        bmm_threshold: max tokens for BMM mode (above → chunked).
+            Set to 64 to cover all CUDA graph batch sizes (BMM is
+            graph-safe; chunked uses .item() which breaks graphs).
 
     Returns:
         output: (num_tokens, hidden_size)
@@ -156,22 +158,87 @@ def fused_token_routed_forward_int8(
     expert_ids: torch.Tensor,
     num_experts: int,
     intermediate_per_tp: int,
+    bmm_threshold: int = 64,
 ) -> torch.Tensor:
     """
     Fused expert forward with INT8 dequantization on-the-fly.
 
-    Dequantizes per-expert weights before matmul.
-    Uses chunked mode (BMM would expand INT8 weights per-token).
+    Two modes (auto-selected by batch size):
+      - BMM mode (N <= threshold): dequant per-token expert weights, torch.bmm.
+        Graph-safe — no .item() calls, no Python loops over experts.
+      - Chunked mode (N > threshold): sort-by-expert, memory-efficient.
 
     Args:
         gate_up_int8: (num_experts, hidden, 2*inter) int8
         gate_up_scale: (num_experts, hidden) float — per-channel scale
         down_int8: (num_experts, inter, hidden) int8
         down_scale: (num_experts, inter) float — per-channel scale
+        bmm_threshold: max tokens for BMM mode (above → chunked)
     """
     N = x.shape[0]
     if N == 0:
         return x
+
+    if N <= bmm_threshold:
+        return _bmm_forward_int8(x, gate_up_int8, gate_up_scale,
+                                  down_int8, down_scale, expert_ids,
+                                  intermediate_per_tp)
+
+    return _chunked_forward_int8(x, gate_up_int8, gate_up_scale,
+                                  down_int8, down_scale, expert_ids,
+                                  num_experts, intermediate_per_tp)
+
+
+def _bmm_forward_int8(
+    x: torch.Tensor,
+    gate_up_int8: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_int8: torch.Tensor,
+    down_scale: torch.Tensor,
+    expert_ids: torch.Tensor,
+    intermediate_per_tp: int,
+) -> torch.Tensor:
+    """
+    BMM INT8 forward — dequantize per-token expert weights, then bmm.
+
+    Graph-safe: no .item() calls, no Python loops.
+    Dequantizes only the selected experts' weights (indexed by expert_ids).
+    """
+    # Select and dequantize each token's expert weights
+    sel_gu_int8 = gate_up_int8[expert_ids]      # (N, H, 2I) int8
+    sel_gu_scale = gate_up_scale[expert_ids]     # (N, H) float
+    sel_gu = sel_gu_int8.float() * sel_gu_scale.unsqueeze(-1)
+    sel_gu = sel_gu.to(x.dtype)
+
+    sel_d_int8 = down_int8[expert_ids]           # (N, I, H) int8
+    sel_d_scale = down_scale[expert_ids]         # (N, I) float
+    sel_d = sel_d_int8.float() * sel_d_scale.unsqueeze(-1)
+    sel_d = sel_d.to(x.dtype)
+
+    # Gate+Up: (N, 1, H) @ (N, H, 2I) -> (N, 2I)
+    gu = torch.bmm(x.unsqueeze(1), sel_gu).squeeze(1)
+
+    # SwiGLU
+    gate = gu[..., :intermediate_per_tp]
+    up = gu[..., intermediate_per_tp:]
+    inter = F.silu(gate) * up
+
+    # Down: (N, 1, I) @ (N, I, H) -> (N, H)
+    return torch.bmm(inter.unsqueeze(1), sel_d).squeeze(1)
+
+
+def _chunked_forward_int8(
+    x: torch.Tensor,
+    gate_up_int8: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_int8: torch.Tensor,
+    down_scale: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_experts: int,
+    intermediate_per_tp: int,
+) -> torch.Tensor:
+    """Chunked INT8 forward for large batches (prefill). Uses .item()."""
+    N = x.shape[0]
 
     sorted_idx = expert_ids.argsort(stable=True)
     sorted_x = x[sorted_idx]

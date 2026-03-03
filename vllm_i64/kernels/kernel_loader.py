@@ -52,6 +52,21 @@ class FallbackOps:
         from vllm_i64.kernels.i64_ops import i64_gather
         return i64_gather(expert_out, scatter_indices)
 
+    @staticmethod
+    def atomic_scatter(hidden, expert_ids, num_experts):
+        """Fallback: uses argsort-based scatter (same as scatter_by_expert)."""
+        from vllm_i64.kernels.i64_ops import i64_scatter
+        return i64_scatter(hidden, expert_ids, num_experts)
+
+    @staticmethod
+    def fused_route_scatter(token_ids, hidden, num_experts):
+        """Fallback: route then scatter in two steps."""
+        from vllm_i64.kernels.i64_ops import i64_route_tokens, i64_scatter
+        expert_ids = i64_route_tokens(token_ids, num_experts)
+        scattered, scatter_map, offsets, counts = i64_scatter(
+            hidden, expert_ids, num_experts)
+        return expert_ids, scattered, scatter_map, offsets, counts
+
 
 def _try_compile() -> Optional[object]:
     """Try to JIT compile CUDA kernels."""

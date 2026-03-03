@@ -96,9 +96,9 @@ class CUDAGraphRunner:
 
     def capture_common_sizes(self):
         """Capture graphs for common batch sizes up to max_batch_size.
-        Capped at 32 to stay within BMM threshold for expert dispatch
-        (chunked expert forward uses .item() which breaks CUDA graphs)."""
-        sizes = [bs for bs in [1, 2, 4, 8, 16, 32] if bs <= self.max_batch_size]
+        BMM threshold raised to 64, so all captured sizes use the
+        graph-safe BMM path (no .item() calls)."""
+        sizes = [bs for bs in [1, 2, 4, 8, 16, 32, 64] if bs <= self.max_batch_size]
         for bs in sizes:
             token_ids = torch.zeros(bs, dtype=torch.int64, device=self.device)
             positions = torch.zeros(bs, dtype=torch.int32, device=self.device)
