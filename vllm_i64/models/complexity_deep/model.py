@@ -538,10 +538,10 @@ class ComplexityDeepModel(nn.Module):
         elif hasattr(self, 'lm_head'):
             logits = self.lm_head(hidden)
         else:
-            logits = F.linear(hidden, torch.zeros(
-                self.config.vocab_size, self.config.hidden_size,
-                device=hidden.device, dtype=hidden.dtype,
-            ))
+            raise RuntimeError(
+                "No lm_head or tied embeddings found — cannot compute logits. "
+                "Check model config: tie_word_embeddings or lm_head weight required."
+            )
 
         return logits
 

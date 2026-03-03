@@ -888,10 +888,13 @@ class I64Engine:
         tokens_per_seq = None
 
         if self.kv_cache is not None and batch.tokens_per_request is not None:
-            seq_ids = [
-                self._request_to_slot.get(int(rid), 0)
-                for rid in batch.request_ids
-            ]
+            seq_ids = []
+            for rid in batch.request_ids:
+                slot = self._request_to_slot.get(int(rid))
+                if slot is None:
+                    logger.error("Request %d has no KV slot — skipping from batch", int(rid))
+                    continue
+                seq_ids.append(slot)
             tokens_per_seq = batch.tokens_per_request.tolist()
 
         # Use CUDA graph for pure decode batches

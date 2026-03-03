@@ -297,6 +297,7 @@ def fused_top_p_sample(
     logits: torch.Tensor,
     top_p: float,
     temperature: float = 1.0,
+    generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
     """
     Fused top-p sampling: sort + softmax + cumsum + mask + sample in one pass.
@@ -329,7 +330,7 @@ def fused_top_p_sample(
     probs[mask] = 0.0
     probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     probs = probs / probs_sum
-    sorted_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+    sorted_token_ids = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
 
     # Map back to original indices
     return sorted_indices.gather(-1, sorted_token_ids.unsqueeze(-1)).squeeze(-1)
@@ -370,9 +371,11 @@ def apply_frequency_presence_penalty_batch(
 
 
 def _apply_seed(params: SamplingParams):
-    """Set torch RNG seed if specified."""
+    """Set torch RNG seed using a per-request Generator (avoids corrupting global RNG)."""
     if params.seed is not None:
-        torch.manual_seed(params.seed)
+        if not hasattr(params, '_generator'):
+            params._generator = torch.Generator()
+        params._generator.manual_seed(params.seed)
 
 
 def sample_batch(
@@ -429,15 +432,16 @@ def sample_batch(
     if params.typical_p < 1.0:
         logits = apply_typical_p(logits, params.typical_p)
 
-    # Seed for reproducibility
+    # Seed for reproducibility (per-request Generator, not global RNG)
     _apply_seed(params)
+    gen = getattr(params, '_generator', None)
 
     # Fused top-p path: sort + softmax + cumsum + sample in one pass
     if params.top_p < 1.0:
-        return fused_top_p_sample(logits, params.top_p, temperature=1.0)
+        return fused_top_p_sample(logits, params.top_p, temperature=1.0, generator=gen)
 
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    return torch.multinomial(probs, num_samples=1, generator=gen).squeeze(-1)
 
 
 def sample_batch_with_logprobs(
@@ -511,18 +515,20 @@ def sample_batch_with_logprobs(
         probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         probs = probs / probs_sum
 
-        # Seed for reproducibility
+        # Seed for reproducibility (per-request Generator)
         _apply_seed(params)
+        gen = getattr(params, '_generator', None)
 
         # Sample in sorted space, map back to original indices
-        sorted_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        sorted_token_ids = torch.multinomial(probs, num_samples=1, generator=gen).squeeze(-1)
         token_ids = sorted_indices.gather(-1, sorted_token_ids.unsqueeze(-1)).squeeze(-1)
     else:
-        # Seed for reproducibility
+        # Seed for reproducibility (per-request Generator)
         _apply_seed(params)
+        gen = getattr(params, '_generator', None)
 
         probs = torch.softmax(logits, dim=-1)
-        token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        token_ids = torch.multinomial(probs, num_samples=1, generator=gen).squeeze(-1)
 
     if log_probs_all is not None:
         lp_list = _gather_logprobs(log_probs_all, token_ids, params.logprobs)

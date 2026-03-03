@@ -63,9 +63,9 @@ class PagedKVCache:
         self.device = self._resolve_device(device)
 
         # FP8 quantization: store KV in FP8 for 2x memory savings
-        if kv_cache_dtype == "fp8" and device != "cpu":
+        if kv_cache_dtype == "fp8" and self.device != "cpu":
             self.kv_dtype = torch.float8_e4m3fn
-        elif kv_cache_dtype == "fp8_e5m2" and device != "cpu":
+        elif kv_cache_dtype == "fp8_e5m2" and self.device != "cpu":
             self.kv_dtype = torch.float8_e5m2
         else:
             self.kv_dtype = dtype
@@ -577,7 +577,7 @@ class PagedKVCache:
         ]
         self._cpu_free_blocks = list(range(cpu_num_blocks))
         self._cpu_block_table = torch.full(
-            (self.max_seqs, 128), -1, dtype=torch.int32, device="cpu"
+            (self.max_seqs, self.max_blocks_per_seq), -1, dtype=torch.int32, device="cpu"
         )
 
     @property
