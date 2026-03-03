@@ -120,6 +120,10 @@ class PagedKVCache:
         self._swapped_seqs: Dict[int, dict] = {}  # seq_id → swap metadata
         self._swap_count: int = 0
 
+        # ── O(1) block count per sequence ──
+        # Avoids scanning block_table[seq_id] >= 0 on every allocate/evict.
+        self._block_count: Dict[int, int] = {}
+
         # ── Lazy block zeroing ──
         # Blocks are zeroed on allocation, not on free. This makes
         # free_sequence() O(1) per block and defers the GPU write to
@@ -208,8 +212,8 @@ class PagedKVCache:
                 heapq.heappush(self._lru_heap, (tick, victim_sid))
                 continue
 
-            # Count blocks held by this sequence (vectorized)
-            victim_blocks = int((self.block_table[victim_sid] >= 0).sum().item())
+            # O(1) block count lookup
+            victim_blocks = self._block_count.get(victim_sid, 0)
 
             # Free it
             self.free_sequence(victim_sid)
@@ -247,7 +251,7 @@ class PagedKVCache:
                 )
 
         allocated = []
-        current_blocks = (self.block_table[seq_id] >= 0).sum().item()
+        current_blocks = self._block_count.get(seq_id, 0)
 
         for i in range(num_blocks_needed):
             block_id = self.free_blocks.pop()
@@ -259,6 +263,7 @@ class PagedKVCache:
             self.block_table[seq_id, block_idx] = block_id
             allocated.append(block_id)
 
+        self._block_count[seq_id] = current_blocks + num_blocks_needed
         self._touch(seq_id)
         self._active_seq_ids.add(seq_id)
         return allocated
@@ -639,10 +644,15 @@ class PagedKVCache:
     def free_sequence(self, seq_id: int):
         """Free all blocks for a sequence. Respects prefix cache refcounts."""
         blocks = self.block_table[seq_id]
-        for i in range(blocks.shape[0]):
+        num_blocks = self._block_count.get(seq_id, 0)
+        # Fast path: if _block_count says 0, no blocks to free
+        if num_blocks == 0:
+            self.seq_lens[seq_id] = 0
+            self._last_access.pop(seq_id, None)
+            self._active_seq_ids.discard(seq_id)
+            return
+        for i in range(num_blocks):
             block_id = blocks[i].item()
-            if block_id < 0:
-                break  # Blocks are contiguous; first -1 means no more
             # Check if this block is a shared prefix block
             prefix_hash = getattr(self, "_block_to_prefix", {}).get(block_id)
             if prefix_hash is not None:
@@ -661,6 +671,7 @@ class PagedKVCache:
                 self.free_blocks.append(block_id)
             blocks[i] = -1
 
+        self._block_count.pop(seq_id, None)
         self.seq_lens[seq_id] = 0
         self._last_access.pop(seq_id, None)
         self._active_seq_ids.discard(seq_id)
@@ -715,15 +726,10 @@ class PagedKVCache:
         if not self._swap_enabled:
             return False
 
-        # Count GPU blocks held (one GPU→CPU transfer)
+        # O(1) block count lookup
+        num_blocks = self._block_count.get(seq_id, 0)
         blocks = self.block_table[seq_id]
-        block_list = blocks.tolist()
-        num_blocks = 0
-        for bid in block_list:
-            if bid >= 0:
-                num_blocks += 1
-            else:
-                break
+        block_list = blocks[:num_blocks].tolist() if num_blocks > 0 else []
 
         if num_blocks == 0:
             return False
@@ -761,7 +767,9 @@ class PagedKVCache:
         self._swapped_seqs[seq_id] = {
             "cpu_blocks": cpu_block_ids,
             "seq_len": seq_len,
+            "num_blocks": num_blocks,
         }
+        self._block_count.pop(seq_id, None)
         self.seq_lens[seq_id] = 0
         self._swap_count += 1
         return True
@@ -803,6 +811,7 @@ class PagedKVCache:
         if swap_stream is not None:
             swap_stream.synchronize()
 
+        self._block_count[seq_id] = num_blocks
         self.seq_lens[seq_id] = meta["seq_len"]
         del self._swapped_seqs[seq_id]
         self._touch(seq_id)

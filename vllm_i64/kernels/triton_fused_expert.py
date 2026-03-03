@@ -355,3 +355,213 @@ def triton_expert_forward_int8(
     )
 
     return output
+
+
+# =====================================================================
+# INT4 inline dequant kernel
+#
+# Loads packed uint8 (2 values per byte) + per-group scale/zero,
+# unpacks and dequantizes in-register. Saves 4x memory bandwidth
+# vs loading pre-dequantized FP16 weights.
+# =====================================================================
+
+if _TRITON_AVAILABLE:
+    @triton.jit
+    def _fused_swiglu_int4_kernel(
+        # Input activations (fp16/bf16/fp32)
+        x_ptr,
+        # INT4 packed weights + per-group scale/zero
+        gate_up_int4_ptr,   # (H, 2*I//2) uint8 — packed
+        gate_up_scale_ptr,  # (H, num_groups_gu) float32
+        gate_up_zero_ptr,   # (H, num_groups_gu) float32
+        down_int4_ptr,      # (I, H//2) uint8 — packed
+        down_scale_ptr,     # (I, num_groups_d) float32
+        down_zero_ptr,      # (I, num_groups_d) float32
+        # Output
+        output_ptr,
+        # Dimensions
+        N, H, I,
+        GROUP_SIZE: tl.constexpr,
+        # Strides for x (N, H)
+        stride_x_n, stride_x_h,
+        # Strides for gate_up_int4 (H, I) — packed dim is I (= 2*inter//2 = inter)
+        stride_gu_h, stride_gu_i,
+        # Strides for gate_up_scale (H, num_groups_gu)
+        stride_gus_h, stride_gus_g,
+        # Strides for down_int4 (I, H//2)
+        stride_d_i, stride_d_h,
+        # Strides for down_scale (I, num_groups_d)
+        stride_ds_i, stride_ds_g,
+        # Strides for output (N, H)
+        stride_o_n, stride_o_h,
+        # Block sizes
+        BLOCK_N: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_I: tl.constexpr,
+    ):
+        """
+        Fused SwiGLU with INT4 inline unpacking and dequantization.
+
+        Same computation as the FP/INT8 kernels but:
+        - Loads packed uint8 bytes (2 INT4 values per byte)
+        - Unpacks high/low nibbles in-register
+        - Dequantizes per-group: w_fp = (nibble - zero[group]) * scale[group]
+        - 4x less memory bandwidth vs FP16 for weight loads
+        """
+        pid_n = tl.program_id(0)
+        pid_h = tl.program_id(1)
+
+        n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        n_mask = n_offsets < N
+
+        h_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+        h_mask = h_offsets < H
+
+        acc = tl.zeros((BLOCK_N, BLOCK_H), dtype=tl.float32)
+
+        # Loop over intermediate dimension in tiles
+        for i_start in range(0, I, BLOCK_I):
+            i_offsets = i_start + tl.arange(0, BLOCK_I)
+            i_mask = i_offsets < I
+
+            gate_acc = tl.zeros((BLOCK_N, BLOCK_I), dtype=tl.float32)
+            up_acc = tl.zeros((BLOCK_N, BLOCK_I), dtype=tl.float32)
+
+            for h_start in range(0, H, BLOCK_H):
+                hk_offsets = h_start + tl.arange(0, BLOCK_H)
+                hk_mask = hk_offsets < H
+
+                # Load x tile: (BLOCK_N, BLOCK_H)
+                x_ptrs = x_ptr + n_offsets[:, None] * stride_x_n + hk_offsets[None, :] * stride_x_h
+                x_tile = tl.load(x_ptrs, mask=n_mask[:, None] & hk_mask[None, :], other=0.0).to(tl.float32)
+
+                # Group index for these i_offsets (gate side: i in [0, I))
+                gate_group = i_offsets // GROUP_SIZE
+                # Group index for up side: i+I maps to group (i+I)//GROUP_SIZE
+                up_group = (i_offsets + I) // GROUP_SIZE
+
+                # Load per-group scale/zero for gate_up rows at hk_offsets
+                gus_gate_ptrs = gate_up_scale_ptr + hk_offsets[:, None] * stride_gus_h + gate_group[None, :] * stride_gus_g
+                gus_gate = tl.load(gus_gate_ptrs, mask=hk_mask[:, None] & i_mask[None, :], other=0.0)
+                guz_gate_ptrs = gate_up_zero_ptr + hk_offsets[:, None] * stride_gus_h + gate_group[None, :] * stride_gus_g
+                guz_gate = tl.load(guz_gate_ptrs, mask=hk_mask[:, None] & i_mask[None, :], other=0.0)
+
+                gus_up_ptrs = gate_up_scale_ptr + hk_offsets[:, None] * stride_gus_h + up_group[None, :] * stride_gus_g
+                gus_up = tl.load(gus_up_ptrs, mask=hk_mask[:, None] & i_mask[None, :], other=0.0)
+                guz_up_ptrs = gate_up_zero_ptr + hk_offsets[:, None] * stride_gus_h + up_group[None, :] * stride_gus_g
+                guz_up = tl.load(guz_up_ptrs, mask=hk_mask[:, None] & i_mask[None, :], other=0.0)
+
+                # Load packed INT4 gate weights and unpack
+                gate_pack_idx = i_offsets // 2
+                gu_gate_ptrs = gate_up_int4_ptr + hk_offsets[:, None] * stride_gu_h + gate_pack_idx[None, :] * stride_gu_i
+                gu_gate_packed = tl.load(gu_gate_ptrs, mask=hk_mask[:, None] & i_mask[None, :], other=0)
+                # Even indices get high nibble, odd get low nibble
+                is_high = (i_offsets % 2) == 0
+                gu_gate_nibble = tl.where(is_high[None, :], (gu_gate_packed >> 4) & 0xF, gu_gate_packed & 0xF)
+                gu_gate_fp = (gu_gate_nibble.to(tl.float32) - guz_gate) * gus_gate
+
+                # Load packed INT4 up weights and unpack
+                up_col = i_offsets + I
+                up_pack_idx = up_col // 2
+                gu_up_ptrs = gate_up_int4_ptr + hk_offsets[:, None] * stride_gu_h + up_pack_idx[None, :] * stride_gu_i
+                gu_up_packed = tl.load(gu_up_ptrs, mask=hk_mask[:, None] & i_mask[None, :], other=0)
+                is_high_up = (up_col % 2) == 0
+                gu_up_nibble = tl.where(is_high_up[None, :], (gu_up_packed >> 4) & 0xF, gu_up_packed & 0xF)
+                gu_up_fp = (gu_up_nibble.to(tl.float32) - guz_up) * gus_up
+
+                # Accumulate: (BLOCK_N, BLOCK_H) @ (BLOCK_H, BLOCK_I)
+                gate_acc += tl.dot(x_tile, gu_gate_fp)
+                up_acc += tl.dot(x_tile, gu_up_fp)
+
+            # SwiGLU activation
+            sigmoid_gate = tl.sigmoid(gate_acc)
+            silu_gate = gate_acc * sigmoid_gate
+            inter = silu_gate * up_acc
+
+            # Down projection: load INT4 packed + dequant inline
+            d_group = h_offsets // GROUP_SIZE
+            ds_ptrs = down_scale_ptr + i_offsets[:, None] * stride_ds_i + d_group[None, :] * stride_ds_g
+            ds = tl.load(ds_ptrs, mask=i_mask[:, None] & h_mask[None, :], other=0.0)
+            dz_ptrs = down_zero_ptr + i_offsets[:, None] * stride_ds_i + d_group[None, :] * stride_ds_g
+            dz = tl.load(dz_ptrs, mask=i_mask[:, None] & h_mask[None, :], other=0.0)
+
+            d_pack_idx = h_offsets // 2
+            d_ptrs = down_int4_ptr + i_offsets[:, None] * stride_d_i + d_pack_idx[None, :] * stride_d_h
+            d_packed = tl.load(d_ptrs, mask=i_mask[:, None] & h_mask[None, :], other=0)
+            is_high_d = (h_offsets % 2) == 0
+            d_nibble = tl.where(is_high_d[None, :], (d_packed >> 4) & 0xF, d_packed & 0xF)
+            d_fp = (d_nibble.to(tl.float32) - dz) * ds
+
+            acc += tl.dot(inter, d_fp)
+
+        # Store output
+        o_ptrs = output_ptr + n_offsets[:, None] * stride_o_n + h_offsets[None, :] * stride_o_h
+        tl.store(o_ptrs, acc.to(output_ptr.dtype.element_ty), mask=n_mask[:, None] & h_mask[None, :])
+
+
+def triton_expert_forward_int4(
+    x: torch.Tensor,
+    gate_up_int4: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_zero: torch.Tensor,
+    down_int4: torch.Tensor,
+    down_scale: torch.Tensor,
+    down_zero: torch.Tensor,
+    num_tokens: int,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """
+    Fused SwiGLU expert forward with INT4 inline dequant via Triton.
+
+    Loads packed uint8 (2 INT4 values per byte) + per-group scale/zero,
+    unpacks and dequantizes in-register. Saves 4x memory bandwidth vs
+    pre-dequantized FP16 weights.
+
+    Args:
+        x: (N, H) input tokens
+        gate_up_int4: (H, 2*I//2) uint8 packed weights
+        gate_up_scale: (H, num_groups) float32 per-group scale
+        gate_up_zero: (H, num_groups) float32 per-group zero
+        down_int4: (I, H//2) uint8 packed weights
+        down_scale: (I, num_groups) float32 per-group scale
+        down_zero: (I, num_groups) float32 per-group zero
+        num_tokens: number of tokens
+        group_size: quantization group size (default 128)
+
+    Returns:
+        output: (N, H) or None if Triton unavailable
+    """
+    if not is_triton_available():
+        return None
+
+    H = x.shape[1]
+    I = down_int4.shape[0]
+    N = num_tokens
+
+    output = torch.empty(N, H, device=x.device, dtype=x.dtype)
+
+    BLOCK_N = min(32, triton.next_power_of_2(N))
+    BLOCK_H = min(64, triton.next_power_of_2(H))
+    BLOCK_I = min(64, triton.next_power_of_2(I))
+
+    grid = (triton.cdiv(N, BLOCK_N), triton.cdiv(H, BLOCK_H))
+
+    _fused_swiglu_int4_kernel[grid](
+        x,
+        gate_up_int4, gate_up_scale, gate_up_zero,
+        down_int4, down_scale, down_zero,
+        output,
+        N, H, I,
+        group_size,
+        x.stride(0), x.stride(1),
+        gate_up_int4.stride(0), gate_up_int4.stride(1),
+        gate_up_scale.stride(0), gate_up_scale.stride(1),
+        down_int4.stride(0), down_int4.stride(1),
+        down_scale.stride(0), down_scale.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_N=BLOCK_N,
+        BLOCK_H=BLOCK_H,
+        BLOCK_I=BLOCK_I,
+    )
+
+    return output

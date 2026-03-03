@@ -8,9 +8,12 @@ Token-routed models are ideal for speculative decoding:
   - Verification is exact: if draft token is accepted, routing was correct
 
 Strategy:
-  1. Draft model generates K tokens speculatively
+  1. Draft model generates K tokens speculatively (greedy for draft)
   2. Target model verifies all K tokens in one forward pass
-  3. Accept matching prefix, reject from first mismatch
+  3. Accept matching prefix, sample from target on mismatch
+     (respects user's SamplingParams — temperature, top-k, top-p, etc.)
+
+Tensor-only: no .item() calls in the draft loop for GPU efficiency.
 
 INL - 2025
 """
@@ -50,67 +53,83 @@ class SpeculativeDecoder:
         self,
         token_ids: torch.Tensor,       # current context (i64)
         positions: torch.Tensor,        # current positions (i32)
+        sampling_params=None,           # optional SamplingParams for target sampling
     ) -> Tuple[List[int], int]:
         """
         One speculative decoding step.
+
+        Args:
+            token_ids: current context tokens
+            positions: current positions
+            sampling_params: if provided, used for target model token selection
+                on mismatch (temperature, top-k, top-p, etc.). If None, uses greedy.
 
         Returns:
             accepted_tokens: list of accepted token IDs (i64)
             num_draft_calls: number of draft forward passes
         """
         device = token_ids.device
-        draft_tokens = []
 
-        # Phase 1: Draft model generates K tokens
+        # Pre-allocate draft token buffer (avoid repeated cat + .item())
+        draft_buf = torch.empty(self.K, dtype=torch.int64, device=device)
+
+        # Phase 1: Draft model generates K tokens (always greedy for speed)
+        # Build all draft inputs incrementally using pre-allocated buffer
         draft_input = token_ids.clone()
-        draft_pos = positions.clone()
+        next_pos = positions[-1:] + 1  # scalar tensor, no .item()
 
-        for _ in range(self.K):
-            logits = self.draft(draft_input, draft_pos)
+        for k in range(self.K):
+            logits = self.draft(draft_input, positions if k == 0 else
+                torch.cat([positions, torch.arange(
+                    positions[-1] + 1, positions[-1] + 1 + k,
+                    dtype=torch.int32, device=device)]))
             if logits.dim() > 1:
-                logits = logits[-1]
-            next_token = logits.argmax().item()
-            draft_tokens.append(next_token)
+                logits = logits[-1:]  # keep as 1D tensor, no squeeze to scalar
+            draft_buf[k] = logits.argmax(-1)
 
-            # Extend for next draft step
-            draft_input = torch.cat([
-                draft_input,
-                torch.tensor([next_token], dtype=torch.int64, device=device)
-            ])
-            draft_pos = torch.cat([
-                draft_pos,
-                torch.tensor([draft_pos[-1].item() + 1], dtype=torch.int32, device=device)
-            ])
+            # Extend input for next draft step (tensor cat, no .item())
+            draft_input = torch.cat([draft_input, draft_buf[k:k+1]])
 
         # Phase 2: Target model verifies all K tokens in one pass
-        verify_tokens = torch.tensor(
-            [token_ids[-1].item()] + draft_tokens,
-            dtype=torch.int64, device=device,
-        )
+        # Build verify input: [last_context_token, draft_0, ..., draft_K-1]
+        verify_tokens = torch.cat([token_ids[-1:], draft_buf])  # (K+1,)
+        start_pos = positions[-1]  # scalar tensor
         verify_pos = torch.arange(
-            positions[-1].item(),
-            positions[-1].item() + len(verify_tokens),
+            start_pos, start_pos + verify_tokens.shape[0],
             dtype=torch.int32, device=device,
         )
 
         target_logits = self.target(verify_tokens, verify_pos)
 
-        # Phase 3: Accept matching prefix
+        # Phase 3: Accept matching prefix, sample from target on mismatch
+        # Move to CPU once for comparison (single transfer)
+        draft_cpu = draft_buf.cpu().tolist()
+        target_argmax = target_logits.argmax(dim=-1).cpu().tolist()
+
         accepted = []
-        for i, draft_token in enumerate(draft_tokens):
-            target_token = target_logits[i].argmax().item()
-            if target_token == draft_token:
+        for i, draft_token in enumerate(draft_cpu):
+            if target_argmax[i] == draft_token:
+                # Draft matches target's greedy — accept
                 accepted.append(draft_token)
             else:
-                # Mismatch: accept target's token instead, stop
-                accepted.append(target_token)
+                # Mismatch: sample from target using user's params
+                sampled = self._sample_target(target_logits[i], sampling_params)
+                accepted.append(sampled)
                 break
         else:
-            # All K tokens accepted, also sample next from target
-            bonus_token = target_logits[self.K].argmax().item()
-            accepted.append(bonus_token)
+            # All K tokens accepted — bonus: sample next from target
+            bonus = self._sample_target(target_logits[self.K], sampling_params)
+            accepted.append(bonus)
 
         return accepted, self.K
+
+    def _sample_target(self, logits_1d: torch.Tensor, sampling_params=None) -> int:
+        """Sample a token from target logits respecting user's sampling params."""
+        if sampling_params is None or sampling_params.temperature == 0.0:
+            return logits_1d.argmax(-1).item()
+
+        from vllm_i64.core.sampling import sample_token
+        return sample_token(logits_1d, sampling_params)
 
     def acceptance_rate(self, accepted: int, drafted: int) -> float:
         """Track acceptance rate."""

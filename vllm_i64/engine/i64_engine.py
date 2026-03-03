@@ -675,16 +675,25 @@ class I64Engine:
         # 1. Handle timeouts and cancellations
         self._check_timeouts_and_cancellations()
 
-        # 1.0.1 Check secondary merge requests for timeouts/cancellations
+        # 1.0.1 Check secondary merge requests for timeouts/cancellations/orphans
         if self._merge_enabled and self._merged_secondaries:
             now = time.perf_counter()
+            # Build set of active primary rids for orphan detection
+            active_primaries = {
+                prid for _, (prid, _, _) in self._merge_primaries.items()
+            }
             for sec_rid in list(self._merged_secondaries.keys()):
                 is_cancelled = sec_rid in self._cancelled_requests
                 deadline = self._request_deadlines.get(sec_rid)
                 is_timed_out = deadline is not None and now > deadline
-                if is_cancelled or is_timed_out:
+                # Orphan: secondary's primary no longer exists
+                phash = self._request_to_merge_group.get(sec_rid)
+                is_orphan = (phash is None
+                             or phash not in self._merge_primaries
+                             or self._merge_primaries[phash][0] not in active_primaries)
+                if is_cancelled or is_timed_out or is_orphan:
                     sec = self._merged_secondaries.pop(sec_rid)
-                    fr = "cancelled" if is_cancelled else "timeout"
+                    fr = "cancelled" if is_cancelled else ("timeout" if is_timed_out else "length")
                     self._merged_finished_results.append(GenerationResult(
                         request_id=sec_rid,
                         prompt_tokens=sec["prompt_tokens"],
@@ -739,12 +748,15 @@ class I64Engine:
             self.total_tokens_generated += len(result)
             return result
 
-        # Pin running sequences so LRU eviction can't corrupt active requests
+        # Pin ALL running sequences (not just this batch) so LRU eviction
+        # during block allocation can't corrupt any active request's KV data.
         if self.kv_cache is not None:
-            self.kv_cache._pinned_seq_ids = {
-                self._request_to_slot.get(int(rid), -1) for rid in batch.request_ids
-            }
-            self.kv_cache._pinned_seq_ids.discard(-1)
+            pinned = set()
+            for req in self.scheduler.running:
+                slot = self._request_to_slot.get(req.request_id)
+                if slot is not None:
+                    pinned.add(slot)
+            self.kv_cache._pinned_seq_ids = pinned
 
         # 2. Model forward (fp16) — the ONLY float step
         _t_fwd = time.perf_counter()

@@ -22,6 +22,7 @@ from vllm_i64.kernels.triton_fused_expert import (
     is_triton_available,
     triton_expert_forward,
     triton_expert_forward_int8,
+    triton_expert_forward_int4,
 )
 
 
@@ -302,12 +303,15 @@ def fused_token_routed_forward_int4(
     num_experts: int,
     intermediate_per_tp: int,
     group_size: int = 128,
+    bmm_threshold: int = 64,
 ) -> torch.Tensor:
     """
     Fused expert forward with INT4 dequantization on-the-fly.
 
-    Unpacks packed uint8 (2 values per byte), dequantizes per-group,
-    then runs SwiGLU. Chunked mode only.
+    Two modes (auto-selected by batch size):
+      - BMM mode (N <= threshold): dequant per-token expert weights, torch.bmm.
+        Graph-safe — no .item() calls, no Python loops over experts.
+      - Chunked mode (N > threshold): sort-by-expert, memory-efficient.
 
     Args:
         gate_up_int4: (num_experts, out, in//2) uint8 — packed
@@ -317,11 +321,106 @@ def fused_token_routed_forward_int4(
         down_scale: (num_experts, out, num_groups) float
         down_zero: (num_experts, out, num_groups) float
     """
-    from vllm_i64.core.quantization import dequantize_int4
-
     N = x.shape[0]
     if N == 0:
         return x
+
+    if N <= bmm_threshold:
+        return _bmm_forward_int4(x, gate_up_int4, gate_up_scale, gate_up_zero,
+                                  down_int4, down_scale, down_zero,
+                                  expert_ids, intermediate_per_tp, group_size)
+
+    return _chunked_forward_int4(x, gate_up_int4, gate_up_scale, gate_up_zero,
+                                  down_int4, down_scale, down_zero,
+                                  expert_ids, num_experts, intermediate_per_tp,
+                                  group_size)
+
+
+def _unpack_int4(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack INT4 packed uint8 → float. (*, in//2) → (*, in) float."""
+    high = ((packed >> 4) & 0xF).float()
+    low = (packed & 0xF).float()
+    return torch.stack([high, low], dim=-1).reshape(*packed.shape[:-1], packed.shape[-1] * 2)
+
+
+def _bmm_forward_int4(
+    x: torch.Tensor,
+    gate_up_int4: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_zero: torch.Tensor,
+    down_int4: torch.Tensor,
+    down_scale: torch.Tensor,
+    down_zero: torch.Tensor,
+    expert_ids: torch.Tensor,
+    intermediate_per_tp: int,
+    group_size: int,
+) -> torch.Tensor:
+    """
+    BMM INT4 forward — dequantize per-token expert weights, then bmm.
+
+    Graph-safe: no .item() calls, no Python loops.
+    Unpacks INT4 → float, dequantizes per-group, then uses torch.bmm.
+    """
+    # Select each token's expert packed weights
+    sel_gu_int4 = gate_up_int4[expert_ids]    # (N, out_dim, in//2) uint8
+    sel_gu_scale = gate_up_scale[expert_ids]   # (N, out_dim, num_groups) float
+    sel_gu_zero = gate_up_zero[expert_ids]     # (N, out_dim, num_groups) float
+
+    # Unpack: (N, out_dim, in//2) → (N, out_dim, in)
+    sel_gu_unpacked = _unpack_int4(sel_gu_int4)
+
+    # Per-group dequant: (unpacked - zero) * scale
+    # Reshape for broadcasting: (N, out_dim, num_groups, group_size)
+    N = x.shape[0]
+    out_dim = sel_gu_unpacked.shape[1]
+    in_features = sel_gu_unpacked.shape[2]
+    num_groups = in_features // group_size
+    sel_gu_grouped = sel_gu_unpacked.reshape(N, out_dim, num_groups, group_size)
+    sel_gu = (sel_gu_grouped - sel_gu_zero.unsqueeze(-1)) * sel_gu_scale.unsqueeze(-1)
+    sel_gu = sel_gu.reshape(N, out_dim, in_features).to(x.dtype)
+
+    # Gate+Up: (N, 1, H) @ (N, H, 2I) -> (N, 2I)
+    gu = torch.bmm(x.unsqueeze(1), sel_gu).squeeze(1)
+
+    # SwiGLU
+    gate = gu[..., :intermediate_per_tp]
+    up = gu[..., intermediate_per_tp:]
+    inter = F.silu(gate) * up
+
+    # Down projection: same unpack + dequant
+    sel_d_int4 = down_int4[expert_ids]
+    sel_d_scale = down_scale[expert_ids]
+    sel_d_zero = down_zero[expert_ids]
+
+    sel_d_unpacked = _unpack_int4(sel_d_int4)
+    d_out_dim = sel_d_unpacked.shape[1]
+    d_in_features = sel_d_unpacked.shape[2]
+    d_num_groups = d_in_features // group_size
+    sel_d_grouped = sel_d_unpacked.reshape(N, d_out_dim, d_num_groups, group_size)
+    sel_d = (sel_d_grouped - sel_d_zero.unsqueeze(-1)) * sel_d_scale.unsqueeze(-1)
+    sel_d = sel_d.reshape(N, d_out_dim, d_in_features).to(x.dtype)
+
+    # Down: (N, 1, I) @ (N, I, H) -> (N, H)
+    return torch.bmm(inter.unsqueeze(1), sel_d).squeeze(1)
+
+
+def _chunked_forward_int4(
+    x: torch.Tensor,
+    gate_up_int4: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    gate_up_zero: torch.Tensor,
+    down_int4: torch.Tensor,
+    down_scale: torch.Tensor,
+    down_zero: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_experts: int,
+    intermediate_per_tp: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Chunked INT4 forward for large batches (prefill). Uses .item()."""
+    from vllm_i64.core.quantization import dequantize_int4
+
+    N = x.shape[0]
 
     sorted_idx = expert_ids.argsort(stable=True)
     sorted_x = x[sorted_idx]
@@ -333,6 +432,8 @@ def fused_token_routed_forward_int4(
 
     output = torch.empty(N, x.shape[1], device=x.device, dtype=x.dtype)
 
+    use_triton = is_triton_available() and x.is_cuda
+
     for eid in range(num_experts):
         s = offsets[eid].item()
         e = offsets[eid + 1].item()
@@ -341,7 +442,18 @@ def fused_token_routed_forward_int4(
 
         chunk = sorted_x[s:e]
 
-        # Dequantize gate_up: int4 packed → float
+        if use_triton:
+            out = triton_expert_forward_int4(
+                chunk,
+                gate_up_int4[eid], gate_up_scale[eid], gate_up_zero[eid],
+                down_int4[eid], down_scale[eid], down_zero[eid],
+                e - s, group_size,
+            )
+            if out is not None:
+                output[s:e] = out
+                continue
+
+        # PyTorch fallback: dequantize + matmul
         w_gu = dequantize_int4(
             gate_up_int4[eid], gate_up_scale[eid], gate_up_zero[eid], group_size,
         )
@@ -352,7 +464,6 @@ def fused_token_routed_forward_int4(
         up = gu[..., intermediate_per_tp:]
         inter = F.silu(gate) * up
 
-        # Dequantize down: int4 packed → float
         w_d = dequantize_int4(
             down_int4[eid], down_scale[eid], down_zero[eid], group_size,
         )
