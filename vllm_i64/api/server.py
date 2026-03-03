@@ -45,7 +45,10 @@ class CompletionRequest:
     temperature: float = 0.8
     top_k: int = 50
     top_p: float = 0.9
+    min_p: float = 0.0              # Min-p: dynamic threshold relative to top token
+    typical_p: float = 1.0          # Typical sampling: entropy-based token selection
     repetition_penalty: float = 1.1
+    min_tokens: int = 0             # Minimum tokens before allowing EOS
     stream: bool = False
     # Structured output
     response_format: Optional[Dict] = None  # {"type": "json_object"} or {"type": "regex", "pattern": "..."}
@@ -79,6 +82,12 @@ class CompletionRequest:
             return "top_k must be >= 0"
         if self.top_p < 0 or self.top_p > 1:
             return "top_p must be in [0, 1]"
+        if self.min_p < 0 or self.min_p > 1:
+            return "min_p must be in [0, 1]"
+        if self.typical_p < 0 or self.typical_p > 1:
+            return "typical_p must be in [0, 1]"
+        if self.min_tokens < 0:
+            return "min_tokens must be >= 0"
         if self.repetition_penalty <= 0:
             return "repetition_penalty must be > 0"
         if self.logprobs is not None and (self.logprobs < 0 or self.logprobs > 20):
@@ -123,7 +132,10 @@ class CompletionRequest:
             temperature=self.temperature,
             top_k=self.top_k,
             top_p=self.top_p,
+            min_p=self.min_p,
+            typical_p=self.typical_p,
             repetition_penalty=self.repetition_penalty,
+            min_tokens=self.min_tokens,
             json_mode=bool(self.response_format and self.response_format.get("type") == "json_object"),
             num_beams=self.best_of if self.best_of > 1 else 1,
             logprobs=self.logprobs,
@@ -567,7 +579,10 @@ class I64Server:
             temperature=body.get("temperature", 0.8),
             top_k=body.get("top_k", 50),
             top_p=body.get("top_p", 0.9),
+            min_p=body.get("min_p", 0.0),
+            typical_p=body.get("typical_p", 1.0),
             repetition_penalty=body.get("repetition_penalty", 1.1),
+            min_tokens=body.get("min_tokens", 0),
             stream=body.get("stream", False),
             response_format=body.get("response_format"),
             stop=body.get("stop"),
@@ -650,7 +665,10 @@ class I64Server:
             temperature=body.get("temperature", 0.8),
             top_k=body.get("top_k", 50),
             top_p=body.get("top_p", 0.9),
+            min_p=body.get("min_p", 0.0),
+            typical_p=body.get("typical_p", 1.0),
             repetition_penalty=body.get("repetition_penalty", 1.1),
+            min_tokens=body.get("min_tokens", 0),
             stream=body.get("stream", False),
         )
 
@@ -948,7 +966,10 @@ class I64Server:
                 temperature=rd.get("temperature", 0.8),
                 top_k=rd.get("top_k", 50),
                 top_p=rd.get("top_p", 0.9),
+                min_p=rd.get("min_p", 0.0),
+                typical_p=rd.get("typical_p", 1.0),
                 repetition_penalty=rd.get("repetition_penalty", 1.1),
+                min_tokens=rd.get("min_tokens", 0),
                 seed=rd.get("seed"),
                 logit_bias=rd.get("logit_bias"),
                 frequency_penalty=rd.get("frequency_penalty", 0.0),

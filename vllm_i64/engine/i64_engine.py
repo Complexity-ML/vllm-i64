@@ -557,9 +557,19 @@ class I64Engine:
                 params = self._request_sampling_params.get(rid, self.sampling_params)
                 req_logits = logits[i:i+1]
 
+                req = next((r for r in self.scheduler.running if r.request_id == rid), None)
+
+                # Apply min_tokens: suppress EOS until minimum tokens generated
+                if params.min_tokens > 0 and req is not None:
+                    eos_id = getattr(req, 'eos_token_id', None)
+                    if eos_id is not None:
+                        from vllm_i64.core.sampling import apply_min_tokens
+                        req_logits = apply_min_tokens(
+                            req_logits, req.num_generated, params.min_tokens, eos_id
+                        )
+
                 past_tokens = None
                 if params.repetition_penalty != 1.0:
-                    req = next((r for r in self.scheduler.running if r.request_id == rid), None)
                     if req is not None:
                         past_tokens = [list(req.prompt_token_ids) + req.output_token_ids]
                     else:

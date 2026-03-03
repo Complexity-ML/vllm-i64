@@ -40,8 +40,11 @@ class SamplingParams:
     temperature: float = 1.0
     top_k: int = 50
     top_p: float = 1.0
+    min_p: float = 0.0              # Min-p: dynamic threshold relative to top token prob
+    typical_p: float = 1.0          # Typical sampling: select tokens near expected entropy
     repetition_penalty: float = 1.0
     max_tokens: int = 256
+    min_tokens: int = 0             # Minimum tokens before allowing EOS
 
     # Beam search
     num_beams: int = 1  # 1 = no beam search
@@ -131,6 +134,104 @@ def sample_token(
     token_id = torch.multinomial(probs, num_samples=1).item()
 
     return token_id
+
+
+def apply_min_p(logits: torch.Tensor, min_p: float) -> torch.Tensor:
+    """
+    Min-p sampling: dynamic threshold based on the top token's probability.
+
+    Instead of a fixed top-p cumulative cutoff, min-p sets a floor relative
+    to the most probable token. If top token has prob 0.9 and min_p=0.1,
+    the threshold is 0.9 * 0.1 = 0.09 — tokens below 0.09 are masked.
+
+    Adapts naturally: confident predictions stay tight, uncertain ones
+    keep more diversity. Better than top-p in practice.
+
+    Args:
+        logits: (batch, vocab_size) or (vocab_size,)
+        min_p: minimum probability threshold relative to top token (0.0 = disabled)
+
+    Returns:
+        logits with low-probability tokens masked to -inf
+    """
+    if min_p <= 0.0 or min_p >= 1.0:
+        return logits
+
+    probs = torch.softmax(logits, dim=-1)
+    top_prob = probs.max(dim=-1, keepdim=True).values
+    threshold = top_prob * min_p
+    logits[probs < threshold] = float("-inf")
+    return logits
+
+
+def apply_typical_p(logits: torch.Tensor, typical_p: float) -> torch.Tensor:
+    """
+    Typical sampling (Meister et al., 2022): select tokens whose information
+    content is close to the expected information content (entropy).
+
+    Instead of taking the most probable tokens (top-p), typical sampling
+    takes the most "typical" tokens — those that contribute information
+    closest to the average. Produces more coherent, less repetitive text.
+
+    Args:
+        logits: (batch, vocab_size) or (vocab_size,)
+        typical_p: cumulative probability threshold in typical space (1.0 = disabled)
+
+    Returns:
+        logits with atypical tokens masked to -inf
+    """
+    if typical_p >= 1.0:
+        return logits
+
+    probs = torch.softmax(logits, dim=-1)
+    log_probs = torch.log_softmax(logits, dim=-1)
+
+    # Entropy = expected information content
+    neg_entropy = (probs * log_probs).sum(dim=-1, keepdim=True)  # -H
+
+    # |log(p(x)) - (-H)| = deviation from expected information
+    surprisal_deviation = (log_probs + neg_entropy).abs()
+
+    # Sort by deviation (most typical first)
+    sorted_deviation, sorted_indices = surprisal_deviation.sort(dim=-1)
+    sorted_probs = probs.gather(-1, sorted_indices)
+
+    # Cumulative sum of probabilities in typical order
+    cumulative = sorted_probs.cumsum(dim=-1)
+    mask = cumulative - sorted_probs > typical_p
+
+    # Unsort the mask back to original positions
+    original_mask = mask.scatter(-1, sorted_indices, mask)
+    logits[original_mask] = float("-inf")
+    return logits
+
+
+def apply_min_tokens(
+    logits: torch.Tensor,
+    num_generated: int,
+    min_tokens: int,
+    eos_token_id: Optional[int],
+) -> torch.Tensor:
+    """
+    Suppress EOS token until min_tokens have been generated.
+
+    Prevents premature stopping — useful for models that tend to
+    generate very short outputs.
+
+    Args:
+        logits: (batch, vocab_size) or (vocab_size,)
+        num_generated: tokens generated so far for this request
+        min_tokens: minimum number of tokens before EOS is allowed
+        eos_token_id: the EOS token to suppress
+
+    Returns:
+        logits with EOS masked if below min_tokens threshold
+    """
+    if min_tokens <= 0 or eos_token_id is None:
+        return logits
+    if num_generated < min_tokens:
+        logits[..., eos_token_id] = float("-inf")
+    return logits
 
 
 def apply_repetition_penalty_batch(
@@ -275,6 +376,10 @@ def sample_batch(
         threshold = top_k_values[..., -1:]
         logits[logits < threshold] = float("-inf")
 
+    # Min-p (dynamic threshold relative to top token)
+    if params.min_p > 0.0:
+        logits = apply_min_p(logits, params.min_p)
+
     # Top-p
     if params.top_p < 1.0:
         sorted_logits, sorted_indices = logits.sort(descending=True, dim=-1)
@@ -283,6 +388,10 @@ def sample_batch(
         mask = (cumulative - probs) > params.top_p
         sorted_logits[mask] = float("-inf")
         logits = sorted_logits.scatter(-1, sorted_indices, sorted_logits)
+
+    # Typical sampling (entropy-based selection)
+    if params.typical_p < 1.0:
+        logits = apply_typical_p(logits, params.typical_p)
 
     # Seed for reproducibility
     _apply_seed(params)
