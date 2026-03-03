@@ -479,8 +479,8 @@ class PagedKVCache:
             if prefix_hash in self._prefix_hash_to_blocks:
                 # Collision detection: verify actual tokens match
                 cached_tokens = self._prefix_hash_to_tokens.get(prefix_hash)
-                if cached_tokens is not None and cached_tokens != tuple(block_tokens):
-                    break  # Hash collision — don't reuse wrong KV blocks
+                if cached_tokens is None or cached_tokens != tuple(block_tokens):
+                    break  # Hash collision or missing metadata — don't reuse
                 # Reuse: point this seq's block table to existing physical block
                 physical_block = self._prefix_hash_to_blocks[prefix_hash][0]
                 self.block_table[seq_id, block_idx] = physical_block

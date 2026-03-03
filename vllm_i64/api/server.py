@@ -786,16 +786,16 @@ class I64Server:
 
         try:
             embeddings = []
+            total_tokens = 0
             for i, text in enumerate(input_data):
                 token_ids = self._tokenize(text)
+                total_tokens += len(token_ids)
                 embedding = self.sync_engine.embed(token_ids)
                 embeddings.append({
                     "object": "embedding",
                     "index": i,
                     "embedding": embedding,
                 })
-
-            total_tokens = sum(len(self._tokenize(t)) for t in input_data)
             return web.json_response({
                 "object": "list",
                 "data": embeddings,

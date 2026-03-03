@@ -93,6 +93,11 @@ def dequantize_int4(
     out_features = packed.shape[0]
     in_features = packed.shape[1] * 2
 
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"INT4 dequant: in_features ({in_features}) not divisible by group_size ({group_size})"
+        )
+
     # Vectorized unpack: extract high/low nibbles
     high = (packed >> 4) & 0xF
     low = packed & 0xF
