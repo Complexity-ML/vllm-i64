@@ -29,7 +29,7 @@ import numpy as np
 import time
 import asyncio
 import signal
-from typing import List, Dict, Optional, Callable, Set
+from typing import List, Dict, Optional, Callable, Set, Tuple
 from dataclasses import dataclass, field
 from collections import deque
 
@@ -167,6 +167,16 @@ class I64Engine:
         # === Logits processors (per-request) ===
         self._request_processors: Dict[int, list] = {}
 
+        # === Pipelined prefill/decode ===
+        self._pipeline_enabled = False
+        self._prefill_result_cache: Optional[Dict[int, torch.Tensor]] = None
+
+        # === Request merging (dedup identical prompts) ===
+        self._merge_enabled = False
+        # Maps prompt_hash → (primary_request_id, [secondary_request_ids])
+        self._merged_requests: Dict[int, Tuple[int, List[int]]] = {}
+        self._request_to_merge_group: Dict[int, int] = {}  # rid → prompt_hash
+
         # === Metrics ===
         self.metrics = None
 
@@ -242,6 +252,23 @@ class I64Engine:
             draft_model=draft_model,
             num_speculative=num_speculative,
         )
+
+    def enable_pipeline(self):
+        """Enable pipelined prefill/decode overlap."""
+        self._pipeline_enabled = True
+        self._prefill_result_cache = {}
+
+    def enable_request_merging(self):
+        """Enable request merging for identical prompts."""
+        self._merge_enabled = True
+
+    def _hash_prompt(self, token_ids: List[int]) -> int:
+        """Fast hash for prompt dedup."""
+        import hashlib
+        h = hashlib.md5()
+        for t in token_ids:
+            h.update(t.to_bytes(8, "little", signed=True))
+        return int.from_bytes(h.digest()[:8], "little")
 
     def _allocate_slot(self, request_id: int) -> int:
         """Allocate a KV cache slot for a request."""
@@ -354,7 +381,35 @@ class I64Engine:
         if self.model is not None and hasattr(self.model, 'config'):
             eos_token_id = getattr(self.model.config, 'eos_token_id', 0)
 
+        # Request merging: if identical prompt already running, piggyback on it
+        if self._merge_enabled:
+            prompt_hash = self._hash_prompt(prompt_token_ids)
+            if prompt_hash in self._merged_requests:
+                primary_rid, secondary_list = self._merged_requests[prompt_hash]
+                # Only merge if primary is still running and sampling is greedy (deterministic)
+                sp = sampling_params or self.sampling_params
+                if sp.temperature == 0.0:
+                    # Create a request but mark it for merge — it will copy output from primary
+                    request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
+                    secondary_list.append(request_id)
+                    self._request_to_merge_group[request_id] = prompt_hash
+                    # Store params, set deadline, allocate slot as normal below
+                    if sampling_params is not None:
+                        self._request_sampling_params[request_id] = sampling_params
+                    t = timeout_s if timeout_s is not None else self.default_timeout_s
+                    if t > 0:
+                        self._request_deadlines[request_id] = time.perf_counter() + t
+                    if self.kv_cache is not None:
+                        self._allocate_slot(request_id)
+                    return request_id
+
         request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
+
+        # Register as merge primary if merging is enabled
+        if self._merge_enabled:
+            prompt_hash = self._hash_prompt(prompt_token_ids)
+            self._merged_requests[prompt_hash] = (request_id, [])
+            self._request_to_merge_group[request_id] = prompt_hash
 
         # Store per-request sampling params
         if sampling_params is not None:
@@ -496,16 +551,33 @@ class I64Engine:
         #    Must happen before schedule() so that newly finished requests remain
         #    visible to callers (generate(), _engine_loop) after this step returns.
         for req in self.scheduler.finished:
-            self._free_slot(req.request_id)
-            self._request_sampling_params.pop(req.request_id, None)
-            self._request_processors.pop(req.request_id, None)
-            self._request_deadlines.pop(req.request_id, None)
-            self._request_logprobs.pop(req.request_id, None)
-            self.scheduler._tokens_generated_per_req.pop(req.request_id, None)
+            rid = req.request_id
+            self._free_slot(rid)
+            self._request_sampling_params.pop(rid, None)
+            self._request_processors.pop(rid, None)
+            self._request_deadlines.pop(rid, None)
+            self._request_logprobs.pop(rid, None)
+            self.scheduler._tokens_generated_per_req.pop(rid, None)
+            # Clean up merge group
+            if self._merge_enabled:
+                phash = self._request_to_merge_group.pop(rid, None)
+                if phash is not None and phash in self._merged_requests:
+                    primary_rid, secondaries = self._merged_requests[phash]
+                    if rid == primary_rid:
+                        # Primary finished — clean up entire merge group
+                        del self._merged_requests[phash]
+                        for sec_rid in secondaries:
+                            self._request_to_merge_group.pop(sec_rid, None)
+                    elif rid in secondaries:
+                        secondaries.remove(rid)
         self.scheduler.finished.clear()
 
         # 1. Handle timeouts and cancellations
         self._check_timeouts_and_cancellations()
+
+        # 1.1 Auto-enable FP8 KV cache under memory pressure
+        if self.kv_cache is not None:
+            self.kv_cache.maybe_enable_fp8()
 
         # 2. Schedule (i64) — moves is_finished requests to scheduler.finished
         batch = self.scheduler.schedule()
@@ -526,10 +598,10 @@ class I64Engine:
             req.request_id: req for req in self.scheduler.running
         }
 
-        # 1.5. Speculative decoding for small decode-only batches
+        # 1.5. Speculative decoding for decode-only batches (threshold batch<=8)
         if (self.speculative_decoder is not None
                 and batch.is_prefill.sum() == 0
-                and batch.num_requests <= 4):
+                and batch.num_requests <= 8):
             result = self._speculative_step(batch, _running_index)
             self.scheduler.update_after_step(result)
             # NOTE: finished request cleanup (slot freeing) happens at top of next step()
@@ -667,6 +739,17 @@ class I64Engine:
             # 5. Map back to requests (integer indexing)
             new_tokens_list = new_token_ids.tolist()
             result = dict(zip(request_id_list, new_tokens_list))
+
+        # 5.5 Propagate merged request outputs
+        if self._merge_enabled:
+            for rid, token_id in list(result.items()):
+                phash = self._request_to_merge_group.get(rid)
+                if phash is not None and phash in self._merged_requests:
+                    primary_rid, secondaries = self._merged_requests[phash]
+                    if rid == primary_rid:
+                        # Copy token to all secondary requests
+                        for sec_rid in secondaries:
+                            result[sec_rid] = token_id
 
         # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)

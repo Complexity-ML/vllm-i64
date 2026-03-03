@@ -14,6 +14,7 @@ INL - 2025
 """
 
 import torch
+import heapq
 import hashlib
 from typing import Optional, Tuple, List, Dict, Set
 
@@ -92,13 +93,15 @@ class PagedKVCache:
         # Sequence lengths (integer)
         self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device=device)
 
-        # ── LRU eviction tracking (all integer) ──
+        # ── LRU eviction tracking (all integer, heap-based O(log n)) ──
         self.enable_lru_eviction = enable_lru_eviction
         self._access_counter: int = 0          # monotonic i64 clock
         self._last_access: Dict[int, int] = {} # seq_id → last access tick
         self._eviction_count: int = 0          # total evictions performed
         self._evicted_seq_ids: List[int] = []  # recently evicted (for scheduler)
         self._active_seq_ids: set = set()      # O(1) tracking of allocated seqs
+        # Min-heap of (tick, seq_id) for O(log n) eviction candidate selection
+        self._lru_heap: List[Tuple[int, int]] = []
 
         # ── Swap-to-CPU ──
         self._swap_enabled = False
@@ -124,13 +127,15 @@ class PagedKVCache:
         return self.num_blocks - len(self.free_blocks)
 
     def _touch(self, seq_id: int):
-        """Update LRU access tick for a sequence. Pure integer."""
+        """Update LRU access tick for a sequence. Pure integer + heap push O(log n)."""
         self._access_counter += 1
         self._last_access[seq_id] = self._access_counter
+        heapq.heappush(self._lru_heap, (self._access_counter, seq_id))
 
     def _evict_lru(self, num_blocks_needed: int, protect_seq_id: int = -1) -> int:
         """
         Evict least recently used sequences until we have enough free blocks.
+        Uses a min-heap for O(log n) candidate selection instead of O(n log n) sort.
 
         Args:
             num_blocks_needed: how many blocks we need to free
@@ -142,20 +147,19 @@ class PagedKVCache:
         freed = 0
         self._evicted_seq_ids.clear()
 
-        # Find active sequences, sorted by LRU (oldest access first)
-        # Uses _active_seq_ids set instead of scanning all max_seqs slots
-        active_seqs = []
-        for sid in self._active_seq_ids:
-            if sid != protect_seq_id:
-                tick = self._last_access.get(sid, 0)
-                active_seqs.append((tick, sid))
+        # Pop from min-heap to find LRU candidates in O(log n) per eviction
+        while freed < num_blocks_needed and self._lru_heap:
+            tick, victim_sid = heapq.heappop(self._lru_heap)
 
-        # Sort by access tick ascending — least recently used first
-        active_seqs.sort()
-
-        for _tick, victim_sid in active_seqs:
-            if freed >= num_blocks_needed:
-                break
+            # Skip stale entries: seq no longer active, or tick is outdated
+            if victim_sid not in self._active_seq_ids:
+                continue
+            if self._last_access.get(victim_sid, 0) != tick:
+                continue  # Stale — this seq was touched again after this entry
+            if victim_sid == protect_seq_id:
+                # Re-push protected seq so it's not lost from the heap
+                heapq.heappush(self._lru_heap, (tick, victim_sid))
+                continue
 
             # Count blocks held by this sequence (vectorized)
             victim_blocks = int((self.block_table[victim_sid] >= 0).sum().item())
@@ -510,6 +514,7 @@ class PagedKVCache:
     def swap_out(self, seq_id: int) -> bool:
         """
         Copy KV blocks from GPU to CPU pinned memory, free GPU blocks.
+        Uses a dedicated CUDA stream for async D2H copies (pipelined).
 
         Returns True on success, False if CPU swap space is full.
         """
@@ -534,19 +539,30 @@ class PagedKVCache:
         seq_len = self.seq_lens[seq_id].item()
         cpu_block_ids = []
 
-        for i in range(num_blocks):
-            gpu_block = block_list[i]
-            cpu_block = self._cpu_free_blocks.pop()
-            cpu_block_ids.append(cpu_block)
+        # Use a dedicated CUDA stream for async D2H copy (pipelined)
+        swap_stream = None
+        if self.device != "cpu" and torch.cuda.is_available():
+            swap_stream = torch.cuda.Stream()
 
-            for layer in range(self.num_layers):
-                self._cpu_k_caches[layer][cpu_block].copy_(self.k_caches[layer][gpu_block])
-                self._cpu_v_caches[layer][cpu_block].copy_(self.v_caches[layer][gpu_block])
+        ctx = torch.cuda.stream(swap_stream) if swap_stream else _nullcontext()
+        with ctx:
+            for i in range(num_blocks):
+                gpu_block = block_list[i]
+                cpu_block = self._cpu_free_blocks.pop()
+                cpu_block_ids.append(cpu_block)
 
-            self._cpu_block_table[seq_id, i] = cpu_block
-            self._dirty_blocks.add(gpu_block)
-            self.free_blocks.append(gpu_block)
-            self.block_table[seq_id, i] = -1
+                for layer in range(self.num_layers):
+                    self._cpu_k_caches[layer][cpu_block].copy_(self.k_caches[layer][gpu_block], non_blocking=True)
+                    self._cpu_v_caches[layer][cpu_block].copy_(self.v_caches[layer][gpu_block], non_blocking=True)
+
+                self._cpu_block_table[seq_id, i] = cpu_block
+                self._dirty_blocks.add(gpu_block)
+                self.free_blocks.append(gpu_block)
+                self.block_table[seq_id, i] = -1
+
+        # Sync the swap stream to ensure copies complete before freeing
+        if swap_stream is not None:
+            swap_stream.synchronize()
 
         self._swapped_seqs[seq_id] = {
             "cpu_blocks": cpu_block_ids,
@@ -559,6 +575,7 @@ class PagedKVCache:
     def swap_in(self, seq_id: int) -> bool:
         """
         Copy KV blocks from CPU back to GPU.
+        Uses a dedicated CUDA stream for async H2D copies (pipelined).
 
         Returns True on success, False if GPU doesn't have enough free blocks.
         """
@@ -572,20 +589,53 @@ class PagedKVCache:
         if len(self.free_blocks) < num_blocks:
             return False
 
-        for i, cpu_block in enumerate(cpu_block_ids):
-            gpu_block = self.free_blocks.pop()
+        swap_stream = None
+        if self.device != "cpu" and torch.cuda.is_available():
+            swap_stream = torch.cuda.Stream()
 
-            for layer in range(self.num_layers):
-                self.k_caches[layer][gpu_block].copy_(self._cpu_k_caches[layer][cpu_block])
-                self.v_caches[layer][gpu_block].copy_(self._cpu_v_caches[layer][cpu_block])
+        ctx = torch.cuda.stream(swap_stream) if swap_stream else _nullcontext()
+        with ctx:
+            for i, cpu_block in enumerate(cpu_block_ids):
+                gpu_block = self.free_blocks.pop()
 
-            self.block_table[seq_id, i] = gpu_block
-            self._cpu_block_table[seq_id, i] = -1
-            self._cpu_free_blocks.append(cpu_block)
+                for layer in range(self.num_layers):
+                    self.k_caches[layer][gpu_block].copy_(self._cpu_k_caches[layer][cpu_block], non_blocking=True)
+                    self.v_caches[layer][gpu_block].copy_(self._cpu_v_caches[layer][cpu_block], non_blocking=True)
+
+                self.block_table[seq_id, i] = gpu_block
+                self._cpu_block_table[seq_id, i] = -1
+                self._cpu_free_blocks.append(cpu_block)
+
+        if swap_stream is not None:
+            swap_stream.synchronize()
 
         self.seq_lens[seq_id] = meta["seq_len"]
         del self._swapped_seqs[seq_id]
         self._touch(seq_id)
+        return True
+
+    def maybe_enable_fp8(self, utilization_threshold: float = 0.70) -> bool:
+        """
+        Auto-enable FP8 KV cache when memory utilization exceeds threshold.
+        Converts existing caches in-place for 2x memory savings.
+
+        Returns True if FP8 was activated (or already active).
+        """
+        if self.device == "cpu":
+            return False
+        if self.kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return True  # Already FP8
+
+        utilization = self.num_used_blocks / max(self.num_blocks, 1)
+        if utilization < utilization_threshold:
+            return False
+
+        # Convert caches to FP8 in-place
+        target_dtype = torch.float8_e4m3fn
+        for layer_idx in range(self.num_layers):
+            self.k_caches[layer_idx] = self.k_caches[layer_idx].to(target_dtype)
+            self.v_caches[layer_idx] = self.v_caches[layer_idx].to(target_dtype)
+        self.kv_dtype = target_dtype
         return True
 
     def get_stats(self) -> dict:
@@ -608,3 +658,11 @@ class PagedKVCache:
             stats["cpu_free_blocks"] = len(self._cpu_free_blocks)
             stats["swap_count_total"] = self._swap_count
         return stats
+
+
+class _nullcontext:
+    """Minimal context manager for when no CUDA stream is needed."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass

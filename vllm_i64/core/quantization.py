@@ -13,7 +13,7 @@ INL - 2025
 """
 
 import torch
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 
@@ -89,11 +89,11 @@ def dequantize_int4(
     zero: torch.Tensor,
     group_size: int = 128,
 ) -> torch.Tensor:
-    """INT4 packed → float."""
+    """INT4 packed → float. Vectorized unpack + dequant."""
     out_features = packed.shape[0]
     in_features = packed.shape[1] * 2
 
-    # Unpack
+    # Vectorized unpack: extract high/low nibbles
     high = (packed >> 4) & 0xF
     low = packed & 0xF
     unpacked = torch.stack([high, low], dim=-1).reshape(out_features, in_features)
@@ -102,6 +102,67 @@ def dequantize_int4(
     num_groups = in_features // group_size
     unpacked_grouped = unpacked.reshape(out_features, num_groups, group_size).float()
     return (unpacked_grouped - zero.unsqueeze(-1)) * scale.unsqueeze(-1)
+
+
+def int4_linear(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    zero: torch.Tensor,
+    group_size: int = 128,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Fused INT4 dequant + GEMM: y = x @ dequant(packed).T + bias
+
+    Instead of materializing the full dequantized weight, this processes
+    by groups to reduce peak memory. For each group, unpack + dequant + partial GEMM.
+
+    Args:
+        x: (batch, in_features) or (in_features,)
+        packed: (out_features, in_features // 2) uint8
+        scale: (out_features, num_groups) float
+        zero: (out_features, num_groups) float
+        group_size: quantization group size
+        bias: optional (out_features,) float
+
+    Returns:
+        y: (batch, out_features) float
+    """
+    out_features = packed.shape[0]
+    in_features = packed.shape[1] * 2
+    num_groups = in_features // group_size
+
+    squeeze = x.dim() == 1
+    if squeeze:
+        x = x.unsqueeze(0)
+
+    batch = x.shape[0]
+    y = torch.zeros(batch, out_features, dtype=x.dtype, device=x.device)
+
+    # Process by groups: unpack + dequant + accumulate partial GEMM
+    for g in range(num_groups):
+        col_start = g * group_size
+        col_end = col_start + group_size
+        pack_start = col_start // 2
+        pack_end = col_end // 2
+
+        # Unpack this group
+        group_packed = packed[:, pack_start:pack_end]
+        high = ((group_packed >> 4) & 0xF).float()
+        low = (group_packed & 0xF).float()
+        group_unpacked = torch.stack([high, low], dim=-1).reshape(out_features, group_size)
+
+        # Dequant: (unpacked - zero) * scale
+        group_weight = (group_unpacked - zero[:, g:g+1]) * scale[:, g:g+1]
+
+        # Partial GEMM: y += x[:, group_cols] @ group_weight.T
+        y += x[:, col_start:col_end] @ group_weight.T
+
+    if bias is not None:
+        y += bias
+
+    return y.squeeze(0) if squeeze else y
 
 
 def quantize_experts(
