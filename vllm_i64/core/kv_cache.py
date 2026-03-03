@@ -71,9 +71,8 @@ class PagedKVCache:
             self.kv_dtype = dtype
         self.dtype = dtype  # backward compat (read_kv returns this dtype)
 
-        # Derive from a reasonable max sequence length (2048 default, configurable)
-        max_blocks_per_seq = max(128, (num_blocks * block_size) // block_size)
-        self.max_blocks_per_seq = max_blocks_per_seq
+        # Max blocks any single sequence can hold (capped at total num_blocks)
+        self.max_blocks_per_seq = min(num_blocks, max(128, num_blocks))
 
         # KV tensors (stored in kv_dtype — may be FP8 for memory savings)
         # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
@@ -91,7 +90,7 @@ class PagedKVCache:
         # Kept on CPU — it's integer metadata, no GPU compute needed.
         # Avoids GPU→CPU sync on every block lookup.
         self.block_table = torch.full(
-            (max_seqs, max_blocks_per_seq), -1, dtype=torch.int32, device="cpu"
+            (max_seqs, self.max_blocks_per_seq), -1, dtype=torch.int32, device="cpu"
         )
 
         # Free block list (integer)
@@ -281,6 +280,9 @@ class PagedKVCache:
             # Need to allocate
             [physical_block] = self.allocate_blocks(seq_id, 1)
 
+        # Copy-on-write: if this block is shared via prefix caching, copy first
+        physical_block = self._cow_if_shared(seq_id, block_idx, physical_block)
+
         k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
         v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
         self.k_caches[layer_idx][physical_block, offset, :, :] = k_kv
@@ -373,6 +375,11 @@ class PagedKVCache:
             self.allocate_blocks(seq_id, missing)
 
         # Fetch all physical block IDs in one tensor op (1 GPU→CPU transfer)
+        # Copy-on-write: ensure shared prefix blocks get private copies
+        for bidx in unique_blocks:
+            pb = self.block_table[seq_id, bidx].item()
+            if pb >= 0:
+                self._cow_if_shared(seq_id, bidx, pb)
         block_map_tensor = self.block_table[seq_id, unique_blocks]
         block_map = {bidx: int(block_map_tensor[i]) for i, bidx in enumerate(unique_blocks)}
 
@@ -508,6 +515,29 @@ class PagedKVCache:
                 self._block_to_prefix[physical_block] = prefix_hash
                 self._prefix_refcount[prefix_hash] = 1
                 self._prefix_hash_to_tokens[prefix_hash] = tuple(block_tokens)
+
+    def _cow_if_shared(self, seq_id: int, block_idx: int, physical_block: int) -> int:
+        """Copy-on-write: if block is shared via prefix caching, allocate a private copy."""
+        if not self.prefix_cache_enabled:
+            return physical_block
+        prefix_hash = getattr(self, "_block_to_prefix", {}).get(physical_block)
+        if prefix_hash is None:
+            return physical_block
+        rc = self._prefix_refcount.get(prefix_hash, 1)
+        if rc <= 1:
+            return physical_block  # Sole owner, no copy needed
+        # Allocate a new block and copy KV data
+        if not self.free_blocks:
+            return physical_block  # Can't copy, no free blocks
+        new_block = self.free_blocks.pop()
+        if new_block in self._dirty_blocks:
+            self._dirty_blocks.discard(new_block)
+        for layer_idx in range(self.num_layers):
+            self.k_caches[layer_idx][new_block].copy_(self.k_caches[layer_idx][physical_block])
+            self.v_caches[layer_idx][new_block].copy_(self.v_caches[layer_idx][physical_block])
+        self.block_table[seq_id, block_idx] = new_block
+        self._prefix_refcount[prefix_hash] = rc - 1
+        return new_block
 
     def _zero_block(self, block_id: int):
         """Zero out K/V data in a physical block to prevent stale data leaking."""

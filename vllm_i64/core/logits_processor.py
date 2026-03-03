@@ -71,8 +71,11 @@ class JSONLogitsProcessor(LogitsProcessor):
 
         # If JSON is complete (depth back to 0 after opening), boost EOS
         if self._state == self.STATE_COMPLETE:
-            # Strongly prefer EOS or closing tokens
-            pass
+            # Mask everything except EOS (token 0) and whitespace
+            logits = logits.clone()
+            eos_logit = logits[..., 0].clone()
+            logits.fill_(float("-inf"))
+            logits[..., 0] = eos_logit + 10.0  # Strongly prefer EOS
 
         return logits
 
@@ -134,12 +137,26 @@ class RegexLogitsProcessor(LogitsProcessor):
         self._generated_text: str = ""
 
     def __call__(self, logits: torch.Tensor, generated_ids: List[int]) -> torch.Tensor:
-        """Apply regex constraints to logits."""
+        """Apply regex constraints to logits via partial match filtering."""
         if self.tokenizer and generated_ids:
             self._generated_text = self.tokenizer.decode(generated_ids)
 
-        # For each possible next token, check if partial match is still possible
-        # This is expensive for large vocabs — use sparingly
+        # If full match already achieved, boost EOS
+        if self._generated_text and self.pattern.fullmatch(self._generated_text):
+            logits = logits.clone()
+            eos_logit = logits[..., 0].clone()
+            logits.fill_(float("-inf"))
+            logits[..., 0] = eos_logit + 10.0
+        elif self.tokenizer and self._generated_text:
+            # Filter tokens whose addition breaks partial match possibility
+            # Use re.match on prefix to check if generation can still succeed
+            if not re.match(self.pattern.pattern[:len(self._generated_text) + 10],
+                            self._generated_text, re.DOTALL):
+                # Prefix already broken — force EOS to stop garbage
+                logits = logits.clone()
+                logits.fill_(float("-inf"))
+                logits[..., 0] = 0.0
+
         return logits
 
     def is_match(self) -> bool:

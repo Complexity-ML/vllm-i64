@@ -230,7 +230,8 @@ class I64Engine:
                 max_batch_size=max_batch_size,
                 device=self.device,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("CUDA graph init failed: %s — falling back to eager mode", e)
             self.cuda_graph_runner = None
 
     def warmup_and_capture_graphs(self):

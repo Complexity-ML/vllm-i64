@@ -171,6 +171,10 @@ class I64Scheduler:
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
         self.num_experts = num_experts
+        if num_experts > 0 and (num_experts & (num_experts - 1)) != 0:
+            raise ValueError(
+                f"num_experts must be a power of 2 for bitmask routing, got {num_experts}"
+            )
         self.expert_mask = np.int64(num_experts - 1)  # For bit masking
         self.kv_block_size = kv_block_size
         self.max_prefill_tokens = max_prefill_tokens
