@@ -71,8 +71,9 @@ class PagedKVCache:
             self.kv_dtype = dtype
         self.dtype = dtype  # backward compat (read_kv returns this dtype)
 
-        # Max blocks any single sequence can hold (capped at total num_blocks)
-        self.max_blocks_per_seq = min(num_blocks, max(128, num_blocks))
+        # Max blocks any single sequence can hold — any seq can use all blocks;
+        # LRU eviction handles fair sharing across sequences.
+        self.max_blocks_per_seq = num_blocks
 
         # KV tensors (stored in kv_dtype — may be FP8 for memory savings)
         # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
@@ -548,27 +549,27 @@ class PagedKVCache:
     def free_sequence(self, seq_id: int):
         """Free all blocks for a sequence. Respects prefix cache refcounts."""
         blocks = self.block_table[seq_id]
-        # Fetch all block IDs in one GPU→CPU transfer
-        block_ids = blocks.tolist()
-        for i, block_id in enumerate(block_ids):
-            if block_id >= 0:
-                # Check if this block is a shared prefix block
-                prefix_hash = getattr(self, "_block_to_prefix", {}).get(block_id)
-                if prefix_hash is not None:
-                    rc = self._prefix_refcount.get(prefix_hash, 1) - 1
-                    if rc <= 0:
-                        # Last user — free the block (lazy zero on next alloc)
-                        self._prefix_hash_to_blocks.pop(prefix_hash, None)
-                        self._block_to_prefix.pop(block_id, None)
-                        self._prefix_refcount.pop(prefix_hash, None)
-                        self._dirty_blocks.add(block_id)
-                        self.free_blocks.append(block_id)
-                    else:
-                        self._prefix_refcount[prefix_hash] = rc
-                else:
+        for i in range(blocks.shape[0]):
+            block_id = blocks[i].item()
+            if block_id < 0:
+                break  # Blocks are contiguous; first -1 means no more
+            # Check if this block is a shared prefix block
+            prefix_hash = getattr(self, "_block_to_prefix", {}).get(block_id)
+            if prefix_hash is not None:
+                rc = self._prefix_refcount.get(prefix_hash, 1) - 1
+                if rc <= 0:
+                    # Last user — free the block (lazy zero on next alloc)
+                    self._prefix_hash_to_blocks.pop(prefix_hash, None)
+                    self._block_to_prefix.pop(block_id, None)
+                    self._prefix_refcount.pop(prefix_hash, None)
                     self._dirty_blocks.add(block_id)
                     self.free_blocks.append(block_id)
-                blocks[i] = -1
+                else:
+                    self._prefix_refcount[prefix_hash] = rc
+            else:
+                self._dirty_blocks.add(block_id)
+                self.free_blocks.append(block_id)
+            blocks[i] = -1
 
         self.seq_lens[seq_id] = 0
         self._last_access.pop(seq_id, None)

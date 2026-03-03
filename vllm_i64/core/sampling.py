@@ -330,9 +330,15 @@ def fused_top_p_sample(
 
     # Zero masked probs and renormalize (avoids redundant second softmax)
     probs[mask] = 0.0
-    probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    probs_sum = probs.sum(dim=-1, keepdim=True)
+    # If top-p killed all probability mass, fall back to argmax (top-1)
+    degenerate = (probs_sum < 1e-8).squeeze(-1)
+    probs_sum = probs_sum.clamp(min=1e-8)
     probs = probs / probs_sum
     sorted_token_ids = torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+    # Replace degenerate rows with argmax (index 0 = highest prob after sort)
+    if degenerate.any():
+        sorted_token_ids[degenerate] = 0
 
     # Map back to original indices
     return sorted_indices.gather(-1, sorted_token_ids.unsqueeze(-1)).squeeze(-1)
@@ -514,7 +520,9 @@ def sample_batch_with_logprobs(
         mask = (cumulative - probs) > params.top_p
         # Zero masked probs and renormalize (avoids redundant second softmax)
         probs[mask] = 0.0
-        probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+        degenerate = (probs_sum < 1e-8).squeeze(-1)
+        probs_sum = probs_sum.clamp(min=1e-8)
         probs = probs / probs_sum
 
         # Seed for reproducibility (per-request Generator)
@@ -523,6 +531,8 @@ def sample_batch_with_logprobs(
 
         # Sample in sorted space, map back to original indices
         sorted_token_ids = torch.multinomial(probs, num_samples=1, generator=gen).squeeze(-1)
+        if degenerate.any():
+            sorted_token_ids[degenerate] = 0
         token_ids = sorted_indices.gather(-1, sorted_token_ids.unsqueeze(-1)).squeeze(-1)
     else:
         # Seed for reproducibility (per-request Generator)

@@ -967,9 +967,9 @@ class I64Engine:
             steps += 1
 
             # Check merged secondary finished results first
-            for mr in self._merged_finished_results:
+            for i, mr in enumerate(self._merged_finished_results):
                 if mr.request_id == request_id:
-                    self._merged_finished_results.remove(mr)
+                    self._merged_finished_results.pop(i)
                     mr.elapsed_ms = (time.perf_counter() - start) * 1000
                     mr.num_steps = steps
                     return mr
