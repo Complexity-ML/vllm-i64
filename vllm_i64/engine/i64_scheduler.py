@@ -218,8 +218,12 @@ class I64Scheduler:
         return allocated
 
     def _free_kv_blocks(self, block_ids: List[int]):
-        """Free KV cache blocks. Pure integer."""
-        self.free_blocks.extend(block_ids)
+        """Free KV cache blocks. Pure integer. Prevents duplicates."""
+        free_set = set(self.free_blocks)
+        for bid in block_ids:
+            if bid not in free_set:
+                self.free_blocks.append(bid)
+                free_set.add(bid)
 
     def _compute_expert_ids(self, token_ids: np.ndarray) -> np.ndarray:
         """

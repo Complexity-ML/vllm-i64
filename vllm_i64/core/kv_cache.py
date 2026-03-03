@@ -388,6 +388,12 @@ class PagedKVCache:
                 self._block_to_prefix[physical_block] = prefix_hash
                 self._prefix_refcount[prefix_hash] = 1
 
+    def _zero_block(self, block_id: int):
+        """Zero out K/V data in a physical block to prevent stale data leaking."""
+        for layer_idx in range(self.num_layers):
+            self.k_caches[layer_idx][block_id].zero_()
+            self.v_caches[layer_idx][block_id].zero_()
+
     def free_sequence(self, seq_id: int):
         """Free all blocks for a sequence. Respects prefix cache refcounts."""
         blocks = self.block_table[seq_id]
@@ -399,14 +405,16 @@ class PagedKVCache:
                 if prefix_hash is not None:
                     rc = self._prefix_refcount.get(prefix_hash, 1) - 1
                     if rc <= 0:
-                        # Last user — free the block
+                        # Last user — free the block and zero it
                         self._prefix_hash_to_blocks.pop(prefix_hash, None)
                         self._block_to_prefix.pop(block_id, None)
                         self._prefix_refcount.pop(prefix_hash, None)
+                        self._zero_block(block_id)
                         self.free_blocks.append(block_id)
                     else:
                         self._prefix_refcount[prefix_hash] = rc
                 else:
+                    self._zero_block(block_id)
                     self.free_blocks.append(block_id)
                 blocks[i] = -1
 

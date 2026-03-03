@@ -258,7 +258,8 @@ class I64Engine:
             slot = self._request_to_slot.pop(request_id)
             if self.kv_cache is not None:
                 self.kv_cache.free_sequence(slot)
-            self._slot_pool.append(slot)
+            if slot not in self._slot_pool:
+                self._slot_pool.append(slot)
 
     def enable_lora(self, target_names: Optional[List[str]] = None):
         """Enable LoRA adapter support by wrapping model layers."""
@@ -500,6 +501,8 @@ class I64Engine:
             self._request_deadlines.pop(req.request_id, None)
             self._request_logprobs.pop(req.request_id, None)
             self.scheduler._tokens_generated_per_req.pop(req.request_id, None)
+        # Clear finished list to prevent double-free on next step
+        self.scheduler.finished.clear()
 
         if batch is None:
             return {}
