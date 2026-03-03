@@ -55,6 +55,13 @@ class LoRALinear(nn.Module):
         if len(self._adapters) >= self.max_adapters:
             raise RuntimeError(f"Max adapters ({self.max_adapters}) reached")
 
+        # Validate rank dimensions match
+        if lora_A.shape[1] != lora_B.shape[0]:
+            raise ValueError(
+                f"LoRA rank mismatch: lora_A has rank {lora_A.shape[1]} "
+                f"but lora_B expects {lora_B.shape[0]}"
+            )
+
         # Move to same device as base weights
         device = self.base.weight.device
         dtype = self.base.weight.dtype

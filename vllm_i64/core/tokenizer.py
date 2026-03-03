@@ -45,20 +45,31 @@ class I64Tokenizer:
     def vocab_size(self) -> int:
         return self.tokenizer.get_vocab_size()
 
+    def _find_token(self, candidates: list, fallback: int) -> int:
+        """Try multiple token names, return first match or fallback."""
+        for name in candidates:
+            tid = self.tokenizer.token_to_id(name)
+            if tid is not None:
+                return tid
+        return fallback
+
     @property
     def eos_token_id(self) -> int:
-        token = self.tokenizer.token_to_id("</s>")
-        return token if token is not None else 0
+        return self._find_token(
+            ["</s>", "<|endoftext|>", "<|end|>", "<eos>", "<|eot_id|>"], 0
+        )
 
     @property
     def bos_token_id(self) -> int:
-        token = self.tokenizer.token_to_id("<s>")
-        return token if token is not None else 2
+        return self._find_token(
+            ["<s>", "<|startoftext|>", "<|begin|>", "<bos>", "<|begin_of_text|>"], 0
+        )
 
     @property
     def pad_token_id(self) -> int:
-        token = self.tokenizer.token_to_id("<pad>")
-        return token if token is not None else 1
+        return self._find_token(
+            ["<pad>", "<|pad|>", "<|padding|>"], self.eos_token_id
+        )
 
 
 def load_tokenizer(model_name: str) -> Optional[I64Tokenizer]:
