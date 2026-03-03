@@ -91,10 +91,10 @@ def sample_token(
 
     # Repetition penalty
     if params.repetition_penalty != 1.0 and past_tokens:
-        token_set = torch.tensor(past_tokens, dtype=torch.long, device=logits.device)
-        token_set = token_set.unique()
+        # Dedup on CPU with set() — avoids tensor.unique() overhead
+        unique_ids = list(set(past_tokens))
+        token_set = torch.tensor(unique_ids, dtype=torch.long, device=logits.device)
         penalty_logits = logits[token_set]
-        # Penalize: reduce positive, amplify negative
         penalty_logits = torch.where(
             penalty_logits > 0,
             penalty_logits / params.repetition_penalty,
@@ -264,10 +264,11 @@ def apply_repetition_penalty_batch(
         past = past_tokens_list[i]
         if not past:
             continue
-        past_tensor = torch.tensor(past, dtype=torch.long, device=device).unique()
-        past_tensor = past_tensor[past_tensor < vocab_size]
-        if past_tensor.numel() == 0:
+        # Dedup on CPU with set() — avoids torch.tensor().unique() overhead
+        unique_ids = [t for t in set(past) if 0 <= t < vocab_size]
+        if not unique_ids:
             continue
+        past_tensor = torch.tensor(unique_ids, dtype=torch.long, device=device)
         scores = logits[i, past_tensor]
         logits[i, past_tensor] = torch.where(
             scores > 0,

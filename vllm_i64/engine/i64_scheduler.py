@@ -369,17 +369,20 @@ class I64Scheduler:
         if not self.running:
             return None
 
-        # Build batch — all integer arrays
-        request_ids = []
-        all_token_ids = []
-        all_positions = []
-        seq_lens = []
-        is_prefill = []
-        toks_per_req = []
+        # Build batch — pre-allocated integer arrays (avoid list append + concatenate)
+        num_running = len(self.running)
+        request_ids = np.empty(num_running, dtype=np.int64)
+        seq_lens = np.empty(num_running, dtype=np.int32)
+        is_prefill_arr = np.empty(num_running, dtype=np.int32)
+        toks_per_req = np.empty(num_running, dtype=np.int32)
         max_blocks_per_seq = 0
 
-        for req in self.running:
-            request_ids.append(req.request_id)
+        # First pass: compute token counts and metadata
+        total_tokens_estimate = 0
+        token_chunks = []  # Collect numpy views (no copy until final concat)
+
+        for i, req in enumerate(self.running):
+            request_ids[i] = req.request_id
 
             if not req.prefill_complete:
                 # === Chunked Prefill ===
@@ -387,61 +390,65 @@ class I64Scheduler:
                 chunk_size = min(remaining, prefill_token_budget)
 
                 if chunk_size <= 0:
-                    # No prefill budget left — skip this request this step
-                    # Still need to include it in the batch for consistency
                     tokens = np.array([req.get_last_token_id()], dtype=np.int64)
                     positions = np.array([req.prefill_progress - 1], dtype=np.int32)
-                    is_prefill.append(0)
+                    is_prefill_arr[i] = 0
                 else:
                     start = req.prefill_progress
                     end = start + chunk_size
-                    tokens = req.prompt_token_ids[start:end]
+                    tokens = req.prompt_token_ids[start:end]  # numpy view, no copy
                     positions = np.arange(start, end, dtype=np.int32)
-                    is_prefill.append(1)
+                    is_prefill_arr[i] = 1
                     prefill_token_budget -= chunk_size
             elif req.seq_pos == 0:
-                # Full prefill (short enough, no chunking needed)
-                tokens = req.prompt_token_ids
+                tokens = req.prompt_token_ids  # numpy view, no copy
                 positions = np.arange(len(tokens), dtype=np.int32)
-                is_prefill.append(1)
+                is_prefill_arr[i] = 1
                 prefill_token_budget -= len(tokens)
             else:
-                # Decode: process last token only
                 tokens = np.array([req.get_last_token_id()], dtype=np.int64)
                 positions = np.array([req.total_tokens - 1], dtype=np.int32)
-                is_prefill.append(0)
+                is_prefill_arr[i] = 0
 
-            all_token_ids.append(tokens)
-            all_positions.append(positions)
-            seq_lens.append(req.total_tokens)
-            toks_per_req.append(len(tokens))
+            ntoks = len(tokens)
+            token_chunks.append((tokens, positions))
+            seq_lens[i] = req.total_tokens
+            toks_per_req[i] = ntoks
+            total_tokens_estimate += ntoks
             max_blocks_per_seq = max(max_blocks_per_seq, len(req.kv_block_ids))
 
-        # Concatenate (integer arrays)
-        token_ids_flat = np.concatenate(all_token_ids).astype(np.int64)
-        positions_flat = np.concatenate(all_positions).astype(np.int32)
+        # Flatten tokens/positions into pre-allocated arrays
+        token_ids_flat = np.empty(total_tokens_estimate, dtype=np.int64)
+        positions_flat = np.empty(total_tokens_estimate, dtype=np.int32)
+        offset = 0
+        for tokens, positions in token_chunks:
+            n = len(tokens)
+            token_ids_flat[offset:offset + n] = tokens
+            positions_flat[offset:offset + n] = positions
+            offset += n
 
         # Pre-compute routing — pure i64
         expert_ids = self._compute_expert_ids(token_ids_flat)
 
         # KV block table (padded, integer)
         kv_block_table = np.zeros(
-            (len(self.running), max(max_blocks_per_seq, 1)),
+            (num_running, max(max_blocks_per_seq, 1)),
             dtype=np.int32
         )
         for i, req in enumerate(self.running):
-            for j, block_id in enumerate(req.kv_block_ids):
-                kv_block_table[i, j] = block_id
+            bids = req.kv_block_ids
+            if bids:
+                kv_block_table[i, :len(bids)] = bids
 
         return I64Batch(
-            request_ids=np.array(request_ids, dtype=np.int64),
+            request_ids=request_ids,
             token_ids=token_ids_flat,
             expert_ids=expert_ids,
-            seq_lens=np.array(seq_lens, dtype=np.int32),
+            seq_lens=seq_lens,
             positions=positions_flat,
             kv_block_table=kv_block_table,
-            is_prefill=np.array(is_prefill, dtype=np.int32),
-            tokens_per_request=np.array(toks_per_req, dtype=np.int32),
+            is_prefill=is_prefill_arr,
+            tokens_per_request=toks_per_req,
         )
 
     def update_after_step(self, new_token_ids: Dict[int, int]):

@@ -263,9 +263,16 @@ class PagedKVCache:
         # Vectorized by block — copy entire block slices instead of per-token
         num_full_blocks = seq_len // self.block_size
         remainder = seq_len % self.block_size
+        total_blocks = num_full_blocks + (1 if remainder > 0 else 0)
+
+        # Fetch all physical block IDs in one tensor op (1 GPU→CPU transfer)
+        if total_blocks > 0:
+            physical_blocks = self.block_table[seq_id, :total_blocks].tolist()
+        else:
+            physical_blocks = []
 
         for block_idx in range(num_full_blocks):
-            physical_block = self.block_table[seq_id, block_idx].item()
+            physical_block = physical_blocks[block_idx]
             if physical_block >= 0:
                 start = block_idx * self.block_size
                 end = start + self.block_size
@@ -273,7 +280,7 @@ class PagedKVCache:
                 v_out[start:end] = self.v_caches[layer_idx][physical_block, :self.block_size, :, :].to(self.compute_dtype)
 
         if remainder > 0:
-            physical_block = self.block_table[seq_id, num_full_blocks].item()
+            physical_block = physical_blocks[num_full_blocks]
             if physical_block >= 0:
                 start = num_full_blocks * self.block_size
                 k_out[start:seq_len] = self.k_caches[layer_idx][physical_block, :remainder, :, :].to(self.compute_dtype)
@@ -289,7 +296,7 @@ class PagedKVCache:
         k: torch.Tensor,           # (n, num_kv_heads, head_dim)
         v: torch.Tensor,           # (n, num_kv_heads, head_dim)
     ):
-        """Batch write K/V for one sequence. Groups writes by block for efficiency."""
+        """Batch write K/V for one sequence. Vectorized block table lookups."""
         n = positions.shape[0]
         if n == 0:
             return
@@ -305,13 +312,17 @@ class PagedKVCache:
             if physical_block < 0:
                 self.allocate_blocks(seq_id, 1)
 
-        # Group writes by block for fewer tensor operations
+        # Fetch all physical block IDs in one tensor op (1 GPU→CPU transfer)
+        unique_list = sorted(unique_blocks)
+        block_map_tensor = self.block_table[seq_id, unique_list]
+        block_map = {bidx: int(block_map_tensor[i]) for i, bidx in enumerate(unique_list)}
+
+        # Write using cached block map (no per-token .item())
         k_kv = k.to(self.kv_dtype)
         v_kv = v.to(self.kv_dtype)
         for t in range(n):
-            bidx = int(block_indices[t])
+            physical_block = block_map[int(block_indices[t])]
             off = int(offsets[t])
-            physical_block = self.block_table[seq_id, bidx].item()
             self.k_caches[layer_idx][physical_block, off, :, :] = k_kv[t]
             self.v_caches[layer_idx][physical_block, off, :, :] = v_kv[t]
 
@@ -427,8 +438,9 @@ class PagedKVCache:
     def free_sequence(self, seq_id: int):
         """Free all blocks for a sequence. Respects prefix cache refcounts."""
         blocks = self.block_table[seq_id]
-        for i in range(blocks.shape[0]):
-            block_id = blocks[i].item()
+        # Fetch all block IDs in one GPU→CPU transfer
+        block_ids = blocks.tolist()
+        for i, block_id in enumerate(block_ids):
             if block_id >= 0:
                 # Check if this block is a shared prefix block
                 prefix_hash = getattr(self, "_block_to_prefix", {}).get(block_id)
@@ -494,11 +506,12 @@ class PagedKVCache:
         if not self._swap_enabled:
             return False
 
-        # Count GPU blocks held
+        # Count GPU blocks held (one GPU→CPU transfer)
         blocks = self.block_table[seq_id]
+        block_list = blocks.tolist()
         num_blocks = 0
-        for i in range(blocks.shape[0]):
-            if blocks[i].item() >= 0:
+        for bid in block_list:
+            if bid >= 0:
                 num_blocks += 1
             else:
                 break
@@ -512,7 +525,7 @@ class PagedKVCache:
         cpu_block_ids = []
 
         for i in range(num_blocks):
-            gpu_block = blocks[i].item()
+            gpu_block = block_list[i]
             cpu_block = self._cpu_free_blocks.pop()
             cpu_block_ids.append(cpu_block)
 
