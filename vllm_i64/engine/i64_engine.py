@@ -173,9 +173,13 @@ class I64Engine:
 
         # === Request merging (dedup identical prompts) ===
         self._merge_enabled = False
-        # Maps prompt_hash → (primary_request_id, [secondary_request_ids])
-        self._merged_requests: Dict[int, Tuple[int, List[int]]] = {}
+        # prompt_hash → (primary_rid, prompt_tokens_tuple, [secondary_rids])
+        self._merge_primaries: Dict[int, Tuple[int, tuple, List[int]]] = {}
         self._request_to_merge_group: Dict[int, int] = {}  # rid → prompt_hash
+        # Secondary requests (NOT in scheduler): sec_rid → info dict
+        self._merged_secondaries: Dict[int, dict] = {}
+        # Finished secondary results, consumed by generate() / _engine_loop
+        self._merged_finished_results: List['GenerationResult'] = []
 
         # === Metrics ===
         self.metrics = None
@@ -384,31 +388,34 @@ class I64Engine:
         # Request merging: if identical prompt already running, piggyback on it
         if self._merge_enabled:
             prompt_hash = self._hash_prompt(prompt_token_ids)
-            if prompt_hash in self._merged_requests:
-                primary_rid, secondary_list = self._merged_requests[prompt_hash]
-                # Only merge if primary is still running and sampling is greedy (deterministic)
+            if prompt_hash in self._merge_primaries:
+                primary_rid, primary_prompt, sec_list = self._merge_primaries[prompt_hash]
                 sp = sampling_params or self.sampling_params
-                if sp.temperature == 0.0:
-                    # Create a request but mark it for merge — it will copy output from primary
-                    request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
-                    secondary_list.append(request_id)
-                    self._request_to_merge_group[request_id] = prompt_hash
-                    # Store params, set deadline, allocate slot as normal below
-                    if sampling_params is not None:
-                        self._request_sampling_params[request_id] = sampling_params
+                # Only merge if: exact same prompt (not just hash), greedy, primary still active
+                if (sp.temperature == 0.0
+                        and tuple(prompt_token_ids) == primary_prompt
+                        and primary_rid in self._request_to_merge_group):
+                    # Allocate unique ID without scheduling (no compute, no KV slot)
+                    sec_rid = self.scheduler.next_request_id
+                    self.scheduler.next_request_id += 1
+                    self._merged_secondaries[sec_rid] = {
+                        "prompt_tokens": list(prompt_token_ids),
+                        "output_tokens": [],
+                        "max_new_tokens": max_new_tokens,
+                    }
+                    sec_list.append(sec_rid)
+                    self._request_to_merge_group[sec_rid] = prompt_hash
                     t = timeout_s if timeout_s is not None else self.default_timeout_s
                     if t > 0:
-                        self._request_deadlines[request_id] = time.perf_counter() + t
-                    if self.kv_cache is not None:
-                        self._allocate_slot(request_id)
-                    return request_id
+                        self._request_deadlines[sec_rid] = time.perf_counter() + t
+                    return sec_rid
 
         request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
 
         # Register as merge primary if merging is enabled
         if self._merge_enabled:
             prompt_hash = self._hash_prompt(prompt_token_ids)
-            self._merged_requests[prompt_hash] = (request_id, [])
+            self._merge_primaries[prompt_hash] = (request_id, tuple(prompt_token_ids), [])
             self._request_to_merge_group[request_id] = prompt_hash
 
         # Store per-request sampling params
@@ -561,19 +568,60 @@ class I64Engine:
             # Clean up merge group
             if self._merge_enabled:
                 phash = self._request_to_merge_group.pop(rid, None)
-                if phash is not None and phash in self._merged_requests:
-                    primary_rid, secondaries = self._merged_requests[phash]
+                if phash is not None and phash in self._merge_primaries:
+                    primary_rid, _, sec_rids = self._merge_primaries[phash]
                     if rid == primary_rid:
-                        # Primary finished — clean up entire merge group
-                        del self._merged_requests[phash]
-                        for sec_rid in secondaries:
+                        # Primary finished — finish all remaining secondaries
+                        eos_id = 0
+                        if self.model is not None and hasattr(self.model, 'config'):
+                            eos_id = getattr(self.model.config, 'eos_token_id', 0)
+                        for sec_rid in sec_rids:
+                            sec = self._merged_secondaries.pop(sec_rid, None)
+                            if sec is not None:
+                                fr = "length"
+                                if sec["output_tokens"] and sec["output_tokens"][-1] == eos_id:
+                                    fr = "stop"
+                                self._merged_finished_results.append(GenerationResult(
+                                    request_id=sec_rid,
+                                    prompt_tokens=sec["prompt_tokens"],
+                                    output_tokens=sec["output_tokens"],
+                                    num_steps=len(sec["output_tokens"]),
+                                    elapsed_ms=0,
+                                    finish_reason=fr,
+                                ))
                             self._request_to_merge_group.pop(sec_rid, None)
-                    elif rid in secondaries:
-                        secondaries.remove(rid)
+                            self._request_deadlines.pop(sec_rid, None)
+                        del self._merge_primaries[phash]
         self.scheduler.finished.clear()
 
         # 1. Handle timeouts and cancellations
         self._check_timeouts_and_cancellations()
+
+        # 1.0.1 Check secondary merge requests for timeouts/cancellations
+        if self._merge_enabled and self._merged_secondaries:
+            now = time.perf_counter()
+            for sec_rid in list(self._merged_secondaries.keys()):
+                is_cancelled = sec_rid in self._cancelled_requests
+                deadline = self._request_deadlines.get(sec_rid)
+                is_timed_out = deadline is not None and now > deadline
+                if is_cancelled or is_timed_out:
+                    sec = self._merged_secondaries.pop(sec_rid)
+                    fr = "cancelled" if is_cancelled else "timeout"
+                    self._merged_finished_results.append(GenerationResult(
+                        request_id=sec_rid,
+                        prompt_tokens=sec["prompt_tokens"],
+                        output_tokens=sec["output_tokens"],
+                        num_steps=len(sec["output_tokens"]),
+                        elapsed_ms=0,
+                        finish_reason=fr,
+                    ))
+                    phash = self._request_to_merge_group.pop(sec_rid, None)
+                    if phash and phash in self._merge_primaries:
+                        _, _, sec_rids = self._merge_primaries[phash]
+                        if sec_rid in sec_rids:
+                            sec_rids.remove(sec_rid)
+                    self._cancelled_requests.discard(sec_rid)
+                    self._request_deadlines.pop(sec_rid, None)
 
         # 1.1 Auto-enable FP8 KV cache under memory pressure
         if self.kv_cache is not None:
@@ -740,16 +788,43 @@ class I64Engine:
             new_tokens_list = new_token_ids.tolist()
             result = dict(zip(request_id_list, new_tokens_list))
 
-        # 5.5 Propagate merged request outputs
-        if self._merge_enabled:
-            for rid, token_id in list(result.items()):
-                phash = self._request_to_merge_group.get(rid)
-                if phash is not None and phash in self._merged_requests:
-                    primary_rid, secondaries = self._merged_requests[phash]
-                    if rid == primary_rid:
-                        # Copy token to all secondary requests
-                        for sec_rid in secondaries:
-                            result[sec_rid] = token_id
+        # 5.5 Propagate primary tokens to merged secondaries (no compute — just copy)
+        if self._merge_enabled and self._merge_primaries:
+            eos_id = 0
+            if self.model is not None and hasattr(self.model, 'config'):
+                eos_id = getattr(self.model.config, 'eos_token_id', 0)
+            for phash, (primary_rid, _, sec_rids) in list(self._merge_primaries.items()):
+                if primary_rid not in result:
+                    continue
+                token_id = result[primary_rid]
+                done_secs = []
+                for sec_rid in sec_rids:
+                    sec = self._merged_secondaries.get(sec_rid)
+                    if sec is None:
+                        done_secs.append(sec_rid)
+                        continue
+                    sec["output_tokens"].append(token_id)
+                    # Add to step result so streaming works in _engine_loop
+                    result[sec_rid] = token_id
+                    # Check if secondary is done
+                    if (len(sec["output_tokens"]) >= sec["max_new_tokens"]
+                            or token_id == eos_id):
+                        fr = "stop" if token_id == eos_id else "length"
+                        self._merged_finished_results.append(GenerationResult(
+                            request_id=sec_rid,
+                            prompt_tokens=sec["prompt_tokens"],
+                            output_tokens=sec["output_tokens"],
+                            num_steps=len(sec["output_tokens"]),
+                            elapsed_ms=0,
+                            finish_reason=fr,
+                        ))
+                        del self._merged_secondaries[sec_rid]
+                        self._request_to_merge_group.pop(sec_rid, None)
+                        self._request_deadlines.pop(sec_rid, None)
+                        done_secs.append(sec_rid)
+                for s in done_secs:
+                    if s in sec_rids:
+                        sec_rids.remove(s)
 
         # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)
@@ -830,6 +905,14 @@ class I64Engine:
         while True:
             self.step()
             steps += 1
+
+            # Check merged secondary finished results first
+            for mr in self._merged_finished_results:
+                if mr.request_id == request_id:
+                    self._merged_finished_results.remove(mr)
+                    mr.elapsed_ms = (time.perf_counter() - start) * 1000
+                    mr.num_steps = steps
+                    return mr
 
             req = None
             for r in self.scheduler.finished:
@@ -1157,6 +1240,19 @@ class AsyncI64Engine:
                     r for r in self.engine.scheduler.finished
                     if r.request_id not in finished_ids
                 ]
+
+                # Resolve finished merged secondaries
+                for mr in list(self.engine._merged_finished_results):
+                    rid = mr.request_id
+                    if rid in self._pending_futures:
+                        target = self._pending_futures.pop(rid)
+                        mr.elapsed_ms = (time.perf_counter() - self._request_times.pop(rid, 0)) * 1000
+                        if isinstance(target, asyncio.Future) and not target.done():
+                            target.set_result(mr)
+                            self.active_requests -= 1
+                        elif isinstance(target, asyncio.Queue):
+                            await target.put(None)
+                self.engine._merged_finished_results.clear()
 
                 await asyncio.sleep(0)
             else:
