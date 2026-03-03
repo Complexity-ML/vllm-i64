@@ -924,6 +924,8 @@ class AsyncI64Engine:
                     break
                 yield item
         finally:
+            # Cancel engine-side request if still running (e.g. client disconnect)
+            self.engine.cancel_request(request_id)
             self.active_requests -= 1
             self._request_times.pop(request_id, None)
 
