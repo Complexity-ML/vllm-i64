@@ -3,7 +3,7 @@ vllm-i64 :: CLI
 
 Usage:
     vllm-i64 serve <model> [--port 8000] [--host 0.0.0.0] [--dtype float16] [--tp 1]
-    vllm-i64 bench [--num-experts 4]
+    vllm-i64 bench [--mode all|routing|engine] [--requests 20] [--concurrency 8]
     vllm-i64 list
     vllm-i64 check <model>
 
@@ -185,34 +185,56 @@ def cmd_bench(args):
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
-    from benchmarks.bench_i64_routing import (
-        bench_i64_routing,
-        bench_float_routing,
-        bench_full_pipeline,
-    )
+    if args.mode == "routing":
+        from benchmarks.bench_i64_routing import (
+            bench_i64_routing,
+            bench_float_routing,
+            bench_full_pipeline,
+        )
 
-    print("=" * 60)
-    print("vllm-i64 :: Benchmark")
-    print("=" * 60)
+        print("=" * 60)
+        print("vllm-i64 :: Routing Benchmark")
+        print("=" * 60)
 
-    print(f"\n--- i64 routing vs float routing ---")
-    print(f"{'Method':<25} {'Tokens':>8} {'us/call':>10} {'ns/tok':>10}")
-    print("-" * 55)
+        print(f"\n--- i64 routing vs float routing ---")
+        print(f"{'Method':<25} {'Tokens':>8} {'us/call':>10} {'ns/tok':>10}")
+        print("-" * 55)
 
-    for n_tok in [256, 1024, 4096]:
-        r_i64 = bench_i64_routing(n_tok, num_experts=args.num_experts)
-        r_float = bench_float_routing(n_tok, num_experts=args.num_experts)
+        for n_tok in [256, 1024, 4096]:
+            r_i64 = bench_i64_routing(n_tok, num_experts=args.num_experts)
+            r_float = bench_float_routing(n_tok, num_experts=args.num_experts)
 
-        print(f"{r_i64['method']:<25} {n_tok:>8} {r_i64['us_per_call']:>10} {r_i64['ns_per_token']:>10}")
-        print(f"{r_float['method']:<25} {n_tok:>8} {r_float['us_per_call']:>10} {r_float['ns_per_token']:>10}")
-        speedup = r_float['us_per_call'] / max(r_i64['us_per_call'], 0.01)
-        print(f"{'  -> speedup':<25} {'':>8} {f'{speedup:.0f}x':>10}")
-        print()
+            print(f"{r_i64['method']:<25} {n_tok:>8} {r_i64['us_per_call']:>10} {r_i64['ns_per_token']:>10}")
+            print(f"{r_float['method']:<25} {n_tok:>8} {r_float['us_per_call']:>10} {r_float['ns_per_token']:>10}")
+            speedup = r_float['us_per_call'] / max(r_i64['us_per_call'], 0.01)
+            print(f"{'  -> speedup':<25} {'':>8} {f'{speedup:.0f}x':>10}")
+            print()
 
-    print("\n--- Full pipeline ---")
-    for n_tok in [256, 1024, 4096]:
-        r = bench_full_pipeline(n_tok, num_experts=args.num_experts)
-        print(f"  {n_tok} tokens: {r['ms_per_call']} ms/call, {r['tokens_per_sec']:,} tok/s")
+        print("\n--- Full pipeline ---")
+        for n_tok in [256, 1024, 4096]:
+            r = bench_full_pipeline(n_tok, num_experts=args.num_experts)
+            print(f"  {n_tok} tokens: {r['ms_per_call']} ms/call, {r['tokens_per_sec']:,} tok/s")
+
+    elif args.mode == "engine":
+        from benchmarks.bench_engine import run_full_benchmark
+        run_full_benchmark(
+            num_requests=args.requests,
+            prompt_len=args.prompt_len,
+            output_len=args.output_len,
+            concurrency=args.concurrency,
+            num_experts=args.num_experts,
+        )
+
+    else:
+        # Default: run both
+        from benchmarks.bench_engine import run_full_benchmark
+        run_full_benchmark(
+            num_requests=args.requests,
+            prompt_len=args.prompt_len,
+            output_len=args.output_len,
+            concurrency=args.concurrency,
+            num_experts=args.num_experts,
+        )
 
     print("\nDone.")
 
@@ -264,7 +286,13 @@ def main():
 
     # bench
     p_bench = sub.add_parser("bench", help="Run benchmarks")
+    p_bench.add_argument("--mode", default="all", choices=["all", "routing", "engine"],
+                         help="Benchmark mode: routing, engine, or all (default)")
     p_bench.add_argument("--num-experts", type=int, default=4)
+    p_bench.add_argument("--requests", type=int, default=20, help="Number of requests")
+    p_bench.add_argument("--prompt-len", type=int, default=64, help="Prompt length (tokens)")
+    p_bench.add_argument("--output-len", type=int, default=64, help="Max output tokens")
+    p_bench.add_argument("--concurrency", type=int, default=8, help="Async concurrency")
     p_bench.set_defaults(func=cmd_bench)
 
     args = parser.parse_args()

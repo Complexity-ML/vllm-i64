@@ -175,7 +175,13 @@ class CompletionResponse:
             self.choices = []
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Attach top-level usage if present (OpenAI standard)
+        if hasattr(self, '_usage'):
+            d["usage"] = self._usage
+        if hasattr(self, '_engine_metrics'):
+            d["engine_metrics"] = self._engine_metrics
+        return d
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -264,7 +270,7 @@ class I64Server:
         return "\n".join(parts)
 
     def _build_response(self, result: GenerationResult, prompt_ids: List[int]) -> CompletionResponse:
-        """Build completion response from generation result."""
+        """Build completion response from generation result (OpenAI-compatible)."""
         output_text = self._detokenize(result.output_tokens)
         req_id = self._next_request_id()
 
@@ -272,13 +278,6 @@ class I64Server:
             "text": output_text,
             "index": 0,
             "finish_reason": result.finish_reason,
-            "usage": {
-                "prompt_tokens": len(prompt_ids),
-                "completion_tokens": len(result.output_tokens),
-                "total_tokens": len(prompt_ids) + len(result.output_tokens),
-                "engine_steps": result.num_steps,
-                "elapsed_ms": round(result.elapsed_ms, 2),
-            },
         }
 
         # Include logprobs if available
@@ -289,12 +288,25 @@ class I64Server:
                 "top_logprobs": [lp.top_logprobs for lp in result.token_logprobs],
             }
 
-        return CompletionResponse(
+        resp = CompletionResponse(
             id=req_id,
             created=int(time.time()),
             model=self.model_name,
             choices=[choice],
         )
+
+        # Attach top-level usage (OpenAI standard)
+        resp._usage = {
+            "prompt_tokens": len(prompt_ids),
+            "completion_tokens": len(result.output_tokens),
+            "total_tokens": len(prompt_ids) + len(result.output_tokens),
+        }
+        # Engine-specific metrics (non-standard extension)
+        resp._engine_metrics = {
+            "engine_steps": result.num_steps,
+            "elapsed_ms": round(result.elapsed_ms, 2),
+        }
+        return resp
 
     async def _async_complete(self, request: CompletionRequest, api_key: Optional[str] = None, endpoint: str = "/v1/completions") -> CompletionResponse:
         """Async completion — batched with other concurrent requests."""
@@ -363,6 +375,63 @@ class I64Server:
                 "index": 0,
                 "text": "",
                 "finish_reason": "length",
+            }],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def _async_chat_stream(
+        self, request: CompletionRequest, tools: Optional[list] = None,
+    ) -> AsyncGenerator[str, None]:
+        """Streaming chat completion — OpenAI SSE format with delta objects."""
+        prompt_ids = self._tokenize(request.prompt)
+        stream_id = self._next_request_id()
+        created = int(time.time())
+
+        # First chunk: role
+        first_chunk = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self.model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": ""},
+                "finish_reason": None,
+            }],
+        }
+        yield f"data: {json.dumps(first_chunk)}\n\n"
+
+        # Content chunks
+        async for token_id in self.async_engine.generate_stream(
+            prompt_token_ids=prompt_ids,
+            max_new_tokens=request.max_tokens,
+            sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
+        ):
+            token_text = self._detokenize([token_id])
+            chunk = {
+                "id": stream_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": self.model_name,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": token_text},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+        # Final chunk with finish_reason
+        final = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self.model_name,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
             }],
         }
         yield f"data: {json.dumps(final)}\n\n"
@@ -492,7 +561,29 @@ class I64Server:
             repetition_penalty=body.get("repetition_penalty", 1.1),
             min_tokens=body.get("min_tokens", 0),
             stream=body.get("stream", False),
+            response_format=body.get("response_format"),
+            stop=body.get("stop"),
+            n=body.get("n", 1),
+            best_of=body.get("best_of", 1),
+            logprobs=body.get("logprobs"),
+            seed=body.get("seed"),
+            logit_bias=body.get("logit_bias"),
+            frequency_penalty=body.get("frequency_penalty", 0.0),
+            presence_penalty=body.get("presence_penalty", 0.0),
+            priority=body.get("priority", 0),
         )
+
+        # Validate
+        error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
+        if error:
+            return web.json_response(
+                {"error": {"message": error, "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # Extract API key for usage tracking
+        auth = request.headers.get("Authorization", "")
+        req_api_key = auth[7:] if auth.startswith("Bearer ") else None
 
         try:
             if req.stream:
@@ -500,13 +591,13 @@ class I64Server:
                 response.content_type = "text/event-stream"
                 await response.prepare(request)
                 try:
-                    async for chunk in self._async_stream(req):
+                    async for chunk in self._async_chat_stream(req, body.get("tools")):
                         await response.write(chunk.encode())
                 except (ConnectionResetError, ConnectionError):
                     pass  # client disconnected
                 return response
 
-            result = await self._async_complete(req)
+            result = await self._async_complete(req, api_key=req_api_key, endpoint="/v1/chat/completions")
             result_dict = result.to_dict()
             if result_dict["choices"]:
                 text = result_dict["choices"][0]["text"]

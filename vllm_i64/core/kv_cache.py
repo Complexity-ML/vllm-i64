@@ -109,6 +109,12 @@ class PagedKVCache:
         self._swapped_seqs: Dict[int, dict] = {}  # seq_id → swap metadata
         self._swap_count: int = 0
 
+        # ── Lazy block zeroing ──
+        # Blocks are zeroed on allocation, not on free. This makes
+        # free_sequence() O(1) per block and defers the GPU write to
+        # the next allocation — beneficial for bulk LRU evictions.
+        self._dirty_blocks: Set[int] = set()
+
     @property
     def num_free_blocks(self) -> int:
         return len(self.free_blocks)
@@ -194,6 +200,10 @@ class PagedKVCache:
 
         for i in range(num_blocks_needed):
             block_id = self.free_blocks.pop()
+            # Lazy zeroing: only zero blocks that were previously used
+            if block_id in self._dirty_blocks:
+                self._zero_block(block_id)
+                self._dirty_blocks.discard(block_id)
             block_idx = current_blocks + i
             self.block_table[seq_id, block_idx] = block_id
             allocated.append(block_id)
@@ -447,16 +457,16 @@ class PagedKVCache:
                 if prefix_hash is not None:
                     rc = self._prefix_refcount.get(prefix_hash, 1) - 1
                     if rc <= 0:
-                        # Last user — free the block and zero it
+                        # Last user — free the block (lazy zero on next alloc)
                         self._prefix_hash_to_blocks.pop(prefix_hash, None)
                         self._block_to_prefix.pop(block_id, None)
                         self._prefix_refcount.pop(prefix_hash, None)
-                        self._zero_block(block_id)
+                        self._dirty_blocks.add(block_id)
                         self.free_blocks.append(block_id)
                     else:
                         self._prefix_refcount[prefix_hash] = rc
                 else:
-                    self._zero_block(block_id)
+                    self._dirty_blocks.add(block_id)
                     self.free_blocks.append(block_id)
                 blocks[i] = -1
 
@@ -534,6 +544,7 @@ class PagedKVCache:
                 self._cpu_v_caches[layer][cpu_block].copy_(self.v_caches[layer][gpu_block])
 
             self._cpu_block_table[seq_id, i] = cpu_block
+            self._dirty_blocks.add(gpu_block)
             self.free_blocks.append(gpu_block)
             self.block_table[seq_id, i] = -1
 
