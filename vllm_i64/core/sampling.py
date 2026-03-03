@@ -324,11 +324,12 @@ def fused_top_p_sample(
     # Cumulative sum + mask in one pass
     cumulative = probs.cumsum(dim=-1)
     mask = (cumulative - probs) > top_p
-    sorted_logits[mask] = float("-inf")
 
-    # Final softmax on masked logits → sample (no redundant softmax)
-    probs_filtered = torch.softmax(sorted_logits, dim=-1)
-    sorted_token_ids = torch.multinomial(probs_filtered, num_samples=1).squeeze(-1)
+    # Zero masked probs and renormalize (avoids redundant second softmax)
+    probs[mask] = 0.0
+    probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    probs = probs / probs_sum
+    sorted_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     # Map back to original indices
     return sorted_indices.gather(-1, sorted_token_ids.unsqueeze(-1)).squeeze(-1)
@@ -356,17 +357,15 @@ def apply_frequency_presence_penalty_batch(
         past = past_tokens_list[i]
         if not past:
             continue
-        # Count occurrences
-        counts = {}
-        for t in past:
-            if 0 <= t < vocab_size:
-                counts[t] = counts.get(t, 0) + 1
-        if not counts:
+        # Vectorized: tensor → unique with counts in one GPU op
+        past_tensor = torch.tensor(past, dtype=torch.long, device=device)
+        past_tensor = past_tensor[(past_tensor >= 0) & (past_tensor < vocab_size)]
+        if past_tensor.numel() == 0:
             continue
-        token_ids = torch.tensor(list(counts.keys()), dtype=torch.long, device=device)
-        freq = torch.tensor(list(counts.values()), dtype=logits.dtype, device=device)
-        presence = (freq > 0).to(logits.dtype)
-        logits[i, token_ids] -= frequency_penalty * freq + presence_penalty * presence
+        token_ids, freq = past_tensor.unique(return_counts=True)
+        freq_f = freq.to(logits.dtype)
+        presence = torch.ones_like(freq_f)
+        logits[i, token_ids] -= frequency_penalty * freq_f + presence_penalty * presence
     return logits
 
 
@@ -507,14 +506,23 @@ def sample_batch_with_logprobs(
         probs = torch.softmax(sorted_logits, dim=-1)
         cumulative = probs.cumsum(dim=-1)
         mask = (cumulative - probs) > params.top_p
-        sorted_logits[mask] = float("-inf")
-        logits = sorted_logits.scatter(-1, sorted_indices, sorted_logits)
+        # Zero masked probs and renormalize (avoids redundant second softmax)
+        probs[mask] = 0.0
+        probs_sum = probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+        probs = probs / probs_sum
 
-    # Seed for reproducibility
-    _apply_seed(params)
+        # Seed for reproducibility
+        _apply_seed(params)
 
-    probs = torch.softmax(logits, dim=-1)
-    token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        # Sample in sorted space, map back to original indices
+        sorted_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+        token_ids = sorted_indices.gather(-1, sorted_token_ids.unsqueeze(-1)).squeeze(-1)
+    else:
+        # Seed for reproducibility
+        _apply_seed(params)
+
+        probs = torch.softmax(logits, dim=-1)
+        token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     if log_probs_all is not None:
         lp_list = _gather_logprobs(log_probs_all, token_ids, params.logprobs)

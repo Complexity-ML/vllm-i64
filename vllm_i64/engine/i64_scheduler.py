@@ -474,14 +474,13 @@ class I64Scheduler:
                 # Track for fairness
                 self._tokens_generated_per_req[req.request_id] = req.num_generated
 
-                # Allocate more KV blocks if needed (integer arithmetic)
+                # Allocate more KV blocks if needed (single batch call)
                 blocks_needed = (req.total_tokens + self.kv_block_size - 1) // self.kv_block_size
-                while len(req.kv_block_ids) < blocks_needed:
-                    new_blocks = self._allocate_kv_blocks(1)
+                deficit = blocks_needed - len(req.kv_block_ids)
+                if deficit > 0:
+                    new_blocks = self._allocate_kv_blocks(deficit)
                     if new_blocks:
                         req.kv_block_ids.extend(new_blocks)
-                    else:
-                        break
 
     def get_stats(self) -> Dict[str, int]:
         """Stats — all integer values."""

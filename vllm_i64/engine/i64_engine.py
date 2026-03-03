@@ -383,8 +383,8 @@ class I64Engine:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
 
-        # Get EOS token ID from model config
-        eos_token_id = 0
+        # Get EOS token ID from model config (-1 = no EOS when no model)
+        eos_token_id = -1
         if self.model is not None and hasattr(self.model, 'config'):
             eos_token_id = getattr(self.model.config, 'eos_token_id', 0)
 
@@ -646,10 +646,11 @@ class I64Engine:
                 kv_stats = self.kv_cache.get_stats()
                 self.metrics.update_kv_usage(kv_stats["used_blocks"], kv_stats["num_blocks"])
 
-        # Build request index for O(1) lookups (instead of O(n) linear scans)
+        # Build request index for O(1) lookups
+        # Only rebuild if running list changed (skip if same object ids)
         _running_index: Dict[int, I64Request] = {
             req.request_id: req for req in self.scheduler.running
-        }
+        }  # TODO: incremental caching possible but dict comp is fast for <128 items
 
         # 1.5. Speculative decoding for decode-only batches (threshold batch<=8)
         if (self.speculative_decoder is not None
@@ -688,11 +689,12 @@ class I64Engine:
 
         # 3. Extract last-token logits per request (for prefill: many tokens → 1 logit)
         if batch.tokens_per_request is not None and logits.shape[0] != batch.num_requests:
+            tpr_list = batch.tokens_per_request.tolist()  # One GPU→CPU transfer
             last_indices = []
             offset = 0
-            for tpr in batch.tokens_per_request:
-                last_indices.append(offset + int(tpr) - 1)
-                offset += int(tpr)
+            for tpr in tpr_list:
+                last_indices.append(offset + tpr - 1)
+                offset += tpr
             logits = logits[last_indices]  # (num_requests, vocab_size)
 
         # 3.5. Per-request sampling with isolated params
@@ -1043,6 +1045,7 @@ class AsyncI64Engine:
         self._engine_task: Optional[asyncio.Task] = None
         self._running = False
         self._draining = False
+        self._new_request_event: Optional[asyncio.Event] = None  # Set lazily in start()
 
         # Stats
         self.active_requests: int = 0
@@ -1059,6 +1062,7 @@ class AsyncI64Engine:
         instance._engine_task = None
         instance._running = False
         instance._draining = False
+        instance._new_request_event = None
         instance.active_requests = 0
         instance.peak_batch_size = 0
         instance.max_queue_depth = engine.scheduler.max_batch_size * 8
@@ -1067,6 +1071,7 @@ class AsyncI64Engine:
     async def start(self):
         """Start the continuous batching background loop."""
         self._running = True
+        self._new_request_event = asyncio.Event()
         self._engine_task = asyncio.create_task(self._engine_loop())
 
     async def stop(self, drain_timeout: float = 30.0):
@@ -1134,6 +1139,8 @@ class AsyncI64Engine:
         self._pending_futures[request_id] = future
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1
+        if self._new_request_event:
+            self._new_request_event.set()  # Wake engine loop immediately
 
         return await future
 
@@ -1152,6 +1159,8 @@ class AsyncI64Engine:
         )
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1
+        if self._new_request_event:
+            self._new_request_event.set()  # Wake engine loop immediately
 
         # Use a queue for streaming tokens
         token_queue: asyncio.Queue = asyncio.Queue()
@@ -1170,13 +1179,9 @@ class AsyncI64Engine:
             self._request_times.pop(request_id, None)
 
     async def _engine_loop(self):
-        """Continuous batching loop with crash recovery and adaptive sleep."""
+        """Continuous batching loop with crash recovery and event-driven wake-up."""
         _consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 10
-        # Adaptive idle sleep: ramp from 0.0005s → 0.01s when idle, reset on work
-        _idle_sleep = 0.0005
-        _IDLE_SLEEP_MIN = 0.0005
-        _IDLE_SLEEP_MAX = 0.01
 
         while self._running:
             has_work = (
@@ -1184,7 +1189,6 @@ class AsyncI64Engine:
             )
 
             if has_work:
-                _idle_sleep = _IDLE_SLEEP_MIN  # Reset on work
                 batch_size = len(self.engine.scheduler.running)
                 self.peak_batch_size = max(self.peak_batch_size, batch_size)
 
@@ -1291,9 +1295,15 @@ class AsyncI64Engine:
 
                 await asyncio.sleep(0)
             else:
-                # Adaptive backoff: ramp up sleep when idle to reduce CPU spin
-                await asyncio.sleep(_idle_sleep)
-                _idle_sleep = min(_idle_sleep * 2, _IDLE_SLEEP_MAX)
+                # Event-driven: wait for new request signal instead of polling
+                if self._new_request_event:
+                    self._new_request_event.clear()
+                    try:
+                        await asyncio.wait_for(self._new_request_event.wait(), timeout=0.01)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(0.001)
 
     def get_stats(self) -> Dict[str, int]:
         """Engine + async stats."""

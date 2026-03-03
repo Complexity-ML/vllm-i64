@@ -22,6 +22,7 @@ import json
 import time
 import asyncio
 import itertools
+import concurrent.futures
 from typing import Optional, List, Dict, AsyncGenerator
 from dataclasses import dataclass, asdict
 
@@ -232,6 +233,10 @@ class I64Server:
         self._request_logger = RequestLogger()
         self._priority_manager = PriorityManager()
         self._shutting_down = False
+        # Thread pool for tokenization (avoids blocking the event loop)
+        self._tokenize_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tokenize")
+        # Single-token detokenize cache: token_id → text (avoids repeated decode calls)
+        self._detok_cache: Dict[int, str] = {}
 
     def _next_request_id(self) -> str:
         """Generate a unique request ID (race-free)."""
@@ -245,11 +250,25 @@ class I64Server:
             return self.tokenizer.encode(text)
         return [int(b) for b in text.encode("utf-8")]
 
+    async def _tokenize_async(self, text: str) -> List[int]:
+        """Tokenize in thread pool to avoid blocking the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._tokenize_pool, self._tokenize, text)
+
     def _detokenize(self, token_ids: List[int]) -> str:
         """i64 token IDs → text. Boundary operation."""
         if self.tokenizer:
             return self.tokenizer.decode(token_ids)
         return bytes(token_ids).decode("utf-8", errors="replace")
+
+    def _detokenize_token(self, token_id: int) -> str:
+        """Single token → text with cache. For streaming."""
+        text = self._detok_cache.get(token_id)
+        if text is None:
+            text = self._detokenize([token_id])
+            if len(self._detok_cache) < 100000:  # Cap cache size
+                self._detok_cache[token_id] = text
+        return text
 
     def _apply_chat_template(self, messages: List[Dict]) -> str:
         """Apply chat template to messages → prompt string."""
@@ -311,7 +330,7 @@ class I64Server:
     async def _async_complete(self, request: CompletionRequest, api_key: Optional[str] = None, endpoint: str = "/v1/completions") -> CompletionResponse:
         """Async completion — batched with other concurrent requests."""
         t0 = time.monotonic()
-        prompt_ids = self._tokenize(request.prompt)
+        prompt_ids = await self._tokenize_async(request.prompt)
 
         result = await self.async_engine.generate(
             prompt_token_ids=prompt_ids,
@@ -342,7 +361,7 @@ class I64Server:
         self, request: CompletionRequest
     ) -> AsyncGenerator[str, None]:
         """Streaming completion via async engine — OpenAI SSE format."""
-        prompt_ids = self._tokenize(request.prompt)
+        prompt_ids = await self._tokenize_async(request.prompt)
         stream_id = self._next_request_id()
         created = int(time.time())
 
@@ -351,7 +370,7 @@ class I64Server:
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
-            token_text = self._detokenize([token_id])
+            token_text = self._detokenize_token(token_id)
             chunk = {
                 "id": stream_id,
                 "object": "text_completion",
@@ -384,7 +403,7 @@ class I64Server:
         self, request: CompletionRequest, tools: Optional[list] = None,
     ) -> AsyncGenerator[str, None]:
         """Streaming chat completion — OpenAI SSE format with delta objects."""
-        prompt_ids = self._tokenize(request.prompt)
+        prompt_ids = await self._tokenize_async(request.prompt)
         stream_id = self._next_request_id()
         created = int(time.time())
 
@@ -408,7 +427,7 @@ class I64Server:
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
-            token_text = self._detokenize([token_id])
+            token_text = self._detokenize_token(token_id)
             chunk = {
                 "id": stream_id,
                 "object": "chat.completion.chunk",

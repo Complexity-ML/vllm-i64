@@ -83,15 +83,17 @@ class PagedKVCache:
         ]
 
         # Block table: maps (seq_id, block_idx) → physical block_id (i32)
+        # Kept on CPU — it's integer metadata, no GPU compute needed.
+        # Avoids GPU→CPU sync on every block lookup.
         self.block_table = torch.full(
-            (max_seqs, max_blocks_per_seq), -1, dtype=torch.int32, device=device
+            (max_seqs, max_blocks_per_seq), -1, dtype=torch.int32, device="cpu"
         )
 
         # Free block list (integer)
         self.free_blocks: List[int] = list(range(num_blocks))
 
-        # Sequence lengths (integer)
-        self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device=device)
+        # Sequence lengths (integer) — CPU for fast lookups without GPU sync
+        self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device="cpu")
 
         # ── LRU eviction tracking (all integer, heap-based O(log n)) ──
         self.enable_lru_eviction = enable_lru_eviction
@@ -242,8 +244,10 @@ class PagedKVCache:
             # Need to allocate
             [physical_block] = self.allocate_blocks(seq_id, 1)
 
-        self.k_caches[layer_idx][physical_block, offset, :, :] = k.to(self.kv_dtype)
-        self.v_caches[layer_idx][physical_block, offset, :, :] = v.to(self.kv_dtype)
+        k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
+        v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
+        self.k_caches[layer_idx][physical_block, offset, :, :] = k_kv
+        self.v_caches[layer_idx][physical_block, offset, :, :] = v_kv
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), position + 1)
         self._touch(seq_id)
 
@@ -286,20 +290,25 @@ class PagedKVCache:
         else:
             physical_blocks = []
 
+        need_cast = self.kv_dtype != self.compute_dtype
         for block_idx in range(num_full_blocks):
             physical_block = physical_blocks[block_idx]
             if physical_block >= 0:
                 start = block_idx * self.block_size
                 end = start + self.block_size
-                k_out[start:end] = self.k_caches[layer_idx][physical_block, :self.block_size, :, :].to(self.compute_dtype)
-                v_out[start:end] = self.v_caches[layer_idx][physical_block, :self.block_size, :, :].to(self.compute_dtype)
+                k_block = self.k_caches[layer_idx][physical_block, :self.block_size, :, :]
+                v_block = self.v_caches[layer_idx][physical_block, :self.block_size, :, :]
+                k_out[start:end] = k_block.to(self.compute_dtype) if need_cast else k_block
+                v_out[start:end] = v_block.to(self.compute_dtype) if need_cast else v_block
 
         if remainder > 0:
             physical_block = physical_blocks[num_full_blocks]
             if physical_block >= 0:
                 start = num_full_blocks * self.block_size
-                k_out[start:seq_len] = self.k_caches[layer_idx][physical_block, :remainder, :, :].to(self.compute_dtype)
-                v_out[start:seq_len] = self.v_caches[layer_idx][physical_block, :remainder, :, :].to(self.compute_dtype)
+                k_block = self.k_caches[layer_idx][physical_block, :remainder, :, :]
+                v_block = self.v_caches[layer_idx][physical_block, :remainder, :, :]
+                k_out[start:seq_len] = k_block.to(self.compute_dtype) if need_cast else k_block
+                v_out[start:seq_len] = v_block.to(self.compute_dtype) if need_cast else v_block
 
         return k_out, v_out
 
@@ -320,21 +329,19 @@ class PagedKVCache:
         block_indices = pos_np // self.block_size
         offsets = pos_np % self.block_size
 
-        # Pre-allocate any missing blocks
-        unique_blocks = set(int(b) for b in block_indices)
-        for bidx in sorted(unique_blocks):
-            physical_block = self.block_table[seq_id, bidx].item()
-            if physical_block < 0:
-                self.allocate_blocks(seq_id, 1)
+        # Pre-allocate any missing blocks (single batch call)
+        unique_blocks = sorted(set(int(b) for b in block_indices))
+        missing = sum(1 for bidx in unique_blocks if self.block_table[seq_id, bidx].item() < 0)
+        if missing > 0:
+            self.allocate_blocks(seq_id, missing)
 
         # Fetch all physical block IDs in one tensor op (1 GPU→CPU transfer)
-        unique_list = sorted(unique_blocks)
-        block_map_tensor = self.block_table[seq_id, unique_list]
-        block_map = {bidx: int(block_map_tensor[i]) for i, bidx in enumerate(unique_list)}
+        block_map_tensor = self.block_table[seq_id, unique_blocks]
+        block_map = {bidx: int(block_map_tensor[i]) for i, bidx in enumerate(unique_blocks)}
 
-        # Write using cached block map — group by physical block for fewer GPU ops
-        k_kv = k.to(self.kv_dtype)
-        v_kv = v.to(self.kv_dtype)
+        # Write using cached block map — skip dtype conversion if already correct
+        k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
+        v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
         if n <= 4:
             # Small batch: direct writes are faster than grouping overhead
             for t in range(n):
