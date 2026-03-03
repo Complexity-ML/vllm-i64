@@ -522,6 +522,7 @@ class I64Server:
             if req.stream:
                 response = web.StreamResponse()
                 response.content_type = "text/event-stream"
+                response.headers["Cache-Control"] = "no-cache"
                 await response.prepare(request)
                 try:
                     async for chunk in self._async_stream(req):
@@ -551,7 +552,7 @@ class I64Server:
 
             return web.json_response(result_dict)
         except (ConnectionResetError, ConnectionError):
-            pass  # client disconnected
+            return web.Response(status=499, text="Client disconnected")
         except Exception as e:
             logger.error(f"Completion error: {e}", exc_info=True)
             return web.json_response(
@@ -616,6 +617,7 @@ class I64Server:
             if req.stream:
                 response = web.StreamResponse()
                 response.content_type = "text/event-stream"
+                response.headers["Cache-Control"] = "no-cache"
                 await response.prepare(request)
                 try:
                     async for chunk in self._async_chat_stream(req, body.get("tools")):
@@ -659,7 +661,7 @@ class I64Server:
             result_dict["object"] = "chat.completion"
             return web.json_response(result_dict)
         except (ConnectionResetError, ConnectionError):
-            pass  # client disconnected during non-stream
+            return web.Response(status=499, text="Client disconnected")
         except Exception as e:
             logger.error(f"Chat completion error: {e}", exc_info=True)
             return web.json_response(

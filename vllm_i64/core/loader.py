@@ -17,6 +17,7 @@ INL - 2025
 """
 
 import json as _json
+import logging
 import torch
 import torch.nn as nn
 from typing import Optional, Dict
@@ -278,6 +279,15 @@ def load_checkpoint(
             loaded_params.add(resolved_name)
 
     # Load expert MLP weight pairs with TP sharding
+    unpaired_gu = set(expert_gate_up.keys()) - set(expert_down.keys())
+    unpaired_dn = set(expert_down.keys()) - set(expert_gate_up.keys())
+    if unpaired_gu or unpaired_dn:
+        _logger = logging.getLogger("vllm_i64.loader")
+        for p in unpaired_gu:
+            _logger.warning(f"Expert gate_up_proj without matching down_proj: {p}")
+        for p in unpaired_dn:
+            _logger.warning(f"Expert down_proj without matching gate_up_proj: {p}")
+
     for prefix in expert_gate_up:
         if prefix in expert_down:
             module_path = prefix.rstrip(".")
