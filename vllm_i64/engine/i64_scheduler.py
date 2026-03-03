@@ -54,6 +54,9 @@ class I64Request:
     # KV cache block indices (integer)
     kv_block_ids: List[int] = field(default_factory=list)
 
+    # Cached prompt as Python list (avoids repeated numpy→list conversion)
+    _prompt_list: Optional[List[int]] = field(default=None, repr=False)
+
     # Position in sequence (integer counter)
     seq_pos: int = 0
 
@@ -65,6 +68,13 @@ class I64Request:
 
     # Arrival order for fairness (integer timestamp)
     arrival_step: int = 0
+
+    @property
+    def prompt_list(self) -> List[int]:
+        """Cached prompt as Python list (avoids repeated numpy→list O(n))."""
+        if self._prompt_list is None:
+            self._prompt_list = self.prompt_token_ids.tolist()
+        return self._prompt_list
 
     @property
     def num_prompt_tokens(self) -> int:

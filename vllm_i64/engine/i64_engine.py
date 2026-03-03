@@ -469,7 +469,7 @@ class I64Engine:
 
             # Build context for speculative decoder
             ctx = torch.tensor(
-                list(req.prompt_token_ids) + req.output_token_ids,
+                req.prompt_list + req.output_token_ids,
                 dtype=torch.int64, device=self.device,
             )
             pos = torch.arange(len(ctx), dtype=torch.int32, device=self.device)
@@ -563,12 +563,51 @@ class I64Engine:
         )
 
         if has_custom:
-            # Sample each request individually with its own params
+            # Partition requests: "complex" (need individual handling) vs "batchable"
+            # Complex = has logits processors, logprobs, or min_tokens
             result = {}
+            complex_indices = []  # (batch_idx, rid)
+            # Group batchable by params id → list of (batch_idx, rid)
+            batchable_groups: Dict[int, list] = {}
+
             for i, rid in enumerate(request_id_list):
                 params = self._request_sampling_params.get(rid, self.sampling_params)
-                req_logits = logits[i:i+1]
+                needs_individual = (
+                    rid in self._request_processors
+                    or params.logprobs is not None
+                    or params.min_tokens > 0
+                )
+                if needs_individual:
+                    complex_indices.append((i, rid))
+                else:
+                    batchable_groups.setdefault(id(params), []).append((i, rid, params))
 
+            # Batch-sample each group of identical params together
+            for _, group in batchable_groups.items():
+                indices = [g[0] for g in group]
+                rids = [g[1] for g in group]
+                params = group[0][2]  # All share same params object
+                group_logits = logits[indices]
+
+                past_tokens_list = None
+                if params.repetition_penalty != 1.0:
+                    past_tokens_list = []
+                    for _, rid, _ in group:
+                        req = _running_index.get(rid)
+                        if req is not None:
+                            past_tokens_list.append(req.prompt_list + req.output_token_ids)
+                        else:
+                            past_tokens_list.append([])
+
+                token_ids = sample_batch(group_logits, params, past_tokens_list=past_tokens_list)
+                token_list = token_ids.tolist()
+                for rid, tid in zip(rids, token_list):
+                    result[rid] = tid
+
+            # Handle complex requests individually
+            for i, rid in complex_indices:
+                params = self._request_sampling_params.get(rid, self.sampling_params)
+                req_logits = logits[i:i+1]
                 req = _running_index.get(rid)
 
                 # Apply min_tokens: suppress EOS until minimum tokens generated
@@ -583,7 +622,7 @@ class I64Engine:
                 past_tokens = None
                 if params.repetition_penalty != 1.0:
                     if req is not None:
-                        past_tokens = [list(req.prompt_token_ids) + req.output_token_ids]
+                        past_tokens = [req.prompt_list + req.output_token_ids]
                     else:
                         past_tokens = [[]]
 
@@ -594,7 +633,6 @@ class I64Engine:
                     req_logits = apply_logits_processors(
                         req_logits.squeeze(0), self._request_processors[rid], generated
                     ).unsqueeze(0)
-                    # Check stop sequence
                     for proc in self._request_processors[rid]:
                         if hasattr(proc, 'should_stop') and proc.should_stop:
                             if req is not None:
@@ -604,13 +642,13 @@ class I64Engine:
 
                 if params.logprobs is not None:
                     sample_out = sample_batch_with_logprobs(req_logits, params, past_tokens_list=past_tokens)
-                    token_id = int(sample_out.token_ids.cpu().numpy().astype(np.int64)[0])
+                    token_id = sample_out.token_ids[0].item()
                     if sample_out.logprobs:
                         self._request_logprobs.setdefault(rid, []).append(sample_out.logprobs[0])
                     result[rid] = token_id
                 else:
                     token_ids = sample_batch(req_logits, params, past_tokens_list=past_tokens)
-                    result[rid] = int(token_ids.cpu().numpy().astype(np.int64)[0])
+                    result[rid] = token_ids[0].item()
         else:
             # Fast path: all requests share the same params
             past_tokens_list = None
@@ -619,7 +657,7 @@ class I64Engine:
                 for rid in request_id_list:
                     req = _running_index.get(rid)
                     if req is not None:
-                        past_tokens_list.append(list(req.prompt_token_ids) + req.output_token_ids)
+                        past_tokens_list.append(req.prompt_list + req.output_token_ids)
                     else:
                         past_tokens_list.append([])
 
@@ -639,7 +677,7 @@ class I64Engine:
                 if req.request_id in result and req.prefill_complete and req.num_generated == 1:
                     slot = self._request_to_slot.get(req.request_id)
                     if slot is not None:
-                        self.kv_cache.register_prefix_blocks(slot, list(req.prompt_token_ids))
+                        self.kv_cache.register_prefix_blocks(slot, req.prompt_list)
 
         # Integer counters
         self.total_steps += 1
@@ -736,7 +774,7 @@ class I64Engine:
 
                 return GenerationResult(
                     request_id=request_id,
-                    prompt_tokens=list(req.prompt_token_ids),
+                    prompt_tokens=req.prompt_list,
                     output_tokens=req.output_token_ids,
                     num_steps=steps,
                     elapsed_ms=elapsed,
@@ -931,9 +969,13 @@ class AsyncI64Engine:
             self._request_times.pop(request_id, None)
 
     async def _engine_loop(self):
-        """Continuous batching loop with crash recovery."""
+        """Continuous batching loop with crash recovery and adaptive sleep."""
         _consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 10
+        # Adaptive idle sleep: ramp from 0.0005s → 0.01s when idle, reset on work
+        _idle_sleep = 0.0005
+        _IDLE_SLEEP_MIN = 0.0005
+        _IDLE_SLEEP_MAX = 0.01
 
         while self._running:
             has_work = (
@@ -941,6 +983,7 @@ class AsyncI64Engine:
             )
 
             if has_work:
+                _idle_sleep = _IDLE_SLEEP_MIN  # Reset on work
                 batch_size = len(self.engine.scheduler.running)
                 self.peak_batch_size = max(self.peak_batch_size, batch_size)
 
@@ -1000,7 +1043,7 @@ class AsyncI64Engine:
                             token_logprobs = self.engine._request_logprobs.pop(rid, None)
                             result = GenerationResult(
                                 request_id=rid,
-                                prompt_tokens=list(req.prompt_token_ids),
+                                prompt_tokens=req.prompt_list,
                                 output_tokens=req.output_token_ids,
                                 num_steps=req.num_generated,
                                 elapsed_ms=elapsed,
@@ -1034,7 +1077,9 @@ class AsyncI64Engine:
 
                 await asyncio.sleep(0)
             else:
-                await asyncio.sleep(0.001)
+                # Adaptive backoff: ramp up sleep when idle to reduce CPU spin
+                await asyncio.sleep(_idle_sleep)
+                _idle_sleep = min(_idle_sleep * 2, _IDLE_SLEEP_MAX)
 
     def get_stats(self) -> Dict[str, int]:
         """Engine + async stats."""
