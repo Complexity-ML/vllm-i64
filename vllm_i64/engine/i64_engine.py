@@ -553,17 +553,19 @@ class I64Engine:
             logits = logits[last_indices]  # (num_requests, vocab_size)
 
         # 3.5. Per-request sampling with isolated params
+        # Convert request_ids to Python int list once (avoid repeated int() casts)
+        request_id_list = batch.request_ids.tolist()
+
         # Check if any request has custom sampling params
         has_custom = any(
-            int(rid) in self._request_sampling_params
-            for rid in batch.request_ids
+            rid in self._request_sampling_params
+            for rid in request_id_list
         )
 
         if has_custom:
             # Sample each request individually with its own params
             result = {}
-            for i, req_id in enumerate(batch.request_ids):
-                rid = int(req_id)
+            for i, rid in enumerate(request_id_list):
                 params = self._request_sampling_params.get(rid, self.sampling_params)
                 req_logits = logits[i:i+1]
 
@@ -614,8 +616,8 @@ class I64Engine:
             past_tokens_list = None
             if self.sampling_params.repetition_penalty != 1.0:
                 past_tokens_list = []
-                for req_id in batch.request_ids:
-                    req = _running_index.get(int(req_id))
+                for rid in request_id_list:
+                    req = _running_index.get(rid)
                     if req is not None:
                         past_tokens_list.append(list(req.prompt_token_ids) + req.output_token_ids)
                     else:
@@ -625,9 +627,8 @@ class I64Engine:
             new_token_ids = self._i64_sample(logits, past_tokens_list)
 
             # 5. Map back to requests (integer indexing)
-            result = {}
-            for i, req_id in enumerate(batch.request_ids):
-                result[int(req_id)] = int(new_token_ids[i])
+            new_tokens_list = new_token_ids.tolist()
+            result = dict(zip(request_id_list, new_tokens_list))
 
         # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)

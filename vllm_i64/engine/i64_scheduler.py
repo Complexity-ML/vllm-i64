@@ -21,6 +21,7 @@ Zero float in the scheduler. FP16 exists only in model forward pass.
 INL - 2025
 """
 
+import heapq
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
@@ -165,14 +166,16 @@ class I64Scheduler:
         self.max_prefill_tokens = max_prefill_tokens
         self.enable_preemption = enable_preemption
 
-        # Request queues (integer indexed)
-        self.pending: deque[I64Request] = deque()
+        # Request queues
+        # pending: heapq sorted by (priority, arrival_step, request_id)
+        self._pending_heap: List[Tuple[int, int, int, I64Request]] = []
         self.running: List[I64Request] = []
         self.finished: List[I64Request] = []
         self.preempted: List[I64Request] = []
 
-        # KV cache block allocator (integer)
+        # KV cache block allocator — deque for O(1) popleft, set for O(1) membership
         self.free_blocks = deque(range(max_kv_blocks))
+        self._free_blocks_set: set = set(range(max_kv_blocks))
         self.max_kv_blocks = max_kv_blocks
 
         # Integer counters
@@ -181,6 +184,20 @@ class I64Scheduler:
 
         # Fairness: track tokens generated per request for round-robin
         self._tokens_generated_per_req: Dict[int, int] = {}
+
+    # --- Pending queue (heapq) compat layer ---
+    # Tests and engine code may access scheduler.pending, so provide a property.
+    @property
+    def pending(self):
+        """Return a list view of pending requests (for backward compat)."""
+        return _PendingProxy(self)
+
+    @pending.setter
+    def pending(self, value):
+        """Accept assignment (e.g. from old code); rebuild heap."""
+        self._pending_heap.clear()
+        for req in value:
+            heapq.heappush(self._pending_heap, (req.priority, req.arrival_step, req.request_id, req))
 
     def add_request(
         self,
@@ -191,8 +208,7 @@ class I64Scheduler:
     ) -> int:
         """
         Add a new request. Returns integer request_id.
-        priority: integer, lower = higher priority (0 = normal, -1 = high, 1 = low)
-        eos_token_id: integer, token ID that signals end of sequence
+        O(log n) insertion via heapq.
         """
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -205,25 +221,44 @@ class I64Scheduler:
             arrival_step=self.step_counter,
             eos_token_id=eos_token_id,
         )
-        self.pending.append(req)
-        # Sort pending by priority, then arrival order (stable sort)
-        self.pending = deque(sorted(self.pending, key=lambda r: (r.priority, r.arrival_step)))
+        heapq.heappush(self._pending_heap, (req.priority, req.arrival_step, req.request_id, req))
         return request_id
 
+    def _pop_pending(self) -> Optional[I64Request]:
+        """Pop highest-priority pending request. O(log n)."""
+        while self._pending_heap:
+            _, _, _, req = heapq.heappop(self._pending_heap)
+            # Skip stale entries (request may have been removed)
+            if req.status == RequestStatus.PENDING:
+                return req
+        return None
+
+    def _peek_pending(self) -> Optional[I64Request]:
+        """Peek at highest-priority pending request. O(1)."""
+        while self._pending_heap:
+            _, _, _, req = self._pending_heap[0]
+            if req.status == RequestStatus.PENDING:
+                return req
+            heapq.heappop(self._pending_heap)  # Remove stale
+        return None
+
     def _allocate_kv_blocks(self, num_blocks: int) -> Optional[List[int]]:
-        """Allocate KV cache blocks. Pure integer."""
+        """Allocate KV cache blocks. Pure integer. O(num_blocks)."""
         if len(self.free_blocks) < num_blocks:
             return None
-        allocated = [self.free_blocks.popleft() for _ in range(num_blocks)]
+        allocated = []
+        for _ in range(num_blocks):
+            bid = self.free_blocks.popleft()
+            self._free_blocks_set.discard(bid)
+            allocated.append(bid)
         return allocated
 
     def _free_kv_blocks(self, block_ids: List[int]):
-        """Free KV cache blocks. Pure integer. Prevents duplicates."""
-        free_set = set(self.free_blocks)
+        """Free KV cache blocks. O(k) with O(1) membership check."""
         for bid in block_ids:
-            if bid not in free_set:
+            if bid not in self._free_blocks_set:
                 self.free_blocks.append(bid)
-                free_set.add(bid)
+                self._free_blocks_set.add(bid)
 
     def _compute_expert_ids(self, token_ids: np.ndarray) -> np.ndarray:
         """
@@ -235,7 +270,6 @@ class I64Scheduler:
     def _try_preempt(self, blocks_needed: int) -> bool:
         """
         Try to preempt lowest-priority running request to free KV blocks.
-
         Returns True if enough blocks were freed.
         """
         if not self.enable_preemption or not self.running:
@@ -254,7 +288,7 @@ class I64Scheduler:
                 break
 
             # Don't preempt high-priority requests for low-priority ones
-            if victim.priority <= 0 and not self.pending:
+            if victim.priority <= 0 and not self._pending_heap:
                 continue
 
             # Preempt
@@ -295,15 +329,16 @@ class I64Scheduler:
         for req in self.preempted:
             req.status = RequestStatus.PENDING
             req.priority = min(req.priority, -1)  # Boost priority after preemption
-            self.pending.append(req)
+            heapq.heappush(self._pending_heap, (req.priority, req.arrival_step, req.request_id, req))
         self.preempted.clear()
-        self.pending = deque(sorted(self.pending, key=lambda r: (r.priority, r.arrival_step)))
 
         # Try to admit new requests
         prefill_token_budget = self.max_prefill_tokens
 
-        while self.pending and len(self.running) < self.max_batch_size:
-            req = self.pending[0]
+        while self._pending_heap and len(self.running) < self.max_batch_size:
+            req = self._peek_pending()
+            if req is None:
+                break
             num_blocks_needed = (req.num_prompt_tokens + self.kv_block_size - 1) // self.kv_block_size
             blocks = self._allocate_kv_blocks(num_blocks_needed)
 
@@ -315,10 +350,11 @@ class I64Scheduler:
             if blocks is None:
                 break  # No KV cache space even after preemption
 
+            # Actually pop from heap now that we know we can admit
+            self._pop_pending()
             req.kv_block_ids = blocks
             req.status = RequestStatus.RUNNING
             self.running.append(req)
-            self.pending.popleft()
 
         if not self.running:
             return None
@@ -432,10 +468,52 @@ class I64Scheduler:
     def get_stats(self) -> Dict[str, int]:
         """Stats — all integer values."""
         return {
-            "pending": len(self.pending),
+            "pending": len(self._pending_heap),
             "running": len(self.running),
             "finished": len(self.finished),
             "preempted": len(self.preempted),
             "free_kv_blocks": len(self.free_blocks),
             "total_steps": self.step_counter,
         }
+
+
+class _PendingProxy:
+    """
+    Backward-compat proxy so scheduler.pending behaves like a sequence.
+    Supports len(), iter(), bool, and append() for existing code.
+    """
+    __slots__ = ("_sched",)
+
+    def __init__(self, sched: I64Scheduler):
+        self._sched = sched
+
+    def __len__(self):
+        return len(self._sched._pending_heap)
+
+    def __bool__(self):
+        return bool(self._sched._pending_heap)
+
+    def __iter__(self):
+        # Yield requests in priority order (without mutating heap)
+        for _, _, _, req in sorted(self._sched._pending_heap):
+            if req.status == RequestStatus.PENDING:
+                yield req
+
+    def append(self, req: I64Request):
+        heapq.heappush(
+            self._sched._pending_heap,
+            (req.priority, req.arrival_step, req.request_id, req),
+        )
+
+    def clear(self):
+        self._sched._pending_heap.clear()
+
+    def popleft(self):
+        return self._sched._pop_pending()
+
+    def __getitem__(self, idx):
+        if idx == 0:
+            return self._sched._peek_pending()
+        # Fallback for non-zero index (rare)
+        items = sorted(self._sched._pending_heap)
+        return items[idx][3]

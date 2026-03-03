@@ -98,6 +98,7 @@ class PagedKVCache:
         self._last_access: Dict[int, int] = {} # seq_id → last access tick
         self._eviction_count: int = 0          # total evictions performed
         self._evicted_seq_ids: List[int] = []  # recently evicted (for scheduler)
+        self._active_seq_ids: set = set()      # O(1) tracking of allocated seqs
 
         # ── Swap-to-CPU ──
         self._swap_enabled = False
@@ -135,10 +136,11 @@ class PagedKVCache:
         freed = 0
         self._evicted_seq_ids.clear()
 
-        # Find active sequences (seq_lens > 0), sorted by LRU (oldest access first)
+        # Find active sequences, sorted by LRU (oldest access first)
+        # Uses _active_seq_ids set instead of scanning all max_seqs slots
         active_seqs = []
-        for sid in range(self.max_seqs):
-            if self.seq_lens[sid].item() > 0 and sid != protect_seq_id:
+        for sid in self._active_seq_ids:
+            if sid != protect_seq_id:
                 tick = self._last_access.get(sid, 0)
                 active_seqs.append((tick, sid))
 
@@ -197,6 +199,7 @@ class PagedKVCache:
             allocated.append(block_id)
 
         self._touch(seq_id)
+        self._active_seq_ids.add(seq_id)
         return allocated
 
 
@@ -447,6 +450,7 @@ class PagedKVCache:
 
         self.seq_lens[seq_id] = 0
         self._last_access.pop(seq_id, None)
+        self._active_seq_ids.discard(seq_id)
 
     # =====================================================================
     # Swap-to-CPU — preserve KV data in pinned CPU memory
