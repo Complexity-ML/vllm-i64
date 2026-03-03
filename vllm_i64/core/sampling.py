@@ -160,6 +160,7 @@ def apply_min_p(logits: torch.Tensor, min_p: float) -> torch.Tensor:
     probs = torch.softmax(logits, dim=-1)
     top_prob = probs.max(dim=-1, keepdim=True).values
     threshold = top_prob * min_p
+    logits = logits.clone()
     logits[probs < threshold] = float("-inf")
     return logits
 
@@ -202,6 +203,7 @@ def apply_typical_p(logits: torch.Tensor, typical_p: float) -> torch.Tensor:
 
     # Unsort the mask back to original positions
     original_mask = mask.scatter(-1, sorted_indices, mask)
+    logits = logits.clone()
     logits[original_mask] = float("-inf")
     return logits
 

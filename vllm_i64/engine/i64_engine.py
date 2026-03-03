@@ -437,7 +437,9 @@ class I64Engine:
 
         # Allocate KV cache slot
         if self.kv_cache is not None:
-            self._allocate_slot(request_id)
+            slot = self._allocate_slot(request_id)
+            if slot < 0:
+                logger.error("No KV cache slots available for request %d", request_id)
 
             # Try to reuse prefix from cache
             if self.kv_cache.prefix_cache_enabled:
@@ -489,6 +491,27 @@ class I64Engine:
                 self.scheduler.finished.append(req)
                 self._free_slot(rid)
                 removed.add(rid)
+                # Clean up merge group if this was a primary
+                if self._merge_enabled:
+                    phash = self._request_to_merge_group.pop(rid, None)
+                    if phash and phash in self._merge_primaries:
+                        primary_rid, _, sec_rids = self._merge_primaries[phash]
+                        if rid == primary_rid:
+                            fr = "cancelled" if is_cancelled else "timeout"
+                            for sec_rid in sec_rids:
+                                sec = self._merged_secondaries.pop(sec_rid, None)
+                                if sec is not None:
+                                    self._merged_finished_results.append(GenerationResult(
+                                        request_id=sec_rid,
+                                        prompt_tokens=sec["prompt_tokens"],
+                                        output_tokens=sec["output_tokens"],
+                                        num_steps=len(sec["output_tokens"]),
+                                        elapsed_ms=0,
+                                        finish_reason=fr,
+                                    ))
+                                self._request_to_merge_group.pop(sec_rid, None)
+                                self._request_deadlines.pop(sec_rid, None)
+                            del self._merge_primaries[phash]
             else:
                 still_running.append(req)
         self.scheduler.running = still_running
@@ -1212,6 +1235,7 @@ class AsyncI64Engine:
                                 self.active_requests -= 1
                             elif isinstance(target, asyncio.Queue):
                                 await target.put(None)
+                        self.engine._free_kv_blocks_for(req)
                         self.engine._free_slot(rid)
                         self.engine._request_deadlines.pop(rid, None)
                         self.engine._request_sampling_params.pop(rid, None)
