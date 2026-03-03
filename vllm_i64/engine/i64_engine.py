@@ -141,6 +141,12 @@ class I64Engine:
         self.total_steps: int = 0
         self.total_tokens_generated: int = 0
 
+        # Performance breakdown (cumulative ms)
+        self._perf_total_ms: float = 0.0
+        self._perf_forward_ms: float = 0.0
+        self._perf_schedule_ms: float = 0.0
+        self._perf_sample_ms: float = 0.0
+
         # Sampling parameters (configurable, default greedy)
         self.sampling_params = SamplingParams(temperature=0.0)
         # Per-request sampling params for multi-user isolation
@@ -663,7 +669,10 @@ class I64Engine:
             self.kv_cache.maybe_enable_fp8()
 
         # 2. Schedule (i64) — moves is_finished requests to scheduler.finished
+        _t_sched = time.perf_counter()
         batch = self.scheduler.schedule()
+        _t_sched_end = time.perf_counter()
+        self._perf_schedule_ms += (_t_sched_end - _t_sched) * 1000
 
         if batch is None:
             return {}
@@ -701,6 +710,7 @@ class I64Engine:
             self.kv_cache._pinned_seq_ids.discard(-1)
 
         # 2. Model forward (fp16) — the ONLY float step
+        _t_fwd = time.perf_counter()
         try:
             if self.model is not None:
                 logits = self._model_forward(batch)
@@ -708,10 +718,13 @@ class I64Engine:
                 logits = torch.randn(batch.num_requests, self.vocab_size)
         except RuntimeError as e:
             logger.error(f"Model forward failed: {e}")
+            self._perf_forward_ms += (time.perf_counter() - _t_fwd) * 1000
             # Unpin and return empty — requests stay running for next step retry
             if self.kv_cache is not None:
                 self.kv_cache._pinned_seq_ids.clear()
             return {}
+
+        self._perf_forward_ms += (time.perf_counter() - _t_fwd) * 1000
 
         # Unpin after forward
         if self.kv_cache is not None:
@@ -728,6 +741,7 @@ class I64Engine:
             logits = logits[last_indices]  # (num_requests, vocab_size)
 
         # 3.5. Per-request sampling with isolated params
+        _t_sample = time.perf_counter()
         # Convert request_ids to Python int list once (avoid repeated int() casts)
         request_id_list = batch.request_ids.tolist()
 
@@ -881,6 +895,8 @@ class I64Engine:
                     if s in sec_rids:
                         sec_rids.remove(s)
 
+        self._perf_sample_ms += (time.perf_counter() - _t_sample) * 1000
+
         # 6. Update scheduler (i64)
         self.scheduler.update_after_step(result)
 
@@ -897,8 +913,9 @@ class I64Engine:
         self.total_tokens_generated += len(result)
 
         # Adaptive batch sizing: record throughput and adjust
+        step_elapsed = (time.perf_counter() - _step_start) * 1000
+        self._perf_total_ms += step_elapsed
         if result:
-            step_elapsed = (time.perf_counter() - _step_start) * 1000
             self._batch_sizer.record(len(result), step_elapsed)
             new_max = self._batch_sizer.adjust()
             if new_max != self.scheduler.max_batch_size:
@@ -1031,8 +1048,8 @@ class I64Engine:
             if callback and results:
                 callback(results)
 
-    def get_stats(self) -> Dict[str, int]:
-        """Engine stats — all integers."""
+    def get_stats(self) -> dict:
+        """Engine stats — integers + perf breakdown."""
         sched_stats = self.scheduler.get_stats()
         stats = {
             **sched_stats,
@@ -1041,6 +1058,19 @@ class I64Engine:
         }
         if self.kv_cache:
             stats.update(self.kv_cache.get_stats())
+        # Performance breakdown
+        if self.total_steps > 0 and self._perf_total_ms > 0:
+            overhead_ms = self._perf_total_ms - self._perf_forward_ms - self._perf_schedule_ms - self._perf_sample_ms
+            stats["perf"] = {
+                "total_ms": round(self._perf_total_ms, 1),
+                "forward_ms": round(self._perf_forward_ms, 1),
+                "schedule_ms": round(self._perf_schedule_ms, 1),
+                "sample_ms": round(self._perf_sample_ms, 1),
+                "overhead_ms": round(max(overhead_ms, 0), 1),
+                "forward_pct": round(self._perf_forward_ms / self._perf_total_ms * 100, 1),
+                "avg_step_ms": round(self._perf_total_ms / self.total_steps, 2),
+                "tok_per_s": round(self.total_tokens_generated / (self._perf_total_ms / 1000), 1) if self._perf_total_ms > 0 else 0,
+            }
         return stats
 
 
