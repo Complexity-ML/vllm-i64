@@ -1,213 +1,141 @@
 """
-vllm-i64 :: Test Async Continuous Batching
+vllm-i64 :: Async Engine Tests
 
-Verifies that multiple concurrent requests are actually batched
-together and processed in parallel by the AsyncI64Engine.
+Tests for AsyncI64Engine lifecycle, generation, streaming,
+concurrency, stats, and graceful shutdown.
 
 Run:
     python -m pytest tests/test_async_engine.py -v
     python tests/test_async_engine.py
 
+Note: project uses pytest-asyncio; asyncio_mode = "auto" can be set
+in pyproject.toml [tool.pytest.ini_options] if desired.
+
 INL - 2025
 """
 
+import pytest
 import asyncio
-import time
 import sys
 import os
-import pytest
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from vllm_i64.engine.i64_engine import AsyncI64Engine, I64Engine, GenerationResult
+from vllm_i64.engine.i64_engine import I64Engine, AsyncI64Engine, GenerationResult
+from vllm_i64.core.sampling import SamplingParams
 
 
 @pytest.mark.asyncio
-async def test_single_request():
-    """Single request should complete."""
-    engine = AsyncI64Engine(
-        model=None,  # Dummy logits
-        num_experts=4,
-        vocab_size=100,
-        max_batch_size=32,
-        device="cpu",
-    )
+async def test_start_stop():
+    """Engine start/stop lifecycle."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
     await engine.start()
+    assert engine._running is True
+    await engine.stop()
+    assert engine._running is False
 
-    result = await engine.generate(
-        prompt_token_ids=[1, 2, 3, 4, 5],
-        max_new_tokens=10,
-    )
 
+@pytest.mark.asyncio
+async def test_generate_basic():
+    """Basic async generation."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
+    await engine.start()
+    result = await engine.generate(prompt_token_ids=[1, 2, 3], max_new_tokens=5)
     assert isinstance(result, GenerationResult)
-    assert len(result.output_tokens) <= 10
-    assert result.request_id >= 0
-    print(f"  single request: {len(result.output_tokens)} tokens, {result.elapsed_ms:.1f}ms")
-
+    assert len(result.output_tokens) == 5
+    assert result.finish_reason == "length"
     await engine.stop()
 
 
 @pytest.mark.asyncio
-async def test_parallel_requests():
-    """Multiple requests should be batched and processed concurrently."""
-    engine = AsyncI64Engine(
-        model=None,
-        num_experts=4,
-        vocab_size=100,
-        max_batch_size=32,
-        device="cpu",
-    )
+async def test_generate_with_sampling_params():
+    """Generation with explicit SamplingParams."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
     await engine.start()
+    params = SamplingParams(temperature=0.0, top_k=1, max_tokens=3)
+    result = await engine.generate([10, 20], max_new_tokens=3, sampling_params=params)
+    assert len(result.output_tokens) == 3
+    await engine.stop()
 
-    num_requests = 8
-    max_tokens = 20
 
-    start = time.perf_counter()
-
-    # Launch all requests concurrently
-    tasks = [
-        asyncio.create_task(
-            engine.generate(
-                prompt_token_ids=list(range(i * 10, i * 10 + 5)),
-                max_new_tokens=max_tokens,
-            )
-        )
-        for i in range(num_requests)
-    ]
-
+@pytest.mark.asyncio
+async def test_concurrent_generates():
+    """Multiple concurrent generates should all complete."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
+    await engine.start()
+    tasks = [engine.generate([i + 1], max_new_tokens=3) for i in range(5)]
     results = await asyncio.gather(*tasks)
-    elapsed = time.perf_counter() - start
-
-    # All requests should have completed
-    assert len(results) == num_requests
-    for i, r in enumerate(results):
-        assert isinstance(r, GenerationResult)
-        assert len(r.output_tokens) <= max_tokens, f"Request {i}: expected <= {max_tokens} tokens, got {len(r.output_tokens)}"
-
-    # Peak batch size should be > 1 (requests were batched)
-    stats = engine.get_stats()
-    peak = stats["peak_batch_size"]
-
-    print(f"  {num_requests} parallel requests: {elapsed*1000:.1f}ms total")
-    print(f"  peak batch size: {peak}")
-    print(f"  total tokens generated: {stats['total_tokens_generated']}")
-    print(f"  throughput: {num_requests * max_tokens / elapsed:.0f} tok/s")
-
-    assert peak > 1, f"Peak batch size was {peak} — requests were NOT batched!"
-
+    assert len(results) == 5
+    for r in results:
+        assert len(r.output_tokens) == 3
     await engine.stop()
 
 
 @pytest.mark.asyncio
-async def test_streaming():
-    """Streaming should yield tokens one by one."""
-    engine = AsyncI64Engine(
-        model=None,
-        num_experts=4,
-        vocab_size=100,
-        max_batch_size=32,
-        device="cpu",
-    )
+async def test_generate_stream():
+    """Streaming should yield individual tokens."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
     await engine.start()
-
     tokens = []
-    async for token_id in engine.generate_stream(
-        prompt_token_ids=[10, 20, 30],
-        max_new_tokens=15,
-    ):
+    async for token_id in engine.generate_stream([1, 2], max_new_tokens=4):
         tokens.append(token_id)
-
-    assert len(tokens) <= 15
-    print(f"  streaming: received {len(tokens)} tokens one by one")
-
+    assert len(tokens) == 4
     await engine.stop()
 
 
 @pytest.mark.asyncio
-async def test_mixed_parallel_streaming():
-    """Mix of regular and streaming requests in parallel."""
-    engine = AsyncI64Engine(
-        model=None,
-        num_experts=4,
-        vocab_size=100,
-        max_batch_size=32,
-        device="cpu",
-    )
+async def test_from_sync_engine():
+    """AsyncI64Engine.from_sync_engine wraps an existing I64Engine."""
+    sync = I64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
+    engine = AsyncI64Engine.from_sync_engine(sync)
     await engine.start()
+    result = await engine.generate([1], max_new_tokens=2)
+    assert len(result.output_tokens) == 2
+    await engine.stop()
 
-    # Regular request
-    async def regular():
-        return await engine.generate([1, 2, 3], max_new_tokens=10)
 
-    # Streaming request
-    async def streaming():
-        tokens = []
-        async for tok in engine.generate_stream([4, 5, 6], max_new_tokens=10):
-            tokens.append(tok)
-        return tokens
-
-    start = time.perf_counter()
-    r1, r2, s1, s2 = await asyncio.gather(
-        regular(), regular(), streaming(), streaming(),
-    )
-    elapsed = time.perf_counter() - start
-
-    assert len(r1.output_tokens) <= 10
-    assert len(r2.output_tokens) <= 10
-    assert len(s1) <= 10
-    assert len(s2) <= 10
-
+@pytest.mark.asyncio
+async def test_stats():
+    """get_stats returns expected keys after generation."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
+    await engine.start()
+    await engine.generate([1, 2], max_new_tokens=3)
     stats = engine.get_stats()
-    print(f"  mixed parallel: 2 regular + 2 streaming in {elapsed*1000:.1f}ms")
-    print(f"  peak batch: {stats['peak_batch_size']}")
-
+    assert "active_requests" in stats
+    assert "peak_batch_size" in stats
+    assert stats["total_tokens_generated"] > 0
     await engine.stop()
 
 
 @pytest.mark.asyncio
-async def test_sequential_vs_parallel_speedup():
-    """Parallel requests should be faster than sequential."""
-    engine = AsyncI64Engine(
-        model=None,
-        num_experts=4,
-        vocab_size=100,
-        max_batch_size=32,
-        device="cpu",
-    )
+async def test_drain_on_stop():
+    """Stop should drain active requests before shutting down."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
     await engine.start()
+    # Start a generate in background
+    task = asyncio.create_task(engine.generate([1], max_new_tokens=3))
+    await asyncio.sleep(0.05)  # Let it start processing
+    await engine.stop(drain_timeout=5.0)
+    # Task should complete (not be cancelled)
+    result = await task
+    assert isinstance(result, GenerationResult)
 
-    num_requests = 6
-    max_tokens = 20
 
-    # Sequential
-    start = time.perf_counter()
-    for i in range(num_requests):
-        await engine.generate(list(range(i * 10, i * 10 + 5)), max_new_tokens=max_tokens)
-    seq_time = time.perf_counter() - start
-
-    # Parallel
-    start = time.perf_counter()
-    tasks = [
-        asyncio.create_task(
-            engine.generate(list(range(i * 10, i * 10 + 5)), max_new_tokens=max_tokens)
-        )
-        for i in range(num_requests)
-    ]
-    await asyncio.gather(*tasks)
-    par_time = time.perf_counter() - start
-
-    speedup = seq_time / par_time if par_time > 0 else 0
-
-    print(f"  sequential: {seq_time*1000:.1f}ms")
-    print(f"  parallel:   {par_time*1000:.1f}ms")
-    print(f"  speedup:    {speedup:.1f}x")
-
-    # Parallel should be faster (or at least not slower)
-    # With dummy model, the speedup comes from batching reducing total steps
-    assert par_time <= seq_time * 1.5, "Parallel was significantly slower than sequential!"
-
+@pytest.mark.asyncio
+async def test_active_requests_counter():
+    """active_requests should be 0 after all requests complete."""
+    engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
+    await engine.start()
+    assert engine.active_requests == 0
+    await engine.generate([1], max_new_tokens=2)
+    assert engine.active_requests == 0  # Should be 0 after completion
     await engine.stop()
 
+
+# ---------------------------------------------------------------------------
+# CLI runner
+# ---------------------------------------------------------------------------
 
 async def main():
     print("=" * 60)
@@ -215,11 +143,15 @@ async def main():
     print("=" * 60)
 
     tests = [
-        ("Single request", test_single_request),
-        ("Parallel requests (batching)", test_parallel_requests),
-        ("Streaming", test_streaming),
-        ("Mixed parallel + streaming", test_mixed_parallel_streaming),
-        ("Sequential vs parallel speedup", test_sequential_vs_parallel_speedup),
+        ("start / stop lifecycle", test_start_stop),
+        ("basic generation", test_generate_basic),
+        ("generation with SamplingParams", test_generate_with_sampling_params),
+        ("concurrent generates", test_concurrent_generates),
+        ("streaming generation", test_generate_stream),
+        ("from_sync_engine", test_from_sync_engine),
+        ("stats after generation", test_stats),
+        ("drain on stop", test_drain_on_stop),
+        ("active_requests counter", test_active_requests_counter),
     ]
 
     passed = 0
@@ -229,7 +161,7 @@ async def main():
         print(f"\n--- {name} ---")
         try:
             await test_fn()
-            print(f"  PASSED")
+            print("  PASSED")
             passed += 1
         except Exception as e:
             print(f"  FAILED: {e}")

@@ -272,8 +272,11 @@ class TestGenerateIntegration:
             result = engine.generate(
                 prompt_token_ids=[i + 1],
                 max_new_tokens=3,
+                sampling_params=SamplingParams(temperature=0.0),
             )
-            assert len(result.output_tokens) == 3
+            # With model=None (random logits), EOS=0 can be hit early
+            assert 1 <= len(result.output_tokens) <= 3
+            assert result.finish_reason in ("length", "stop")
 
         # No leftover state
         assert len(engine.scheduler.running) == 0

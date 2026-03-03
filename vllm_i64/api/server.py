@@ -928,6 +928,173 @@ class I64Server:
         self._priority_manager.set_priority(api_key, int(priority))
         return web.json_response({"status": "ok", "api_key": api_key, "priority": priority})
 
+    async def handle_cancel(self, request: web.Request) -> web.Response:
+        """POST /v1/cancel/{request_id} — cancel a running request."""
+        try:
+            request_id = int(request.match_info["request_id"])
+        except (KeyError, ValueError):
+            return web.json_response(
+                {"error": {"message": "Invalid request_id", "type": "invalid_request_error"}},
+                status=400,
+            )
+        await self.async_engine.cancel_request(request_id)
+        return web.json_response({"status": "ok", "cancelled": request_id})
+
+    async def handle_ws_completions(self, request: web.Request) -> web.WebSocketResponse:
+        """WebSocket /v1/ws/completions — streaming via WebSocket."""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    body = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    await ws.send_json({"error": {"message": "Invalid JSON", "type": "invalid_request_error"}})
+                    continue
+
+                prompt = body.get("prompt")
+                if not prompt:
+                    await ws.send_json({"error": {"message": "Missing 'prompt'", "type": "invalid_request_error"}})
+                    continue
+
+                req = CompletionRequest(
+                    prompt=prompt,
+                    max_tokens=body.get("max_tokens", 256),
+                    temperature=body.get("temperature", 0.8),
+                    top_k=body.get("top_k", 50),
+                    top_p=body.get("top_p", 0.9),
+                    stream=True,
+                )
+
+                error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
+                if error:
+                    await ws.send_json({"error": {"message": error, "type": "invalid_request_error"}})
+                    continue
+
+                stream_id = self._next_request_id()
+                created = int(time.time())
+                prompt_ids = self._tokenize(prompt)
+
+                try:
+                    async for token_id in self.async_engine.generate_stream(
+                        prompt_token_ids=prompt_ids,
+                        max_new_tokens=req.max_tokens,
+                        sampling_params=req.to_sampling_params(tokenizer=self.tokenizer),
+                    ):
+                        token_text = self._detokenize([token_id])
+                        await ws.send_json({
+                            "id": stream_id,
+                            "object": "text_completion.chunk",
+                            "created": created,
+                            "model": self.model_name,
+                            "choices": [{"index": 0, "text": token_text, "finish_reason": None}],
+                        })
+                    await ws.send_json({
+                        "id": stream_id,
+                        "object": "text_completion.chunk",
+                        "created": created,
+                        "model": self.model_name,
+                        "choices": [{"index": 0, "text": "", "finish_reason": "length"}],
+                        "done": True,
+                    })
+                except Exception as e:
+                    await ws.send_json({"error": {"message": str(e), "type": "server_error"}})
+            elif msg.type == web.WSMsgType.ERROR:
+                break
+
+        return ws
+
+    async def handle_openapi(self, request: web.Request) -> web.Response:
+        """GET /docs — OpenAPI 3.0 spec."""
+        spec = {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "vllm-i64 API",
+                "version": "0.1.0",
+                "description": "Integer-first inference engine for token-routed language models",
+            },
+            "paths": {
+                "/v1/completions": {
+                    "post": {
+                        "summary": "Create completion",
+                        "requestBody": {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/CompletionRequest"}}}},
+                        "responses": {"200": {"description": "Completion response"}},
+                    }
+                },
+                "/v1/chat/completions": {
+                    "post": {
+                        "summary": "Create chat completion",
+                        "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"messages": {"type": "array"}, "max_tokens": {"type": "integer"}}}}}},
+                        "responses": {"200": {"description": "Chat completion response"}},
+                    }
+                },
+                "/v1/cancel/{request_id}": {
+                    "post": {
+                        "summary": "Cancel a running request",
+                        "parameters": [{"name": "request_id", "in": "path", "required": True, "schema": {"type": "integer"}}],
+                        "responses": {"200": {"description": "Cancellation confirmed"}},
+                    }
+                },
+                "/v1/batch": {
+                    "post": {
+                        "summary": "Batch completions",
+                        "responses": {"200": {"description": "Batch response"}},
+                    }
+                },
+                "/v1/models": {
+                    "get": {
+                        "summary": "List models",
+                        "responses": {"200": {"description": "Model list"}},
+                    }
+                },
+                "/v1/ws/completions": {
+                    "get": {
+                        "summary": "WebSocket streaming completions",
+                        "description": "Send JSON messages with prompt/max_tokens, receive streamed token chunks",
+                    }
+                },
+                "/health": {
+                    "get": {
+                        "summary": "Health check",
+                        "responses": {"200": {"description": "Health status"}},
+                    }
+                },
+                "/v1/metrics": {
+                    "get": {
+                        "summary": "Latency and usage metrics",
+                        "responses": {"200": {"description": "Metrics data"}},
+                    }
+                },
+            },
+            "components": {
+                "schemas": {
+                    "CompletionRequest": {
+                        "type": "object",
+                        "required": ["prompt"],
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "max_tokens": {"type": "integer", "default": 256},
+                            "temperature": {"type": "number", "default": 0.8},
+                            "top_k": {"type": "integer", "default": 50},
+                            "top_p": {"type": "number", "default": 0.9},
+                            "min_p": {"type": "number", "default": 0.0},
+                            "typical_p": {"type": "number", "default": 1.0},
+                            "repetition_penalty": {"type": "number", "default": 1.1},
+                            "min_tokens": {"type": "integer", "default": 0},
+                            "stream": {"type": "boolean", "default": False},
+                            "stop": {"type": "array", "items": {"type": "string"}},
+                            "seed": {"type": "integer"},
+                            "logit_bias": {"type": "object"},
+                            "frequency_penalty": {"type": "number", "default": 0.0},
+                            "presence_penalty": {"type": "number", "default": 0.0},
+                        },
+                    },
+                },
+            },
+        }
+        return web.json_response(spec)
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
         middlewares = [make_cors_middleware()]
@@ -958,6 +1125,9 @@ class I64Server:
         app.router.add_get("/v1/metrics", self.handle_metrics)
         app.router.add_get("/v1/logs", self.handle_request_log)
         app.router.add_post("/v1/priority", self.handle_priority)
+        app.router.add_post("/v1/cancel/{request_id}", self.handle_cancel)
+        app.router.add_get("/v1/ws/completions", self.handle_ws_completions)
+        app.router.add_get("/docs", self.handle_openapi)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app
@@ -991,6 +1161,7 @@ class I64Server:
         logger.info(f"  http://{self.host}:{self.port}")
         logger.info(f"  POST /v1/completions | POST /v1/chat/completions | GET /health")
         logger.info(f"  POST /v1/batch | GET /v1/models/{{id}} | GET /v1/metrics | GET /v1/logs")
+        logger.info(f"  POST /v1/cancel/{{id}} | WS /v1/ws/completions | GET /docs")
         logger.info(f"  mode: async continuous batching")
         app = self.create_app()
 

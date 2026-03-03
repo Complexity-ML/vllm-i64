@@ -22,6 +22,7 @@ INL - 2025
 """
 
 import numpy as np
+from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from enum import IntEnum
@@ -165,13 +166,13 @@ class I64Scheduler:
         self.enable_preemption = enable_preemption
 
         # Request queues (integer indexed)
-        self.pending: List[I64Request] = []
+        self.pending: deque[I64Request] = deque()
         self.running: List[I64Request] = []
         self.finished: List[I64Request] = []
         self.preempted: List[I64Request] = []
 
         # KV cache block allocator (integer)
-        self.free_blocks = list(range(max_kv_blocks))
+        self.free_blocks = deque(range(max_kv_blocks))
         self.max_kv_blocks = max_kv_blocks
 
         # Integer counters
@@ -206,15 +207,14 @@ class I64Scheduler:
         )
         self.pending.append(req)
         # Sort pending by priority, then arrival order (stable sort)
-        self.pending.sort(key=lambda r: (r.priority, r.arrival_step))
+        self.pending = deque(sorted(self.pending, key=lambda r: (r.priority, r.arrival_step)))
         return request_id
 
     def _allocate_kv_blocks(self, num_blocks: int) -> Optional[List[int]]:
         """Allocate KV cache blocks. Pure integer."""
         if len(self.free_blocks) < num_blocks:
             return None
-        allocated = self.free_blocks[:num_blocks]
-        self.free_blocks = self.free_blocks[num_blocks:]
+        allocated = [self.free_blocks.popleft() for _ in range(num_blocks)]
         return allocated
 
     def _free_kv_blocks(self, block_ids: List[int]):
@@ -297,7 +297,7 @@ class I64Scheduler:
             req.priority = min(req.priority, -1)  # Boost priority after preemption
             self.pending.append(req)
         self.preempted.clear()
-        self.pending.sort(key=lambda r: (r.priority, r.arrival_step))
+        self.pending = deque(sorted(self.pending, key=lambda r: (r.priority, r.arrival_step)))
 
         # Try to admit new requests
         prefill_token_budget = self.max_prefill_tokens
@@ -318,7 +318,7 @@ class I64Scheduler:
             req.kv_block_ids = blocks
             req.status = RequestStatus.RUNNING
             self.running.append(req)
-            self.pending.pop(0)
+            self.pending.popleft()
 
         if not self.running:
             return None

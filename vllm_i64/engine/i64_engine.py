@@ -63,7 +63,7 @@ class AdaptiveBatchSizer:
         if len(self._throughputs) < self.window:
             return self.current
         avg_tps = sum(self._throughputs) / len(self._throughputs)
-        recent_tps = sum(self._throughputs[-5:]) / 5
+        recent_tps = sum(list(self._throughputs)[-5:]) / 5
 
         if recent_tps > avg_tps * 1.05:
             self.current = min(self.current + 1, self.max_size)
