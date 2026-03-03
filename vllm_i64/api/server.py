@@ -261,6 +261,11 @@ class I64Server:
             return self.tokenizer.decode(token_ids)
         return bytes(token_ids).decode("utf-8", errors="replace")
 
+    async def _detokenize_async(self, token_ids: List[int]) -> str:
+        """Detokenize in thread pool to avoid blocking the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._tokenize_pool, self._detokenize, token_ids)
+
     def _detokenize_token(self, token_id: int) -> str:
         """Single token → text with cache. For streaming."""
         text = self._detok_cache.get(token_id)
@@ -1102,7 +1107,7 @@ class I64Server:
                         max_new_tokens=req.max_tokens,
                         sampling_params=req.to_sampling_params(tokenizer=self.tokenizer),
                     ):
-                        token_text = self._detokenize([token_id])
+                        token_text = self._detokenize_token(token_id)
                         await ws.send_json({
                             "id": stream_id,
                             "object": "text_completion.chunk",

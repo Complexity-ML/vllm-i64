@@ -131,6 +131,12 @@ class I64Engine:
         # Expert mask for routing (i64)
         self.expert_mask = np.int64(num_experts - 1)
 
+        # Persistent input buffers (avoid per-step allocation)
+        _buf_device = device if device == "cpu" or torch.cuda.is_available() else "cpu"
+        _max_tokens = max_batch_size * max_seq_len
+        self._buf_token_ids = torch.zeros(_max_tokens, dtype=torch.long, device=_buf_device)
+        self._buf_positions = torch.zeros(_max_tokens, dtype=torch.long, device=_buf_device)
+
         # Step counter (integer)
         self.total_steps: int = 0
         self.total_tokens_generated: int = 0
@@ -904,8 +910,15 @@ class I64Engine:
         """
         Run model forward pass with KV cache support.
         """
-        token_ids = torch.from_numpy(batch.token_ids).to(self.device)
-        positions = torch.from_numpy(batch.positions).to(self.device)
+        n = batch.token_ids.shape[0]
+        if n <= self._buf_token_ids.shape[0]:
+            self._buf_token_ids[:n].copy_(torch.from_numpy(batch.token_ids))
+            self._buf_positions[:n].copy_(torch.from_numpy(batch.positions))
+            token_ids = self._buf_token_ids[:n]
+            positions = self._buf_positions[:n]
+        else:
+            token_ids = torch.from_numpy(batch.token_ids).to(self.device)
+            positions = torch.from_numpy(batch.positions).to(self.device)
 
         # Build KV cache metadata
         seq_ids = None

@@ -69,6 +69,15 @@ def cmd_serve(args):
     )
     model.eval()
 
+    # torch.compile for kernel fusion (CPU + GPU)
+    if getattr(args, 'compile', False):
+        compile_mode = getattr(args, 'compile_mode', 'reduce-overhead')
+        # CPU backend doesn't support reduce-overhead (CUDA graphs)
+        if device == "cpu" and compile_mode == "reduce-overhead":
+            compile_mode = "default"
+        print(f"  torch.compile: mode={compile_mode}")
+        model = torch.compile(model, mode=compile_mode)
+
     # Load tokenizer (from checkpoint dir if overridden)
     tokenizer = None
     if args.checkpoint:
@@ -265,6 +274,11 @@ def main():
                          help="Path to draft model for speculative decoding")
     p_serve.add_argument("--num-speculative-tokens", type=int, default=5,
                          help="Number of tokens to speculate ahead")
+    p_serve.add_argument("--compile", action="store_true",
+                         help="Enable torch.compile for kernel fusion (10-30%% speedup)")
+    p_serve.add_argument("--compile-mode", default="reduce-overhead",
+                         choices=["default", "reduce-overhead", "max-autotune"],
+                         help="torch.compile mode (default: reduce-overhead)")
     p_serve.add_argument("--enable-swap", action="store_true",
                          help="Enable swap-to-CPU for KV cache overflow")
     p_serve.add_argument("--api-key", default=None,
