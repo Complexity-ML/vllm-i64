@@ -503,23 +503,30 @@ class TestRequestCache:
     def test_cache_deterministic(self):
         """Should cache requests with temperature=0."""
         cache = RequestCache()
-        cache.put("hello", 0.0, 50, 0.9, 10, {"result": "cached"})
-        assert cache.get("hello", 0.0, 50, 0.9, 10) == {"result": "cached"}
+        cache.put("hello", 10, {"result": "cached"}, temperature=0.0, top_k=50, top_p=0.9)
+        assert cache.get("hello", 10, temperature=0.0, top_k=50, top_p=0.9) == {"result": "cached"}
 
     def test_no_cache_nondeterministic(self):
         """Should NOT cache requests with temperature > 0."""
         cache = RequestCache()
-        cache.put("hello", 0.8, 50, 0.9, 10, {"result": "cached"})
-        assert cache.get("hello", 0.8, 50, 0.9, 10) is None
+        cache.put("hello", 10, {"result": "cached"}, temperature=0.8, top_k=50, top_p=0.9)
+        assert cache.get("hello", 10, temperature=0.8, top_k=50, top_p=0.9) is None
 
     def test_eviction_order(self):
         """Oldest entries should be evicted first (O(1) with OrderedDict)."""
         cache = RequestCache(max_size=2)
-        cache.put("a", 0.0, 50, 0.9, 10, {"r": "a"})
-        cache.put("b", 0.0, 50, 0.9, 10, {"r": "b"})
-        cache.put("c", 0.0, 50, 0.9, 10, {"r": "c"})  # Should evict "a"
-        assert cache.get("a", 0.0, 50, 0.9, 10) is None
-        assert cache.get("b", 0.0, 50, 0.9, 10) is not None
+        cache.put("a", 10, {"r": "a"}, temperature=0.0, top_k=50, top_p=0.9)
+        cache.put("b", 10, {"r": "b"}, temperature=0.0, top_k=50, top_p=0.9)
+        cache.put("c", 10, {"r": "c"}, temperature=0.0, top_k=50, top_p=0.9)  # Should evict "a"
+        assert cache.get("a", 10, temperature=0.0, top_k=50, top_p=0.9) is None
+        assert cache.get("b", 10, temperature=0.0, top_k=50, top_p=0.9) is not None
+
+    def test_different_sampling_params_not_shared(self):
+        """Different sampling params should NOT share cache entries."""
+        cache = RequestCache()
+        cache.put("hello", 10, {"result": "a"}, temperature=0.0, min_p=0.1)
+        assert cache.get("hello", 10, temperature=0.0, min_p=0.2) is None
+        assert cache.get("hello", 10, temperature=0.0, min_p=0.1) == {"result": "a"}
 
 
 class TestUsageTracker:

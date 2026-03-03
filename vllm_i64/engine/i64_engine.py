@@ -184,6 +184,9 @@ class I64Engine:
         # === Metrics ===
         self.metrics = None
 
+        # === Adaptive batch sizing ===
+        self._batch_sizer = AdaptiveBatchSizer(initial=max_batch_size)
+
         # === LoRA Manager ===
         self._lora_manager = None
 
@@ -554,6 +557,8 @@ class I64Engine:
 
         Returns {request_id: generated_token_id} — all integers.
         """
+        _step_start = time.perf_counter()
+
         # 0. Clean up finished from PREVIOUS step (free slots, clear per-request state)
         #    Must happen before schedule() so that newly finished requests remain
         #    visible to callers (generate(), _engine_loop) after this step returns.
@@ -657,11 +662,29 @@ class I64Engine:
             self.total_tokens_generated += len(result)
             return result
 
+        # Pin running sequences so LRU eviction can't corrupt active requests
+        if self.kv_cache is not None:
+            self.kv_cache._pinned_seq_ids = {
+                self._request_to_slot.get(int(rid), -1) for rid in batch.request_ids
+            }
+            self.kv_cache._pinned_seq_ids.discard(-1)
+
         # 2. Model forward (fp16) — the ONLY float step
-        if self.model is not None:
-            logits = self._model_forward(batch)
-        else:
-            logits = torch.randn(batch.num_requests, self.vocab_size)
+        try:
+            if self.model is not None:
+                logits = self._model_forward(batch)
+            else:
+                logits = torch.randn(batch.num_requests, self.vocab_size)
+        except RuntimeError as e:
+            logger.error(f"Model forward failed: {e}")
+            # Unpin and return empty — requests stay running for next step retry
+            if self.kv_cache is not None:
+                self.kv_cache._pinned_seq_ids.clear()
+            return {}
+
+        # Unpin after forward
+        if self.kv_cache is not None:
+            self.kv_cache._pinned_seq_ids.clear()
 
         # 3. Extract last-token logits per request (for prefill: many tokens → 1 logit)
         if batch.tokens_per_request is not None and logits.shape[0] != batch.num_requests:
@@ -841,6 +864,14 @@ class I64Engine:
         self.total_steps += 1
         self.total_tokens_generated += len(result)
 
+        # Adaptive batch sizing: record throughput and adjust
+        if result:
+            step_elapsed = (time.perf_counter() - _step_start) * 1000
+            self._batch_sizer.record(len(result), step_elapsed)
+            new_max = self._batch_sizer.adjust()
+            if new_max != self.scheduler.max_batch_size:
+                self.scheduler.max_batch_size = new_max
+
         return result
 
     def _model_forward(self, batch: I64Batch) -> torch.Tensor:
@@ -1016,6 +1047,7 @@ class AsyncI64Engine:
         # Stats
         self.active_requests: int = 0
         self.peak_batch_size: int = 0
+        self.max_queue_depth: int = max_batch_size * 8  # Backpressure limit
 
     @classmethod
     def from_sync_engine(cls, engine: 'I64Engine') -> 'AsyncI64Engine':
@@ -1029,6 +1061,7 @@ class AsyncI64Engine:
         instance._draining = False
         instance.active_requests = 0
         instance.peak_batch_size = 0
+        instance.max_queue_depth = engine.scheduler.max_batch_size * 8
         return instance
 
     async def start(self):
@@ -1088,6 +1121,8 @@ class AsyncI64Engine:
         """
         if self._draining:
             raise RuntimeError("Engine is shutting down, not accepting new requests")
+        if self.active_requests >= self.max_queue_depth:
+            raise RuntimeError(f"Queue full ({self.active_requests}/{self.max_queue_depth}), try again later")
 
         loop = asyncio.get_running_loop()
         future = loop.create_future()

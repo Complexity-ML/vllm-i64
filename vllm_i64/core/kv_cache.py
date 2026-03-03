@@ -100,6 +100,7 @@ class PagedKVCache:
         self._eviction_count: int = 0          # total evictions performed
         self._evicted_seq_ids: List[int] = []  # recently evicted (for scheduler)
         self._active_seq_ids: set = set()      # O(1) tracking of allocated seqs
+        self._pinned_seq_ids: set = set()      # Sequences protected from eviction
         # Min-heap of (tick, seq_id) for O(log n) eviction candidate selection
         self._lru_heap: List[Tuple[int, int]] = []
 
@@ -156,8 +157,8 @@ class PagedKVCache:
                 continue
             if self._last_access.get(victim_sid, 0) != tick:
                 continue  # Stale — this seq was touched again after this entry
-            if victim_sid == protect_seq_id:
-                # Re-push protected seq so it's not lost from the heap
+            if victim_sid == protect_seq_id or victim_sid in self._pinned_seq_ids:
+                # Re-push protected/pinned seq so it's not lost from the heap
                 heapq.heappush(self._lru_heap, (tick, victim_sid))
                 continue
 
@@ -331,14 +332,28 @@ class PagedKVCache:
         block_map_tensor = self.block_table[seq_id, unique_list]
         block_map = {bidx: int(block_map_tensor[i]) for i, bidx in enumerate(unique_list)}
 
-        # Write using cached block map (no per-token .item())
+        # Write using cached block map — group by physical block for fewer GPU ops
         k_kv = k.to(self.kv_dtype)
         v_kv = v.to(self.kv_dtype)
-        for t in range(n):
-            physical_block = block_map[int(block_indices[t])]
-            off = int(offsets[t])
-            self.k_caches[layer_idx][physical_block, off, :, :] = k_kv[t]
-            self.v_caches[layer_idx][physical_block, off, :, :] = v_kv[t]
+        if n <= 4:
+            # Small batch: direct writes are faster than grouping overhead
+            for t in range(n):
+                physical_block = block_map[int(block_indices[t])]
+                off = int(offsets[t])
+                self.k_caches[layer_idx][physical_block, off, :, :] = k_kv[t]
+                self.v_caches[layer_idx][physical_block, off, :, :] = v_kv[t]
+        else:
+            # Batch by physical block: group writes to same block
+            from collections import defaultdict
+            block_groups: dict = defaultdict(list)
+            for t in range(n):
+                pb = block_map[int(block_indices[t])]
+                block_groups[pb].append((int(offsets[t]), t))
+            for pb, entries in block_groups.items():
+                offs = [e[0] for e in entries]
+                idxs = [e[1] for e in entries]
+                self.k_caches[layer_idx][pb, offs, :, :] = k_kv[idxs]
+                self.v_caches[layer_idx][pb, offs, :, :] = v_kv[idxs]
 
         max_pos = int(pos_np.max()) + 1
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), max_pos)
@@ -372,6 +387,8 @@ class PagedKVCache:
         self._block_to_prefix: Dict[int, int] = {}
         # Reference count per prefix hash
         self._prefix_refcount: Dict[int, int] = {}
+        # Maps prefix_hash → actual token tuple for collision detection
+        self._prefix_hash_to_tokens: Dict[int, tuple] = {}
 
     @property
     def prefix_cache_enabled(self) -> bool:
@@ -408,6 +425,10 @@ class PagedKVCache:
             prefix_hash = self._hash_token_block(block_tokens)
 
             if prefix_hash in self._prefix_hash_to_blocks:
+                # Collision detection: verify actual tokens match
+                cached_tokens = self._prefix_hash_to_tokens.get(prefix_hash)
+                if cached_tokens is not None and cached_tokens != tuple(block_tokens):
+                    break  # Hash collision — don't reuse wrong KV blocks
                 # Reuse: point this seq's block table to existing physical block
                 physical_block = self._prefix_hash_to_blocks[prefix_hash][0]
                 self.block_table[seq_id, block_idx] = physical_block
@@ -442,6 +463,7 @@ class PagedKVCache:
                 self._prefix_hash_to_blocks[prefix_hash] = [physical_block]
                 self._block_to_prefix[physical_block] = prefix_hash
                 self._prefix_refcount[prefix_hash] = 1
+                self._prefix_hash_to_tokens[prefix_hash] = tuple(block_tokens)
 
     def _zero_block(self, block_id: int):
         """Zero out K/V data in a physical block to prevent stale data leaking."""

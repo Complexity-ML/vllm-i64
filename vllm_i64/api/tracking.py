@@ -52,15 +52,20 @@ class RequestCache:
         self.ttl = ttl_seconds
         self._cache: OrderedDict = OrderedDict()  # fingerprint → (result_dict, timestamp)
 
-    def _fingerprint(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int) -> str:
+    def _fingerprint(self, prompt: str, max_tokens: int, **sampling_kwargs) -> str:
         """Create a cache key from request params. Only cache deterministic requests (temp=0)."""
+        temperature = sampling_kwargs.get("temperature", 0.0)
         if temperature > 0:
             return ""  # Don't cache non-deterministic requests
-        key = f"{prompt}|{temperature}|{top_k}|{top_p}|{max_tokens}"
+        # Include ALL sampling params to prevent wrong cache hits
+        parts = [prompt, str(max_tokens)]
+        for k in sorted(sampling_kwargs.keys()):
+            parts.append(f"{k}={sampling_kwargs[k]}")
+        key = "|".join(parts)
         return hashlib.sha256(key.encode()).hexdigest()
 
-    def get(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int) -> Optional[dict]:
-        fp = self._fingerprint(prompt, temperature, top_k, top_p, max_tokens)
+    def get(self, prompt: str, max_tokens: int, **sampling_kwargs) -> Optional[dict]:
+        fp = self._fingerprint(prompt, max_tokens, **sampling_kwargs)
         if not fp or fp not in self._cache:
             return None
         result, ts = self._cache[fp]
@@ -71,8 +76,8 @@ class RequestCache:
         self._cache.move_to_end(fp)
         return result
 
-    def put(self, prompt: str, temperature: float, top_k: int, top_p: float, max_tokens: int, result: dict):
-        fp = self._fingerprint(prompt, temperature, top_k, top_p, max_tokens)
+    def put(self, prompt: str, max_tokens: int, result: dict, **sampling_kwargs):
+        fp = self._fingerprint(prompt, max_tokens, **sampling_kwargs)
         if not fp:
             return
         # Evict oldest (first item) if at capacity — O(1)

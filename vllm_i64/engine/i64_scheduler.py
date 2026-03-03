@@ -461,10 +461,11 @@ class I64Scheduler:
             if req.request_id in new_token_ids:
                 # Update chunked prefill progress
                 if not req.prefill_complete:
-                    # This was a prefill step — advance progress
-                    # The scheduler assigned this many tokens:
-                    req.prefill_progress = req.num_prompt_tokens  # simplified: mark complete
-                    req.seq_pos = req.num_prompt_tokens
+                    # Advance by the actual chunk size scheduled (not jump to complete)
+                    remaining = req.num_prompt_tokens - req.prefill_progress
+                    chunk = min(remaining, self.max_prefill_tokens)
+                    req.prefill_progress = min(req.prefill_progress + max(chunk, 1), req.num_prompt_tokens)
+                    req.seq_pos = req.prefill_progress
 
                 token_id = new_token_ids[req.request_id]
                 req.output_token_ids.append(token_id)
@@ -511,8 +512,9 @@ class _PendingProxy:
         return bool(self._sched._pending_heap)
 
     def __iter__(self):
-        # Yield requests in priority order (without mutating heap)
-        for _, _, _, req in sorted(self._sched._pending_heap):
+        # Yield pending requests without sorting (O(n) instead of O(n log n))
+        # Callers that need priority order should use the scheduler directly
+        for _, _, _, req in self._sched._pending_heap:
             if req.status == RequestStatus.PENDING:
                 yield req
 

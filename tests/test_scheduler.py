@@ -106,12 +106,21 @@ class TestSchedulerPriority:
         assert int(batch.request_ids[0]) == id0
 
     def test_pending_sorted_by_priority_then_arrival(self):
-        sched = make_scheduler()
-        sched.add_request(prompt(4), priority=2)
-        sched.add_request(prompt(4), priority=0)
-        sched.add_request(prompt(4), priority=-1)
-        priorities = [r.priority for r in sched.pending]
-        assert priorities == [-1, 0, 2]
+        sched = make_scheduler(max_batch_size=1)
+        sched.add_request(prompt(4), priority=2, max_new_tokens=1)
+        sched.add_request(prompt(4), priority=0, max_new_tokens=1)
+        sched.add_request(prompt(4), priority=-1, max_new_tokens=1)
+        # Verify heap pops in priority order via scheduling
+        scheduled_priorities = []
+        for _ in range(3):
+            batch = sched.schedule()
+            assert batch is not None
+            req = sched.running[-1]
+            scheduled_priorities.append(req.priority)
+            # Complete prefill + generate 1 token to finish
+            sched.update_after_step({req.request_id: 999})
+            sched.schedule()  # move finished out, free slot
+        assert scheduled_priorities == [-1, 0, 2]
 
 
 # ===========================================================================

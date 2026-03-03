@@ -512,7 +512,15 @@ class I64Server:
                 return response
 
             # Check dedup cache
-            cached = self._request_cache.get(req.prompt, req.temperature, req.top_k, req.top_p, req.max_tokens)
+            cache_kwargs = dict(
+                temperature=req.temperature, top_k=req.top_k, top_p=req.top_p,
+                min_p=getattr(req, 'min_p', 0.0), typical_p=getattr(req, 'typical_p', 1.0),
+                repetition_penalty=getattr(req, 'repetition_penalty', 1.0),
+                frequency_penalty=getattr(req, 'frequency_penalty', 0.0),
+                presence_penalty=getattr(req, 'presence_penalty', 0.0),
+                seed=getattr(req, 'seed', None),
+            )
+            cached = self._request_cache.get(req.prompt, req.max_tokens, **cache_kwargs)
             if cached is not None:
                 return web.json_response(cached)
 
@@ -520,7 +528,7 @@ class I64Server:
             result_dict = result.to_dict()
 
             # Store in dedup cache
-            self._request_cache.put(req.prompt, req.temperature, req.top_k, req.top_p, req.max_tokens, result_dict)
+            self._request_cache.put(req.prompt, req.max_tokens, result_dict, **cache_kwargs)
 
             return web.json_response(result_dict)
         except (ConnectionResetError, ConnectionError):

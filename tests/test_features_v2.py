@@ -166,51 +166,51 @@ class TestRequestCache:
     def test_cache_miss(self):
         """Empty cache returns None."""
         cache = RequestCache()
-        assert cache.get("hello", 0.0, 50, 0.9, 256) is None
+        assert cache.get("hello", 256, temperature=0.0, top_k=50, top_p=0.9) is None
 
     def test_cache_hit_deterministic(self):
         """Deterministic requests (temp=0) are cached."""
         cache = RequestCache()
         result = {"text": "output"}
-        cache.put("hello", 0.0, 50, 0.9, 256, result)
-        assert cache.get("hello", 0.0, 50, 0.9, 256) == result
+        cache.put("hello", 256, result, temperature=0.0, top_k=50, top_p=0.9)
+        assert cache.get("hello", 256, temperature=0.0, top_k=50, top_p=0.9) == result
 
     def test_cache_skip_nondeterministic(self):
         """Non-deterministic requests (temp>0) are NOT cached."""
         cache = RequestCache()
         result = {"text": "output"}
-        cache.put("hello", 0.8, 50, 0.9, 256, result)
-        assert cache.get("hello", 0.8, 50, 0.9, 256) is None
+        cache.put("hello", 256, result, temperature=0.8, top_k=50, top_p=0.9)
+        assert cache.get("hello", 256, temperature=0.8, top_k=50, top_p=0.9) is None
 
     def test_cache_different_params(self):
         """Different params produce different cache keys."""
         cache = RequestCache()
-        cache.put("hello", 0.0, 50, 0.9, 256, {"a": 1})
-        cache.put("hello", 0.0, 50, 0.9, 128, {"a": 2})
-        assert cache.get("hello", 0.0, 50, 0.9, 256) == {"a": 1}
-        assert cache.get("hello", 0.0, 50, 0.9, 128) == {"a": 2}
+        cache.put("hello", 256, {"a": 1}, temperature=0.0, top_k=50, top_p=0.9)
+        cache.put("hello", 128, {"a": 2}, temperature=0.0, top_k=50, top_p=0.9)
+        assert cache.get("hello", 256, temperature=0.0, top_k=50, top_p=0.9) == {"a": 1}
+        assert cache.get("hello", 128, temperature=0.0, top_k=50, top_p=0.9) == {"a": 2}
 
     def test_cache_expiration(self):
         """Expired entries return None."""
         cache = RequestCache(ttl_seconds=0.01)
-        cache.put("hello", 0.0, 50, 0.9, 256, {"text": "cached"})
-        assert cache.get("hello", 0.0, 50, 0.9, 256) is not None
+        cache.put("hello", 256, {"text": "cached"}, temperature=0.0, top_k=50, top_p=0.9)
+        assert cache.get("hello", 256, temperature=0.0, top_k=50, top_p=0.9) is not None
         time.sleep(0.02)
-        assert cache.get("hello", 0.0, 50, 0.9, 256) is None
+        assert cache.get("hello", 256, temperature=0.0, top_k=50, top_p=0.9) is None
 
     def test_cache_eviction(self):
         """Cache evicts oldest entry when full."""
         cache = RequestCache(max_size=2)
-        cache.put("a", 0.0, 50, 0.9, 256, {"a": 1})
-        cache.put("b", 0.0, 50, 0.9, 256, {"b": 2})
+        cache.put("a", 256, {"a": 1}, temperature=0.0, top_k=50, top_p=0.9)
+        cache.put("b", 256, {"b": 2}, temperature=0.0, top_k=50, top_p=0.9)
         assert cache.size == 2
-        cache.put("c", 0.0, 50, 0.9, 256, {"c": 3})
+        cache.put("c", 256, {"c": 3}, temperature=0.0, top_k=50, top_p=0.9)
         assert cache.size == 2  # Still 2, oldest evicted
 
     def test_cache_hit_rate_info(self):
         """hit_rate_info returns cache stats."""
         cache = RequestCache(max_size=100)
-        cache.put("x", 0.0, 50, 0.9, 256, {"x": 1})
+        cache.put("x", 256, {"x": 1}, temperature=0.0, top_k=50, top_p=0.9)
         info = cache.hit_rate_info
         assert info["cached_entries"] == 1
         assert info["max_size"] == 100
