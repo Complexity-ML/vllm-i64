@@ -16,7 +16,10 @@ INL - 2025
 import torch
 import heapq
 import hashlib
+import logging
 from typing import Optional, Tuple, List, Dict, Set
+
+logger = logging.getLogger(__name__)
 
 
 class PagedKVCache:
@@ -55,7 +58,9 @@ class PagedKVCache:
         self.num_blocks = num_blocks
         self.max_seqs = max_seqs
         self.compute_dtype = dtype
-        self.device = device
+
+        # Device validation with CPU fallback
+        self.device = self._resolve_device(device)
 
         # FP8 quantization: store KV in FP8 for 2x memory savings
         if kv_cache_dtype == "fp8" and device != "cpu":
@@ -120,6 +125,38 @@ class PagedKVCache:
         # free_sequence() O(1) per block and defers the GPU write to
         # the next allocation — beneficial for bulk LRU evictions.
         self._dirty_blocks: Set[int] = set()
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        """Validate device and fall back to CPU if unavailable."""
+        if device == "cpu":
+            return "cpu"
+        if device.startswith("cuda"):
+            if not torch.cuda.is_available():
+                logger.warning(
+                    "Device %r requested but CUDA is not available — falling back to cpu",
+                    device,
+                )
+                return "cpu"
+            # Validate specific device ordinal (e.g. "cuda:3")
+            if ":" in device:
+                ordinal = int(device.split(":")[1])
+                if ordinal >= torch.cuda.device_count():
+                    logger.warning(
+                        "Device %r requested but only %d GPU(s) visible — falling back to cpu",
+                        device, torch.cuda.device_count(),
+                    )
+                    return "cpu"
+            return device
+        # Unknown device string — let PyTorch try, fall back on failure
+        try:
+            torch.empty(1, device=device)
+            return device
+        except (RuntimeError, AssertionError):
+            logger.warning(
+                "Device %r is not available — falling back to cpu", device,
+            )
+            return "cpu"
 
     @property
     def num_free_blocks(self) -> int:
@@ -517,18 +554,25 @@ class PagedKVCache:
             return  # No point swapping CPU→CPU
         self._swap_enabled = True
         cpu_num_blocks = self.num_blocks
+        can_pin = torch.cuda.is_available()
         self._cpu_k_caches = [
             torch.zeros(
                 cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
                 dtype=self.kv_dtype, device="cpu",
-            ).pin_memory()
+            ).pin_memory() if can_pin else torch.zeros(
+                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
+                dtype=self.kv_dtype, device="cpu",
+            )
             for _ in range(self.num_layers)
         ]
         self._cpu_v_caches = [
             torch.zeros(
                 cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
                 dtype=self.kv_dtype, device="cpu",
-            ).pin_memory()
+            ).pin_memory() if can_pin else torch.zeros(
+                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
+                dtype=self.kv_dtype, device="cpu",
+            )
             for _ in range(self.num_layers)
         ]
         self._cpu_free_blocks = list(range(cpu_num_blocks))
