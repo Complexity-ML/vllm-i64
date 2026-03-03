@@ -88,17 +88,17 @@ class PagedKVCache:
         ]
 
         # Block table: maps (seq_id, block_idx) → physical block_id (i32)
-        # Kept on CPU — it's integer metadata, no GPU compute needed.
-        # Avoids GPU→CPU sync on every block lookup.
+        # On device (GPU when available) to avoid CPU→GPU transfer on decode hot path.
+        # Management code uses .item() for scalar reads (sync is fine, not on hot path).
         self.block_table = torch.full(
-            (max_seqs, self.max_blocks_per_seq), -1, dtype=torch.int32, device="cpu"
+            (max_seqs, self.max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
         )
 
         # Free block list (integer)
         self.free_blocks: List[int] = list(range(num_blocks))
 
-        # Sequence lengths (integer) — CPU for fast lookups without GPU sync
-        self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device="cpu")
+        # Sequence lengths (integer) — on device for flash_attn cache_seqlens
+        self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device=self.device)
 
         # ── LRU eviction tracking (all integer, heap-based O(log n)) ──
         self.enable_lru_eviction = enable_lru_eviction
@@ -125,6 +125,13 @@ class PagedKVCache:
         # free_sequence() O(1) per block and defers the GPU write to
         # the next allocation — beneficial for bulk LRU evictions.
         self._dirty_blocks: Set[int] = set()
+
+        # ── CUDA graph support ──
+        # Static buffers for block_table/seqlens used during graph replay.
+        # These keep the same tensor addresses across captures and replays.
+        self._graph_mode: bool = False
+        self._graph_block_table: Optional[torch.Tensor] = None
+        self._graph_cache_seqlens: Optional[torch.Tensor] = None
 
     @staticmethod
     def _resolve_device(device: str) -> str:
@@ -420,11 +427,94 @@ class PagedKVCache:
 
     def get_block_table_for_seqs(self, seq_ids: List[int]) -> torch.Tensor:
         """Extract block table rows for given sequences. Returns (num_seqs, max_blocks_per_seq) int32."""
+        if self._graph_mode and self._graph_block_table is not None:
+            return self._graph_block_table[:len(seq_ids)]
         return self.block_table[seq_ids]
 
     def get_cache_seqlens(self, seq_ids: List[int]) -> torch.Tensor:
         """Get current sequence lengths. Returns (num_seqs,) int32."""
+        if self._graph_mode and self._graph_cache_seqlens is not None:
+            return self._graph_cache_seqlens[:len(seq_ids)]
         return self.seq_lens[seq_ids]
+
+    def write_kv_decode(
+        self,
+        layer_idx: int,
+        seq_ids_tensor: torch.Tensor,  # (batch,) long — slot indices
+        positions: torch.Tensor,        # (batch,) long — write positions
+        k: torch.Tensor,                # (batch, num_kv_heads, head_dim)
+        v: torch.Tensor,                # (batch, num_kv_heads, head_dim)
+    ):
+        """
+        Tensor-only KV write for decode (1 token per seq). CUDA-graph compatible.
+
+        No Python loops, no .item() calls, no dynamic allocation.
+        Blocks must already be allocated (guaranteed for decode after prefill).
+        """
+        block_idx = (positions // self.block_size).long()
+        offset = (positions % self.block_size).long()
+
+        if self._graph_mode and self._graph_block_table is not None:
+            n = seq_ids_tensor.shape[0]
+            physical = self._graph_block_table[self._graph_batch_range[:n], block_idx]
+        else:
+            physical = self.block_table[seq_ids_tensor, block_idx]
+
+        physical = physical.clamp(min=0)  # Guard against -1 padding
+
+        k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
+        v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
+        self.k_caches[layer_idx][physical, offset] = k_kv
+        self.v_caches[layer_idx][physical, offset] = v_kv
+
+        # Update seqlens (tensor op, graph-safe)
+        new_lens = (positions + 1).to(torch.int32)
+        if self._graph_mode and self._graph_cache_seqlens is not None:
+            n = seq_ids_tensor.shape[0]
+            self._graph_cache_seqlens[:n] = torch.maximum(
+                self._graph_cache_seqlens[:n], new_lens
+            )
+        else:
+            self.seq_lens[seq_ids_tensor] = torch.maximum(
+                self.seq_lens[seq_ids_tensor], new_lens
+            )
+
+    def get_block_table_for_seqs_tensor(self, seq_ids_tensor: torch.Tensor) -> torch.Tensor:
+        """Block table rows for tensor-based seq_ids. Graph-compatible."""
+        if self._graph_mode and self._graph_block_table is not None:
+            return self._graph_block_table[:seq_ids_tensor.shape[0]]
+        return self.block_table[seq_ids_tensor]
+
+    def get_cache_seqlens_tensor(self, seq_ids_tensor: torch.Tensor) -> torch.Tensor:
+        """Cache seqlens for tensor-based seq_ids. Graph-compatible."""
+        if self._graph_mode and self._graph_cache_seqlens is not None:
+            return self._graph_cache_seqlens[:seq_ids_tensor.shape[0]]
+        return self.seq_lens[seq_ids_tensor]
+
+    def init_graph_buffers(self, max_batch_size: int):
+        """Allocate static buffers for CUDA graph mode (same tensor addresses)."""
+        self._graph_block_table = torch.full(
+            (max_batch_size, self.max_blocks_per_seq), 0, dtype=torch.int32, device=self.device
+        )
+        self._graph_cache_seqlens = torch.zeros(
+            max_batch_size, dtype=torch.int32, device=self.device
+        )
+        self._graph_batch_range = torch.arange(
+            max_batch_size, device=self.device, dtype=torch.long
+        )
+
+    def enter_graph_mode(self, seq_ids: List[int]):
+        """Copy current metadata into static graph buffers and enable graph mode."""
+        n = len(seq_ids)
+        if self._graph_block_table is None:
+            return
+        self._graph_block_table[:n].copy_(self.block_table[seq_ids])
+        self._graph_cache_seqlens[:n].copy_(self.seq_lens[seq_ids])
+        self._graph_mode = True
+
+    def exit_graph_mode(self):
+        """Disable graph mode."""
+        self._graph_mode = False
 
     # =====================================================================
     # Prefix Caching — reuse KV blocks across requests with same prefix

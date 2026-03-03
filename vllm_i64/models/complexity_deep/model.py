@@ -260,6 +260,78 @@ class MuGuidedAttention(nn.Module):
         out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
         return self.o_proj(out)
 
+    def decode_step(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        mu_prev: Optional[torch.Tensor],
+        kv_cache,
+        layer_idx: int,
+        seq_ids_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Decode-only attention with tensor-based KV write. CUDA-graph compatible.
+
+        All operations are pure tensor ops: no Python loops, no .item().
+        Used by the engine in CUDA graph mode for the decode hot path.
+        """
+        from vllm_i64.layers.attention import (
+            is_flash_attn_available, flash_decode_attention,
+            naive_paged_decode_attention,
+        )
+
+        bsz = hidden.shape[0]
+
+        q = self.q_proj(hidden)
+        k = self.k_proj(hidden)
+        v = self.v_proj(hidden)
+
+        if mu_prev is not None:
+            q = q + self.mu_to_q(mu_prev)
+            k = k + self.mu_to_k(mu_prev)
+            v = v + self.mu_to_v(mu_prev)
+
+        q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
+        k = k.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+        v = v.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        cos, sin = self.rope(positions)
+        q = apply_rotary(q, cos, sin)
+        k = apply_rotary(k, cos, sin)
+
+        # Tensor-only KV write (graph-safe)
+        kv_cache.write_kv_decode(layer_idx, seq_ids_tensor, positions, k, v)
+
+        # Attention from paged cache
+        scale = 1.0 / math.sqrt(self.head_dim)
+        k_cache, v_cache = kv_cache.get_cache_tensors(layer_idx)
+        block_table = kv_cache.get_block_table_for_seqs_tensor(seq_ids_tensor).clamp(min=0)
+        cache_seqlens = kv_cache.get_cache_seqlens_tensor(seq_ids_tensor)
+
+        use_flash = is_flash_attn_available() and q.is_cuda
+
+        if use_flash:
+            q_4d = q.unsqueeze(1)
+            out = flash_decode_attention(
+                q_4d, k_cache, v_cache,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                softmax_scale=scale,
+            )
+            out = out.squeeze(1)
+        else:
+            out = naive_paged_decode_attention(
+                q, k_cache, v_cache, block_table, cache_seqlens,
+                self.num_kv_groups, scale,
+            )
+
+        out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
+        return self.o_proj(out)
+
     def _cached_attention(
         self,
         q: torch.Tensor,
@@ -287,7 +359,7 @@ class MuGuidedAttention(nn.Module):
         scale = 1.0 / math.sqrt(self.head_dim)
         use_flash = is_flash_attn_available() and q.is_cuda
 
-        # Step 1: Write new K/V to cache (batch write per sequence)
+        # Step 1: Write new K/V to cache (graph mode uses decode_step path instead)
         offset = 0
         for i, seq_id in enumerate(seq_ids):
             n = tokens_per_seq[i]
@@ -395,6 +467,36 @@ class ComplexityDecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = MuGuidedTokenRoutedMLP(config)
 
+    def decode_step(
+        self,
+        hidden: torch.Tensor,
+        positions: torch.Tensor,
+        velocity: torch.Tensor,
+        token_ids: torch.Tensor,
+        mu_prev: Optional[torch.Tensor],
+        kv_cache,
+        layer_idx: int,
+        seq_ids_tensor: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Decode-only layer forward. CUDA-graph compatible (all tensor ops)."""
+        residual = hidden
+        hidden = self.input_layernorm(hidden)
+        hidden = self.self_attn.decode_step(
+            hidden, positions, mu_prev=mu_prev,
+            kv_cache=kv_cache, layer_idx=layer_idx,
+            seq_ids_tensor=seq_ids_tensor,
+        )
+
+        hidden, velocity, mu_current = self.dynamics(hidden, velocity)
+        hidden = residual + hidden
+
+        residual = hidden
+        hidden = self.post_attention_layernorm(hidden)
+        hidden = self.mlp(hidden, token_ids=token_ids, mu=mu_current)
+        hidden = residual + hidden
+
+        return hidden, velocity, mu_current
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -473,6 +575,62 @@ class ComplexityDeepModel(nn.Module):
         self.tie_word_embeddings = config.tie_word_embeddings
         if not config.tie_word_embeddings and is_last_pp_rank():
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def decode_step(
+        self,
+        token_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_cache,
+        seq_ids_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Decode-only forward pass. CUDA-graph compatible.
+
+        All operations are tensor-based (no Python loops, no .item()).
+        Used for GPU decode with captured CUDA graphs. Single PP stage only.
+        """
+        from vllm_i64.parallel.pipeline_parallel import is_first_pp_rank, is_last_pp_rank
+
+        if is_first_pp_rank():
+            hidden = self.embed_tokens(token_ids.long())
+            velocity = torch.zeros_like(hidden)
+            mu_prev = None
+            mu_residual = None
+        else:
+            raise RuntimeError("decode_step with pipeline parallelism not yet supported")
+
+        for layer_idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_idx]
+            hidden, velocity, mu_current = layer.decode_step(
+                hidden, positions, velocity,
+                token_ids=token_ids,
+                mu_prev=mu_prev,
+                kv_cache=kv_cache,
+                layer_idx=layer_idx,
+                seq_ids_tensor=seq_ids_tensor,
+            )
+
+            if mu_residual is None:
+                mu_residual = mu_current.clone()
+            else:
+                mu_residual = mu_residual + mu_current
+            mu_prev = mu_current + 0.1 * mu_residual
+
+        if not is_last_pp_rank():
+            raise RuntimeError("decode_step with pipeline parallelism not yet supported")
+
+        hidden = self.norm(hidden)
+
+        if self.tie_word_embeddings and self.embed_tokens is not None:
+            logits = F.linear(hidden, self.embed_tokens.weight)
+        elif hasattr(self, 'lm_head'):
+            logits = self.lm_head(hidden)
+        else:
+            raise RuntimeError(
+                "No lm_head or tied embeddings found — cannot compute logits."
+            )
+
+        return logits
 
     def forward(
         self,

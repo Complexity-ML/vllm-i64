@@ -234,8 +234,34 @@ class I64Engine:
         try:
             from vllm_i64.core.cuda_graph import CUDAGraphRunner
 
-            def _graph_forward(token_ids, positions, expert_ids):
-                return self.model(token_ids=token_ids, positions=positions)
+            # Init graph buffers in KV cache for static block_table/seqlens
+            if self.kv_cache is not None:
+                self.kv_cache.init_graph_buffers(max_batch_size)
+
+            # Pre-allocate static seq_ids tensor for graph mode
+            self._graph_seq_ids = torch.arange(
+                max_batch_size, dtype=torch.long, device=self.device
+            )
+
+            has_decode_step = hasattr(self.model, 'decode_step')
+
+            def _graph_forward(token_ids, positions, _expert_ids):
+                if has_decode_step and self.kv_cache is not None:
+                    # Graph-compatible path: tensor-only KV writes
+                    return self.model.decode_step(
+                        token_ids=token_ids,
+                        positions=positions,
+                        kv_cache=self.kv_cache,
+                        seq_ids_tensor=self._graph_seq_ids[:token_ids.shape[0]],
+                    )
+                else:
+                    return self.model(
+                        token_ids=token_ids,
+                        positions=positions,
+                        kv_cache=self.kv_cache,
+                        seq_ids=list(range(token_ids.shape[0])),
+                        tokens_per_seq=[1] * token_ids.shape[0],
+                    )
 
             self.cuda_graph_runner = CUDAGraphRunner(
                 forward_fn=_graph_forward,
@@ -253,11 +279,22 @@ class I64Engine:
         if self.device == "cpu":
             return
         try:
+            if self.kv_cache is not None:
+                self.kv_cache._graph_mode = True
+                # Non-zero seqlens ensures attention kernels are captured
+                if self.kv_cache._graph_cache_seqlens is not None:
+                    self.kv_cache._graph_cache_seqlens.fill_(1)
             self.cuda_graph_runner.capture_common_sizes()
+            if self.kv_cache is not None:
+                self.kv_cache._graph_mode = False
+                # Capture warmup wrote garbage to block 0 — mark dirty
+                self.kv_cache._dirty_blocks.add(0)
             logger.info(f"CUDA graphs captured for sizes: {sorted(self.cuda_graph_runner._captured_sizes)}")
         except Exception as e:
             logger.warning(f"CUDA graph capture failed: {e}")
             self.cuda_graph_runner = None
+            if self.kv_cache is not None:
+                self.kv_cache._graph_mode = False
 
     def enable_metrics(self, port: int = 9090, model_name: str = ""):
         """Enable Prometheus metrics collection."""
@@ -953,18 +990,33 @@ class I64Engine:
                 valid_indices.append(i)
             tokens_per_seq = [batch.tokens_per_request[i] for i in valid_indices]
 
-        # Use CUDA graph for pure decode batches
+        # CUDA graph for pure decode batches. Now supports KV cache via
+        # model.decode_step() which uses tensor-only KV writes (graph-safe).
         use_graph = (
             self.cuda_graph_runner is not None
             and self.cuda_graph_runner.is_captured
             and batch.is_prefill.sum() == 0
-            and self.kv_cache is None  # graphs don't pass KV metadata
+            and seq_ids is not None
+            and len(seq_ids) > 0
+            and hasattr(self.model, 'decode_step')
         )
 
         with torch.no_grad():
             if use_graph:
+                # Enter graph mode: copy block_table + seqlens to static buffers
+                self.kv_cache.enter_graph_mode(seq_ids)
+
                 expert_ids = torch.from_numpy(batch.expert_ids).to(self.device)
                 logits = self.cuda_graph_runner.run(token_ids, positions, expert_ids)
+
+                self.kv_cache.exit_graph_mode()
+
+                # Sync real seq_lens from graph (decode adds 1 token per seq)
+                seq_ids_tensor = torch.tensor(seq_ids, dtype=torch.long, device=self.device)
+                self.kv_cache.seq_lens[seq_ids_tensor] += 1
+                # Touch LRU tracking
+                for sid in seq_ids:
+                    self.kv_cache._touch(sid)
             else:
                 logits = self.model(
                     token_ids=token_ids,
