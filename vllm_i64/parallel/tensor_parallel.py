@@ -57,10 +57,15 @@ def init_distributed(tp_size: int = 1, backend: str = "nccl"):
     device = f"cuda:{local_rank}"
     torch.cuda.set_device(device)
 
-    tp_group = dist.new_group(list(range(tp_size)))
+    # Each PP stage gets its own TP group: ranks [stage*tp, (stage+1)*tp)
+    world_size = dist.get_world_size()
+    tp_rank_local = rank % tp_size
+    pp_stage = rank // tp_size
+    tp_group_ranks = list(range(pp_stage * tp_size, min((pp_stage + 1) * tp_size, world_size)))
+    tp_group = dist.new_group(tp_group_ranks)
 
-    _TP = TPState(tp_size=tp_size, tp_rank=rank, tp_group=tp_group, device=device)
-    print(f"[TP] rank={rank}/{tp_size} device={device}")
+    _TP = TPState(tp_size=tp_size, tp_rank=tp_rank_local, tp_group=tp_group, device=device)
+    print(f"[TP] rank={rank} tp_rank={tp_rank_local}/{tp_size} pp_stage={pp_stage} device={device}")
 
 
 def get_tp() -> TPState:

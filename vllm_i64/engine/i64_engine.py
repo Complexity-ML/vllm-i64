@@ -913,19 +913,22 @@ class I64Engine:
 
         if self.kv_cache is not None and batch.tokens_per_request is not None:
             seq_ids = []
-            for rid in batch.request_ids:
+            valid_indices = []
+            for i, rid in enumerate(batch.request_ids):
                 slot = self._request_to_slot.get(int(rid))
                 if slot is None:
                     logger.error("Request %d has no KV slot — skipping from batch", int(rid))
                     continue
                 seq_ids.append(slot)
-            tokens_per_seq = batch.tokens_per_request.tolist()
+                valid_indices.append(i)
+            tokens_per_seq = [batch.tokens_per_request[i] for i in valid_indices]
 
         # Use CUDA graph for pure decode batches
         use_graph = (
             self.cuda_graph_runner is not None
             and self.cuda_graph_runner.is_captured
             and batch.is_prefill.sum() == 0
+            and self.kv_cache is None  # graphs don't pass KV metadata
         )
 
         with torch.no_grad():
@@ -1292,11 +1295,11 @@ class AsyncI64Engine:
                     else:
                         # Orphan finished request (no future) — clean it up
                         finished_ids.add(rid)
-                        self.engine._free_slot(rid)
                         self._request_times.pop(rid, None)
 
                 # Clean up finished + all associated engine state
                 for rid in finished_ids:
+                    self.engine._free_slot(rid)
                     self.engine._request_deadlines.pop(rid, None)
                     self.engine._request_sampling_params.pop(rid, None)
                     self.engine._request_processors.pop(rid, None)
