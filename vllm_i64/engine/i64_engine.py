@@ -490,6 +490,11 @@ class I64Engine:
             slot = self._allocate_slot(request_id)
             if slot < 0:
                 logger.error("No KV cache slots available for request %d", request_id)
+                # Remove the request from the scheduler so it doesn't loop forever
+                self.scheduler.running = [
+                    r for r in self.scheduler.running if r.request_id != request_id
+                ]
+                raise RuntimeError(f"No KV cache slots available for request {request_id}")
 
             # Try to reuse prefix from cache
             if self.kv_cache.prefix_cache_enabled:
@@ -1025,7 +1030,7 @@ class I64Engine:
 
                 # Sync real seq_lens from graph (decode adds 1 token per seq)
                 n = len(seq_ids)
-                self._buf_seq_ids[:n] = torch.tensor(seq_ids, dtype=torch.long)
+                self._buf_seq_ids[:n] = torch.from_numpy(np.array(seq_ids, dtype=np.int64))
                 seq_ids_tensor = self._buf_seq_ids[:n]
                 self.kv_cache.seq_lens[seq_ids_tensor] += 1
                 # Touch LRU tracking

@@ -224,12 +224,10 @@ class PagedKVCache:
                 heapq.heappush(self._lru_heap, (tick, victim_sid))
                 continue
 
-            # O(1) block count lookup
-            victim_blocks = self._block_count.get(victim_sid, 0)
-
-            # Free it
+            # Measure actual freed blocks via free_blocks diff
+            free_before = len(self.free_blocks)
             self.free_sequence(victim_sid)
-            freed += victim_blocks
+            freed += len(self.free_blocks) - free_before
             self._eviction_count += 1
             self._evicted_seq_ids.append(victim_sid)
 
@@ -601,6 +599,11 @@ class PagedKVCache:
 
         if reused > 0:
             self.seq_lens[seq_id] = reused
+            # Update block count and LRU tracking so eviction knows about this seq
+            num_reused_blocks = reused // self.block_size
+            self._block_count[seq_id] = self._block_count.get(seq_id, 0) + num_reused_blocks
+            self._active_seq_ids.add(seq_id)
+            self._touch(seq_id)
 
         return reused
 
@@ -613,6 +616,11 @@ class PagedKVCache:
             return
 
         num_full_blocks = len(token_ids) // self.block_size
+        if num_full_blocks == 0:
+            return
+
+        # Single GPU→CPU transfer for all block IDs
+        physical_blocks = self.block_table[seq_id, :num_full_blocks].tolist()
 
         for block_idx in range(num_full_blocks):
             start = block_idx * self.block_size
@@ -620,7 +628,7 @@ class PagedKVCache:
             block_tokens = token_ids[start:end]
             prefix_hash = self._hash_token_block(block_tokens)
 
-            physical_block = self.block_table[seq_id, block_idx].item()
+            physical_block = physical_blocks[block_idx]
             if physical_block >= 0 and prefix_hash not in self._prefix_hash_to_blocks:
                 self._prefix_hash_to_blocks[prefix_hash] = [physical_block]
                 self._block_to_prefix[physical_block] = prefix_hash
@@ -666,16 +674,18 @@ class PagedKVCache:
             self._last_access.pop(seq_id, None)
             self._active_seq_ids.discard(seq_id)
             return
-        for i in range(num_blocks):
-            block_id = blocks[i].item()
+        # Single GPU→CPU transfer for all block IDs
+        block_ids = blocks[:num_blocks].tolist()
+        block_to_prefix = getattr(self, "_block_to_prefix", {})
+        for block_id in block_ids:
             # Check if this block is a shared prefix block
-            prefix_hash = getattr(self, "_block_to_prefix", {}).get(block_id)
+            prefix_hash = block_to_prefix.get(block_id)
             if prefix_hash is not None:
                 rc = self._prefix_refcount.get(prefix_hash, 1) - 1
                 if rc <= 0:
                     # Last user — free the block (lazy zero on next alloc)
                     self._prefix_hash_to_blocks.pop(prefix_hash, None)
-                    self._block_to_prefix.pop(block_id, None)
+                    block_to_prefix.pop(block_id, None)
                     self._prefix_refcount.pop(prefix_hash, None)
                     self._dirty_blocks.add(block_id)
                     self.free_blocks.append(block_id)
@@ -684,7 +694,7 @@ class PagedKVCache:
             else:
                 self._dirty_blocks.add(block_id)
                 self.free_blocks.append(block_id)
-            blocks[i] = -1
+        blocks[:num_blocks] = -1
 
         self._block_count.pop(seq_id, None)
         self.seq_lens[seq_id] = 0

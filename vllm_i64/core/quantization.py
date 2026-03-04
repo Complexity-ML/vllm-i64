@@ -55,7 +55,10 @@ def quantize_int4(
     Returns: (packed, scales, zeros)
     """
     out_features, in_features = weight.shape
-    assert in_features % group_size == 0
+    if in_features % group_size != 0:
+        raise ValueError(
+            f"INT4 quantize: in_features ({in_features}) not divisible by group_size ({group_size})"
+        )
 
     num_groups = in_features // group_size
     weight_grouped = weight.reshape(out_features, num_groups, group_size)

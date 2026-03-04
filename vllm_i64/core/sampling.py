@@ -14,6 +14,7 @@ Strategies:
 INL - 2025
 """
 
+import numpy as np
 import torch
 from typing import Optional, List, Dict
 from dataclasses import dataclass
@@ -265,7 +266,6 @@ def apply_repetition_penalty_batch(
 
     device = logits.device
     # Build all past tokens as a flat numpy array → single CPU→GPU transfer
-    import numpy as np
     batch = logits.shape[0]
     for i in range(batch):
         past = past_tokens_list[i]
@@ -373,7 +373,6 @@ def apply_frequency_presence_penalty_batch(
     if frequency_penalty == 0.0 and presence_penalty == 0.0:
         return logits
     device = logits.device
-    import numpy as np
     for i in range(logits.shape[0]):
         past = past_tokens_list[i]
         if not past:

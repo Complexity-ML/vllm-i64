@@ -396,8 +396,11 @@ class MuGuidedAttention(nn.Module):
             cu_k = torch.zeros(len(seq_ids) + 1, dtype=torch.int32, device=q.device)
             k_parts, v_parts = [], []
 
-            # Batch-read all seq_lens in one GPU→CPU transfer
-            seq_ids_tensor = torch.tensor(seq_ids, dtype=torch.long, device=kv_cache.seq_lens.device)
+            # Batch-read all seq_lens in one GPU→CPU transfer (avoid sync from torch.tensor)
+            import numpy as np
+            seq_ids_tensor = torch.from_numpy(np.array(seq_ids, dtype=np.int64)).to(
+                device=kv_cache.seq_lens.device, non_blocking=True
+            )
             cached_lens = kv_cache.seq_lens[seq_ids_tensor].tolist()
 
             for i, seq_id in enumerate(seq_ids):

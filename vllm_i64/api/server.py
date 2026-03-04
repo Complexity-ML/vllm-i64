@@ -394,7 +394,7 @@ class I64Server:
         # Detect finish reason from last token
         finish_reason = "length"
         eos_id = getattr(self.tokenizer, 'eos_token_id', None)
-        if eos_id is not None and last_token_id == eos_id:
+        if last_token_id is None or (eos_id is not None and last_token_id == eos_id):
             finish_reason = "stop"
 
         final = {
@@ -458,7 +458,7 @@ class I64Server:
         # Detect finish reason from last token
         finish_reason = "length"
         eos_id = getattr(self.tokenizer, 'eos_token_id', None)
-        if eos_id is not None and last_token_id == eos_id:
+        if last_token_id is None or (eos_id is not None and last_token_id == eos_id):
             finish_reason = "stop"
 
         final = {
@@ -1133,7 +1133,7 @@ class I64Server:
                         })
                     ws_finish = "length"
                     eos_id = getattr(self.tokenizer, 'eos_token_id', None)
-                    if eos_id is not None and last_token_id == eos_id:
+                    if last_token_id is None or (eos_id is not None and last_token_id == eos_id):
                         ws_finish = "stop"
                     await ws.send_json({
                         "id": stream_id,
