@@ -28,7 +28,7 @@ from typing import Optional, List
 
 from vllm_i64.layers.dense_mlp import DenseMLP
 from vllm_i64.layers.rmsnorm import RMSNorm
-from vllm_i64.layers.rotary import RotaryEmbedding, apply_rotary
+from vllm_i64.layers.rotary import RotaryEmbedding, apply_rotary, apply_rotary_integer
 from vllm_i64.parallel.tensor_parallel import (
     get_tp, ColumnParallelLinear, RowParallelLinear,
 )
@@ -125,6 +125,23 @@ class LlamaAttention(nn.Module):
             out = out.to(self.o_proj.linear.weight.dtype)
         return self.o_proj(out)
 
+    @property
+    def _integer_pipeline(self) -> bool:
+        """True when INT8 quantized — use integer RoPE + integer attention."""
+        return hasattr(self, 'qkv_int8')
+
+    def _apply_rope(self, q, k, positions):
+        """Apply rotary embeddings — integer or float path."""
+        if self._integer_pipeline:
+            cos_q14, sin_q14 = self.rope.forward_integer(positions)
+            q = apply_rotary_integer(q, cos_q14, sin_q14)
+            k = apply_rotary_integer(k, cos_q14, sin_q14)
+        else:
+            cos, sin = self.rope(positions)
+            q = apply_rotary(q, cos, sin)
+            k = apply_rotary(k, cos, sin)
+        return q, k
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -143,9 +160,7 @@ class LlamaAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        cos, sin = self.rope(positions)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+        q, k = self._apply_rope(q, k, positions)
 
         # === KV Cache path ===
         if kv_cache is not None and seq_ids is not None and tokens_per_seq is not None:
@@ -155,7 +170,8 @@ class LlamaAttention(nn.Module):
 
         # === Standard path: prefill without cache ===
         from vllm_i64.layers.attention import (
-            is_flash_attn_available, flash_prefill_attention, naive_varlen_attention,
+            is_flash_attn_available, flash_prefill_attention,
+            naive_varlen_attention, naive_integer_varlen_attention,
         )
 
         scale = 1.0 / math.sqrt(self.head_dim)
@@ -163,6 +179,8 @@ class LlamaAttention(nn.Module):
 
         if is_flash_attn_available() and q.is_cuda:
             out = flash_prefill_attention(q, k, v, tps, softmax_scale=scale)
+        elif self._integer_pipeline:
+            out = naive_integer_varlen_attention(q, k, v, tps, self.num_kv_groups, softmax_scale=scale)
         else:
             out = naive_varlen_attention(q, k, v, tps, self.num_kv_groups, softmax_scale=scale)
 
@@ -180,7 +198,7 @@ class LlamaAttention(nn.Module):
         """Decode-only attention. CUDA-graph compatible (all tensor ops)."""
         from vllm_i64.layers.attention import (
             is_flash_attn_available, flash_decode_attention,
-            naive_paged_decode_attention,
+            naive_paged_decode_attention, naive_integer_paged_decode_attention,
         )
 
         bsz = hidden.shape[0]
@@ -191,9 +209,7 @@ class LlamaAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        cos, sin = self.rope(positions)
-        q = apply_rotary(q, cos, sin)
-        k = apply_rotary(k, cos, sin)
+        q, k = self._apply_rope(q, k, positions)
 
         kv_cache.write_kv_decode(layer_idx, seq_ids_tensor, positions, k, v)
 
@@ -213,6 +229,11 @@ class LlamaAttention(nn.Module):
                 softmax_scale=scale,
             )
             out = out.squeeze(1)
+        elif self._integer_pipeline:
+            out = naive_integer_paged_decode_attention(
+                q, k_cache, v_cache, block_table, cache_seqlens,
+                self.num_kv_groups, scale,
+            )
         else:
             out = naive_paged_decode_attention(
                 q, k_cache, v_cache, block_table, cache_seqlens,
@@ -237,6 +258,7 @@ class LlamaAttention(nn.Module):
         from vllm_i64.layers.attention import (
             is_flash_attn_available, flash_decode_attention,
             flash_prefill_with_cache, naive_cached_attention,
+            naive_integer_cached_attention,
         )
 
         scale = 1.0 / math.sqrt(self.head_dim)
@@ -304,6 +326,7 @@ class LlamaAttention(nn.Module):
             return self._apply_o_proj(out)
 
         # === Naive fallback ===
+        _cached_fn = naive_integer_cached_attention if self._integer_pipeline else naive_cached_attention
         outputs = []
         offset = 0
         for i, seq_id in enumerate(seq_ids):
@@ -312,7 +335,7 @@ class LlamaAttention(nn.Module):
             pos_i = positions[offset:offset + n]
 
             k_full, v_full = kv_cache.read_kv(layer_idx, seq_id)
-            out_i = naive_cached_attention(
+            out_i = _cached_fn(
                 q_i, k_full, v_full, self.num_kv_groups, pos_i, softmax_scale=scale,
             )
             out_i = out_i.reshape(n, self.num_heads_per_tp * self.head_dim)

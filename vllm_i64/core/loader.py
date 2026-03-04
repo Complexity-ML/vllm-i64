@@ -395,6 +395,7 @@ def load_model_by_name(
         _quantize_experts(model, quantization)
         _quantize_dense_mlp(model, quantization)
         _quantize_attention(model, quantization)
+        _quantize_rmsnorm(model, quantization)
         if tp.tp_rank == 0:
             print(f"  Quantized weights: {quantization}")
 
@@ -552,3 +553,20 @@ def _quantize_attention(model: nn.Module, method: str):
         module.k_proj.linear.weight = None
         module.v_proj.linear.weight = None
         module.o_proj.linear.weight = None
+
+
+def _quantize_rmsnorm(model: nn.Module, method: str):
+    """
+    Quantize all RMSNorm weights to Q12 INT16 for integer forward path.
+
+    Enables integer RMSNorm: float rsqrt (irreducible) + INT32 weight multiply.
+    Only applied for INT8 quantization (full integer pipeline).
+    """
+    from vllm_i64.layers.rmsnorm import RMSNorm, quantize_rmsnorm
+
+    if method != "int8":
+        return  # Only INT8 triggers full integer pipeline
+
+    for name, module in model.named_modules():
+        if isinstance(module, RMSNorm):
+            quantize_rmsnorm(module)

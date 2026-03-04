@@ -943,3 +943,329 @@ class TestInt8Attention:
             out_int8.flatten().unsqueeze(0),
         ).item()
         assert cos_sim > 0.90
+
+
+# =========================================================================
+# Integer RMSNorm
+# =========================================================================
+
+class TestIntegerRMSNorm:
+    def test_shape(self):
+        """Integer RMSNorm output shape matches input."""
+        from vllm_i64.layers.rmsnorm import RMSNorm, quantize_rmsnorm
+        norm = RMSNorm(64)
+        quantize_rmsnorm(norm)
+        x = torch.randn(8, 64)
+        with torch.no_grad():
+            out = norm(x)
+        assert out.shape == x.shape
+
+    def test_vs_float(self):
+        """Integer RMSNorm matches float path (cosine > 0.999)."""
+        from vllm_i64.layers.rmsnorm import RMSNorm, quantize_rmsnorm
+        torch.manual_seed(42)
+        norm = RMSNorm(128)
+        norm.weight.data = torch.randn(128) * 0.5 + 1.0
+        x = torch.randn(16, 128)
+        with torch.no_grad():
+            out_float = norm(x)
+        quantize_rmsnorm(norm)
+        with torch.no_grad():
+            out_int = norm(x)
+        cos = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int.flatten().unsqueeze(0),
+        ).item()
+        assert cos > 0.999, f"Integer RMSNorm cosine={cos:.6f}"
+
+    def test_bf16_input(self):
+        """Integer RMSNorm handles bf16 input correctly."""
+        from vllm_i64.layers.rmsnorm import RMSNorm, quantize_rmsnorm
+        norm = RMSNorm(64)
+        quantize_rmsnorm(norm)
+        x = torch.randn(4, 64, dtype=torch.bfloat16)
+        with torch.no_grad():
+            out = norm(x)
+        assert out.dtype == torch.bfloat16
+        assert out.shape == x.shape
+
+    def test_quantize_creates_buffer(self):
+        """quantize_rmsnorm creates weight_q12 INT16 buffer."""
+        from vllm_i64.layers.rmsnorm import RMSNorm, quantize_rmsnorm
+        norm = RMSNorm(32)
+        assert not hasattr(norm, 'weight_q12')
+        quantize_rmsnorm(norm)
+        assert hasattr(norm, 'weight_q12')
+        assert norm.weight_q12.dtype == torch.int16
+        assert norm.weight_q12.shape == (32,)
+
+    def test_loader_quantizes_rmsnorm(self):
+        """_quantize_rmsnorm finds and quantizes all RMSNorm modules."""
+        from vllm_i64.layers.rmsnorm import RMSNorm
+        from vllm_i64.core.loader import _quantize_rmsnorm
+        model = torch.nn.Module()
+        model.norm1 = RMSNorm(64)
+        model.norm2 = RMSNorm(64)
+        _quantize_rmsnorm(model, "int8")
+        assert hasattr(model.norm1, 'weight_q12')
+        assert hasattr(model.norm2, 'weight_q12')
+
+    def test_loader_skips_non_int8(self):
+        """_quantize_rmsnorm skips for non-int8 methods."""
+        from vllm_i64.layers.rmsnorm import RMSNorm
+        from vllm_i64.core.loader import _quantize_rmsnorm
+        model = torch.nn.Module()
+        model.norm = RMSNorm(64)
+        _quantize_rmsnorm(model, "int4")
+        assert not hasattr(model.norm, 'weight_q12')
+
+
+# =========================================================================
+# Integer RoPE
+# =========================================================================
+
+class TestIntegerRoPE:
+    def test_table_building(self):
+        """Integer RoPE builds Q14 INT16 cos/sin tables."""
+        from vllm_i64.layers.rotary import RotaryEmbedding
+        rope = RotaryEmbedding(32, max_seq_len=256)
+        rope.build_integer_tables(256, torch.device('cpu'))
+        assert hasattr(rope, 'cos_table')
+        assert hasattr(rope, 'sin_table')
+        assert rope.cos_table.dtype == torch.int16
+        assert rope.sin_table.dtype == torch.int16
+        assert rope.cos_table.shape == (256, 32)
+
+    def test_forward_integer_shape(self):
+        """forward_integer returns correct shapes."""
+        from vllm_i64.layers.rotary import RotaryEmbedding
+        rope = RotaryEmbedding(64, max_seq_len=128)
+        positions = torch.arange(8)
+        cos, sin = rope.forward_integer(positions)
+        assert cos.shape == (8, 64)
+        assert sin.shape == (8, 64)
+        assert cos.dtype == torch.int16
+
+    def test_forward_integer_vs_float(self):
+        """Integer RoPE cos/sin tables match float (high correlation)."""
+        from vllm_i64.layers.rotary import RotaryEmbedding, _Q_ROPE
+        rope = RotaryEmbedding(64, max_seq_len=256)
+        positions = torch.arange(64)
+        cos_f, sin_f = rope(positions)
+        cos_i, sin_i = rope.forward_integer(positions)
+        cos_dq = cos_i.float() / _Q_ROPE
+        sin_dq = sin_i.float() / _Q_ROPE
+        cos_sim_c = torch.nn.functional.cosine_similarity(
+            cos_f.flatten().unsqueeze(0), cos_dq.flatten().unsqueeze(0),
+        ).item()
+        cos_sim_s = torch.nn.functional.cosine_similarity(
+            sin_f.flatten().unsqueeze(0), sin_dq.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim_c > 0.9999, f"Cos table cosine={cos_sim_c:.6f}"
+        assert cos_sim_s > 0.9999, f"Sin table cosine={cos_sim_s:.6f}"
+
+    def test_apply_rotary_integer_shape(self):
+        """apply_rotary_integer output shape matches input."""
+        from vllm_i64.layers.rotary import RotaryEmbedding, apply_rotary_integer
+        rope = RotaryEmbedding(32, max_seq_len=128)
+        positions = torch.arange(8)
+        cos_q14, sin_q14 = rope.forward_integer(positions)
+        x = torch.randn(8, 4, 32)
+        out = apply_rotary_integer(x, cos_q14, sin_q14)
+        assert out.shape == x.shape
+
+    def test_apply_rotary_integer_vs_float(self):
+        """Integer rotary matches float rotary (cosine > 0.999)."""
+        from vllm_i64.layers.rotary import (
+            RotaryEmbedding, apply_rotary, apply_rotary_integer,
+        )
+        torch.manual_seed(42)
+        rope = RotaryEmbedding(64, max_seq_len=128)
+        positions = torch.arange(16)
+        x = torch.randn(16, 4, 64)
+        cos_f, sin_f = rope(positions)
+        cos_i, sin_i = rope.forward_integer(positions)
+        out_f = apply_rotary(x, cos_f, sin_f)
+        out_i = apply_rotary_integer(x, cos_i, sin_i)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_f.flatten().unsqueeze(0), out_i.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.999, f"Rotary integer cosine={cos_sim:.6f}"
+
+    def test_lazy_table_building(self):
+        """forward_integer builds tables lazily and extends when needed."""
+        from vllm_i64.layers.rotary import RotaryEmbedding
+        rope = RotaryEmbedding(32, max_seq_len=64)
+        positions = torch.arange(10)
+        cos, sin = rope.forward_integer(positions)
+        assert rope.cos_table.shape[0] >= 10
+        positions2 = torch.arange(3000, 3010)
+        cos2, sin2 = rope.forward_integer(positions2)
+        assert rope.cos_table.shape[0] >= 3010
+
+    def test_bf16_passthrough(self):
+        """Integer rotary preserves bf16 dtype."""
+        from vllm_i64.layers.rotary import RotaryEmbedding, apply_rotary_integer
+        rope = RotaryEmbedding(32, max_seq_len=128)
+        positions = torch.arange(4)
+        cos_q14, sin_q14 = rope.forward_integer(positions)
+        x = torch.randn(4, 2, 32, dtype=torch.bfloat16)
+        out = apply_rotary_integer(x, cos_q14, sin_q14)
+        assert out.dtype == torch.bfloat16
+
+
+# =========================================================================
+# Integer Attention (Q@K^T + softmax_integer)
+# =========================================================================
+
+class TestIntegerAttentionPipeline:
+    def test_varlen_shape(self):
+        """Integer varlen attention output shape matches input."""
+        from vllm_i64.layers.attention import naive_integer_varlen_attention
+        q = torch.randn(8, 4, 32)
+        k = torch.randn(8, 2, 32)
+        v = torch.randn(8, 2, 32)
+        out = naive_integer_varlen_attention(q, k, v, [8], num_kv_groups=2)
+        assert out.shape == q.shape
+
+    def test_varlen_multi_seq(self):
+        """Integer varlen attention handles multiple sequences."""
+        from vllm_i64.layers.attention import naive_integer_varlen_attention
+        q = torch.randn(12, 4, 32)
+        k = torch.randn(12, 4, 32)
+        v = torch.randn(12, 4, 32)
+        out = naive_integer_varlen_attention(q, k, v, [5, 7], num_kv_groups=1)
+        assert out.shape == q.shape
+
+    def test_varlen_vs_float(self):
+        """Integer attention matches float attention (cosine > 0.95)."""
+        from vllm_i64.layers.attention import (
+            naive_varlen_attention, naive_integer_varlen_attention,
+        )
+        torch.manual_seed(42)
+        q = torch.randn(16, 4, 32)
+        k = torch.randn(16, 4, 32)
+        v = torch.randn(16, 4, 32)
+        out_f = naive_varlen_attention(q, k, v, [16], num_kv_groups=1)
+        out_i = naive_integer_varlen_attention(q, k, v, [16], num_kv_groups=1)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_f.flatten().unsqueeze(0), out_i.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.95, f"Integer attention cosine={cos_sim:.6f}"
+
+    def test_cached_shape(self):
+        """Integer cached attention output shape."""
+        from vllm_i64.layers.attention import naive_integer_cached_attention
+        q = torch.randn(4, 4, 32)
+        k_full = torch.randn(20, 4, 32)
+        v_full = torch.randn(20, 4, 32)
+        positions = torch.arange(16, 20)
+        out = naive_integer_cached_attention(q, k_full, v_full, 1, positions)
+        assert out.shape == q.shape
+
+    def test_cached_vs_float(self):
+        """Integer cached attention matches float (cosine > 0.95)."""
+        from vllm_i64.layers.attention import (
+            naive_cached_attention, naive_integer_cached_attention,
+        )
+        torch.manual_seed(42)
+        q = torch.randn(4, 4, 32)
+        k_full = torch.randn(20, 4, 32)
+        v_full = torch.randn(20, 4, 32)
+        positions = torch.arange(16, 20)
+        out_f = naive_cached_attention(q, k_full, v_full, 1, positions)
+        out_i = naive_integer_cached_attention(q, k_full, v_full, 1, positions)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_f.flatten().unsqueeze(0), out_i.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.95, f"Integer cached attention cosine={cos_sim:.6f}"
+
+    def test_paged_decode_shape(self):
+        """Integer paged decode attention output shape."""
+        from vllm_i64.layers.attention import naive_integer_paged_decode_attention
+        batch = 2
+        num_heads = 4
+        head_dim = 32
+        block_size = 4
+        num_blocks = 8
+        q = torch.randn(batch, num_heads, head_dim)
+        k_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        v_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        block_table = torch.tensor([[0, 1, 2, -1], [3, 4, -1, -1]], dtype=torch.int32)
+        cache_seqlens = torch.tensor([10, 6], dtype=torch.int32)
+        out = naive_integer_paged_decode_attention(
+            q, k_cache, v_cache, block_table, cache_seqlens, num_kv_groups=1,
+        )
+        assert out.shape == (batch, num_heads, head_dim)
+
+    def test_paged_decode_vs_float(self):
+        """Integer paged decode matches float (cosine > 0.95)."""
+        from vllm_i64.layers.attention import (
+            naive_paged_decode_attention, naive_integer_paged_decode_attention,
+        )
+        torch.manual_seed(42)
+        batch = 2
+        num_heads = 4
+        head_dim = 32
+        block_size = 4
+        num_blocks = 8
+        q = torch.randn(batch, num_heads, head_dim)
+        k_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        v_cache = torch.randn(num_blocks, block_size, num_heads, head_dim)
+        block_table = torch.tensor([[0, 1, 2, -1], [3, 4, -1, -1]], dtype=torch.int32)
+        cache_seqlens = torch.tensor([10, 6], dtype=torch.int32)
+        out_f = naive_paged_decode_attention(
+            q, k_cache, v_cache, block_table, cache_seqlens, num_kv_groups=1,
+        )
+        out_i = naive_integer_paged_decode_attention(
+            q, k_cache, v_cache, block_table, cache_seqlens, num_kv_groups=1,
+        )
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_f.flatten().unsqueeze(0), out_i.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.95, f"Integer paged decode cosine={cos_sim:.6f}"
+
+    def test_sliding_window(self):
+        """Integer varlen attention supports sliding window masking."""
+        from vllm_i64.layers.attention import naive_integer_varlen_attention
+        q = torch.randn(16, 4, 32)
+        k = torch.randn(16, 4, 32)
+        v = torch.randn(16, 4, 32)
+        out = naive_integer_varlen_attention(
+            q, k, v, [16], num_kv_groups=1, sliding_window=4,
+        )
+        assert out.shape == q.shape
+
+    def test_integer_pipeline_llama_layer(self):
+        """Full LlamaDecoderLayer with integer pipeline (INT8 + integer RoPE + integer attention + integer RMSNorm)."""
+        from vllm_i64.models.llama.model import LlamaDecoderLayer
+        from vllm_i64.core.loader import _quantize_attention, _quantize_dense_mlp, _quantize_rmsnorm
+        torch.manual_seed(42)
+        config = type('C', (), {
+            'hidden_size': 64, 'num_attention_heads': 4,
+            'num_key_value_heads': 2, 'head_dim': 16,
+            'max_position_embeddings': 128, 'rope_theta': 10000.0,
+            'rope_scaling': None, 'rms_norm_eps': 1e-5,
+            'intermediate_size': 128, 'attention_bias': False,
+            'use_qk_norm': False,
+        })()
+        layer = LlamaDecoderLayer(config)
+        layer.eval()
+        hidden = torch.randn(8, 64)
+        positions = torch.arange(8)
+        with torch.no_grad():
+            out_float = layer(hidden, positions, tokens_per_seq=[8])
+        # Enable full integer pipeline
+        wrapper = torch.nn.Module()
+        wrapper.layer = layer
+        _quantize_attention(wrapper, "int8")
+        _quantize_dense_mlp(wrapper, "int8")
+        _quantize_rmsnorm(wrapper, "int8")
+        with torch.no_grad():
+            out_int = layer(hidden, positions, tokens_per_seq=[8])
+        assert out_int.shape == out_float.shape
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.85, f"Full integer pipeline cosine={cos_sim:.6f}"

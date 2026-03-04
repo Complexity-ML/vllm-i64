@@ -241,6 +241,230 @@ def naive_cached_attention(
     return out.transpose(0, 1)    # (n, num_heads, head_dim)
 
 
+def naive_integer_varlen_attention(
+    q: torch.Tensor,           # (total_tokens, num_heads, head_dim)
+    k: torch.Tensor,           # (total_tokens, num_kv_heads, head_dim)
+    v: torch.Tensor,           # (total_tokens, num_kv_heads, head_dim)
+    tokens_per_seq: List[int],
+    num_kv_groups: int,
+    softmax_scale: Optional[float] = None,
+    sliding_window: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Integer attention: INT8 Q@K^T scores + softmax_integer + float V multiply.
+
+    Uses torch._int_mm (GPU SM80+) for true INT8 score computation.
+    Falls back to float bmm + softmax_integer on CPU / older GPUs.
+    Causal mask uses -1e4 (not -inf) for softmax_integer compatibility.
+    """
+    from vllm_i64.layers.moe import softmax_integer
+    from vllm_i64.core.quantization import quantize_activations_int8, _INT_MM_AVAILABLE
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+
+    compute_dtype = q.dtype
+    if k.dtype != compute_dtype:
+        k = k.to(compute_dtype)
+    if v.dtype != compute_dtype:
+        v = v.to(compute_dtype)
+
+    use_int_mm = _INT_MM_AVAILABLE and q.is_cuda
+    outputs = []
+    offset = 0
+
+    for n in tokens_per_seq:
+        q_i = q[offset:offset + n]
+        k_i = k[offset:offset + n]
+        v_i = v[offset:offset + n]
+
+        if num_kv_groups > 1:
+            k_i = k_i.repeat_interleave(num_kv_groups, dim=1)
+            v_i = v_i.repeat_interleave(num_kv_groups, dim=1)
+
+        q_t = q_i.transpose(0, 1)  # (num_heads, n, head_dim)
+        k_t = k_i.transpose(0, 1)
+        v_t = v_i.transpose(0, 1)
+        num_heads = q_t.shape[0]
+
+        if use_int_mm and n > 0:
+            # INT8 Q@K^T per head — _int_mm is 2D only
+            scores = torch.zeros(num_heads, n, n, device=q.device, dtype=torch.float32)
+            for h in range(num_heads):
+                q_h = q_t[h]  # (n, head_dim)
+                k_h = k_t[h]
+                q_int8, q_scale = quantize_activations_int8(q_h)
+                k_int8, k_scale = quantize_activations_int8(k_h)
+                s_i32 = torch._int_mm(q_int8, k_int8.t().contiguous())
+                scores[h] = s_i32.float() * (q_scale.unsqueeze(1) * k_scale.unsqueeze(0))
+            scores = scores * softmax_scale
+        else:
+            # Float bmm fallback — still use integer softmax
+            scores = torch.bmm(q_t.float(), k_t.float().transpose(1, 2)) * softmax_scale
+
+        # Causal mask — -1e4 instead of -inf for softmax_integer (Q7: -1e4*128 clamps to LUT min)
+        if n > 1:
+            causal_mask = torch.triu(
+                torch.full((n, n), -1e4, device=q.device, dtype=torch.float32),
+                diagonal=1,
+            )
+            if sliding_window is not None:
+                sw_mask = torch.tril(
+                    torch.full((n, n), -1e4, device=q.device, dtype=torch.float32),
+                    diagonal=-sliding_window,
+                )
+                causal_mask = causal_mask + sw_mask
+            scores = scores + causal_mask.unsqueeze(0)
+
+        # Integer softmax
+        attn = softmax_integer(scores)
+
+        # Float V multiply (V values need full precision for output quality)
+        out_i = torch.bmm(attn.to(v_t.dtype), v_t)
+        out_i = out_i.transpose(0, 1)
+        outputs.append(out_i)
+        offset += n
+
+    return torch.cat(outputs, dim=0)
+
+
+def naive_integer_cached_attention(
+    q: torch.Tensor,           # (n_tokens, num_heads, head_dim)
+    k_full: torch.Tensor,      # (history_len, num_kv_heads, head_dim)
+    v_full: torch.Tensor,      # (history_len, num_kv_heads, head_dim)
+    num_kv_groups: int,
+    positions: torch.Tensor,   # (n_tokens,) int32
+    softmax_scale: Optional[float] = None,
+    sliding_window: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Integer cached attention: INT8 Q@K^T + softmax_integer for prefill with cache.
+    Falls back to float bmm on CPU / no _int_mm. Always uses integer softmax.
+    """
+    from vllm_i64.layers.moe import softmax_integer
+    from vllm_i64.core.quantization import quantize_activations_int8, _INT_MM_AVAILABLE
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+
+    n = q.shape[0]
+
+    compute_dtype = q.dtype
+    if k_full.dtype != compute_dtype:
+        k_full = k_full.to(compute_dtype)
+    if v_full.dtype != compute_dtype:
+        v_full = v_full.to(compute_dtype)
+
+    if num_kv_groups > 1:
+        k_full = k_full.repeat_interleave(num_kv_groups, dim=1)
+        v_full = v_full.repeat_interleave(num_kv_groups, dim=1)
+
+    q_t = q.transpose(0, 1)       # (num_heads, n, head_dim)
+    k_t = k_full.transpose(0, 1)  # (num_heads, history, head_dim)
+    v_t = v_full.transpose(0, 1)
+    num_heads = q_t.shape[0]
+    history = k_full.shape[0]
+
+    use_int_mm = _INT_MM_AVAILABLE and q.is_cuda
+
+    if use_int_mm and n > 0 and history > 0:
+        scores = torch.zeros(num_heads, n, history, device=q.device, dtype=torch.float32)
+        for h in range(num_heads):
+            q_int8, q_scale = quantize_activations_int8(q_t[h])
+            k_int8, k_scale = quantize_activations_int8(k_t[h])
+            s_i32 = torch._int_mm(q_int8, k_int8.t().contiguous())
+            scores[h] = s_i32.float() * (q_scale.unsqueeze(1) * k_scale.unsqueeze(0))
+        scores = scores * softmax_scale
+    else:
+        scores = torch.bmm(q_t.float(), k_t.float().transpose(1, 2)) * softmax_scale
+
+    # Causal mask — use -1e4 for softmax_integer compatibility
+    total = k_full.shape[0]
+    q_pos = positions.unsqueeze(1).float()
+    k_pos = torch.arange(total, device=q.device, dtype=torch.float32).unsqueeze(0)
+    causal = torch.where(k_pos <= q_pos, 0.0, -1e4)
+
+    if sliding_window is not None:
+        sw_mask = torch.where(q_pos - k_pos < sliding_window, 0.0, -1e4)
+        causal = causal + sw_mask
+
+    scores = scores + causal.unsqueeze(0)
+
+    # Integer softmax
+    attn = softmax_integer(scores)
+
+    # Float V multiply
+    out = torch.bmm(attn.to(v_t.dtype), v_t)
+    return out.transpose(0, 1)
+
+
+def naive_integer_paged_decode_attention(
+    q: torch.Tensor,              # (batch, num_heads, head_dim)
+    k_cache: torch.Tensor,        # (num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache: torch.Tensor,        # same
+    block_table: torch.Tensor,    # (batch, max_blocks_per_seq) int32
+    cache_seqlens: torch.Tensor,  # (batch,) int32
+    num_kv_groups: int = 1,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Integer paged decode attention: float Q@K^T + softmax_integer.
+
+    Q@K^T stays float (tiny 1×seq_len matmul, no INT8 benefit).
+    softmax_integer replaces F.softmax for deterministic integer weights.
+    """
+    from vllm_i64.layers.moe import softmax_integer
+
+    batch = q.shape[0]
+    bs = k_cache.shape[1]
+
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+
+    compute_dtype = q.dtype
+    outputs = []
+
+    for b in range(batch):
+        seq_len = cache_seqlens[b].item()
+        if seq_len == 0:
+            outputs.append(torch.zeros_like(q[b]))
+            continue
+
+        # Gather K/V from blocks
+        num_blocks_needed = (seq_len + bs - 1) // bs
+        k_parts = []
+        v_parts = []
+        for blk_idx in range(num_blocks_needed):
+            block_id = block_table[b, blk_idx].item()
+            if block_id < 0:
+                break
+            if blk_idx == num_blocks_needed - 1:
+                remainder = seq_len - blk_idx * bs
+                k_parts.append(k_cache[block_id, :remainder].to(compute_dtype))
+                v_parts.append(v_cache[block_id, :remainder].to(compute_dtype))
+            else:
+                k_parts.append(k_cache[block_id].to(compute_dtype))
+                v_parts.append(v_cache[block_id].to(compute_dtype))
+
+        k_seq = torch.cat(k_parts, dim=0)
+        v_seq = torch.cat(v_parts, dim=0)
+
+        if num_kv_groups > 1:
+            k_seq = k_seq.repeat_interleave(num_kv_groups, dim=1)
+            v_seq = v_seq.repeat_interleave(num_kv_groups, dim=1)
+
+        q_b = q[b].unsqueeze(1)           # (num_heads, 1, head_dim)
+        k_t = k_seq.transpose(0, 1)       # (num_heads, seq_len, head_dim)
+        v_t = v_seq.transpose(0, 1)
+
+        attn = torch.bmm(q_b.float(), k_t.float().transpose(1, 2)) * softmax_scale
+        attn = softmax_integer(attn)
+        out_b = torch.bmm(attn.to(v_t.dtype), v_t).squeeze(1)
+        outputs.append(out_b)
+
+    return torch.stack(outputs)
+
+
 def naive_paged_decode_attention(
     q: torch.Tensor,              # (batch, num_heads, head_dim)
     k_cache: torch.Tensor,        # (num_blocks, block_size, num_kv_heads, head_dim)
