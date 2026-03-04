@@ -78,15 +78,22 @@ def cmd_serve(args):
         print(f"  torch.compile: mode={compile_mode}")
         model = torch.compile(model, mode=compile_mode)
 
-    # Load tokenizer (from checkpoint dir if overridden)
+    # Load tokenizer (from checkpoint dir if overridden, search up 3 parent dirs)
     tokenizer = None
     if args.checkpoint:
         import os
-        tok_path = os.path.join(args.checkpoint, "tokenizer.json")
-        if os.path.exists(tok_path):
-            from vllm_i64.core.tokenizer import I64Tokenizer
-            tokenizer = I64Tokenizer(tok_path)
-            print(f"  tokenizer: {tok_path}")
+        search_dir = args.checkpoint
+        for _ in range(4):  # checkpoint, parent, grandparent, great-grandparent
+            tok_path = os.path.join(search_dir, "tokenizer.json")
+            if os.path.exists(tok_path):
+                from vllm_i64.core.tokenizer import I64Tokenizer
+                tokenizer = I64Tokenizer(tok_path)
+                print(f"  tokenizer: {tok_path}")
+                break
+            parent = os.path.dirname(search_dir)
+            if parent == search_dir:
+                break
+            search_dir = parent
     if tokenizer is None:
         tokenizer = load_tokenizer(args.model)
 

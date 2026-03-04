@@ -259,7 +259,10 @@ class I64Server:
         """i64 token IDs → text. Boundary operation."""
         if self.tokenizer:
             return self.tokenizer.decode(token_ids)
-        return bytes(token_ids).decode("utf-8", errors="replace")
+        # Byte fallback: only valid for byte-level models (vocab_size <= 256).
+        # Mask to 8 bits to avoid ValueError when IDs exceed 255.
+        safe_ids = [t & 0xFF for t in token_ids]
+        return bytes(safe_ids).decode("utf-8", errors="replace")
 
     async def _detokenize_async(self, token_ids: List[int]) -> str:
         """Detokenize in thread pool to avoid blocking the event loop."""
