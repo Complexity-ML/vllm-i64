@@ -10,9 +10,10 @@ Strategies:
   - INT4: per-group asymmetric quantization (group_size=128)
 
 Native INT8 matmul:
-  torch._int_mm (PyTorch 2.2+, SM80+ GPU) does true INT8×INT8→INT32.
+  torch._int_mm (PyTorch 2.2+ CPU/GPU) does true INT8×INT8→INT32.
   Activations dynamically quantized per-token, weights statically per-channel.
-  Fallback to dequant+F.linear on CPU or older GPUs.
+  Works on CPU (VNNI/AMX) and GPU (SM80+ tensor cores).
+  Fallback to dequant+F.linear on unsupported platforms.
 
 INL - 2025
 """
@@ -25,8 +26,19 @@ import logging
 
 _logger = logging.getLogger("vllm_i64.quantization")
 
-# Native INT8 matmul support detection
+# Native INT8 matmul support detection (works on CPU + GPU since PyTorch 2.4)
 _INT_MM_AVAILABLE = hasattr(torch, '_int_mm')
+
+# Probe CPU _int_mm once at import time
+_INT_MM_CPU_OK = False
+if _INT_MM_AVAILABLE:
+    try:
+        _a = torch.ones(1, 8, dtype=torch.int8)
+        _b = torch.ones(8, 1, dtype=torch.int8)
+        torch._int_mm(_a, _b)
+        _INT_MM_CPU_OK = True
+    except (RuntimeError, Exception):
+        pass
 
 
 @dataclass
@@ -102,48 +114,47 @@ def int8_linear_native(
     """
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
+    out_features = weight_int8.shape[0]
 
-    if not (_INT_MM_AVAILABLE and x.is_cuda):
-        if x.is_cuda:
-            # Priority 1: CUDA I64_gemm_dequant_int8
-            try:
-                from vllm_i64.kernels.cuda import get_i64_cuda_ops
-                cuda_ops = get_i64_cuda_ops()
-                if cuda_ops is not None:
-                    out = cuda_ops.gemm_dequant_int8(x_2d.float(), weight_int8, weight_scale)
-                    if bias is not None:
-                        out = out + bias
-                    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
-            except (ImportError, Exception):
-                pass
-            # Priority 2: Triton fused dequant+GEMM
-            try:
-                from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
-                out = triton_dequant_gemm_int8(x_2d, weight_int8, weight_scale, bias)
-                if out is not None:
-                    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
-            except ImportError:
-                pass
-        # Priority 3: dequant weight → float32 matmul
-        w_float = dequantize_int8(weight_int8, weight_scale)
-        out = F.linear(x_2d.float(), w_float, bias)
-        return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+    # Check if native _int_mm is usable on this device
+    use_int_mm = _INT_MM_AVAILABLE and (x.is_cuda or _INT_MM_CPU_OK)
 
-    # Dynamic quantize activations
-    x_int8, x_scale = quantize_activations_int8(x_2d)
+    if use_int_mm:
+        # Native INT8 matmul path — CPU (VNNI/AMX) or GPU (tensor cores)
+        x_int8, x_scale = quantize_activations_int8(x_2d)
+        wt = weight_int8.t().contiguous()
+        result_i32 = torch._int_mm(x_int8, wt)
+        out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*orig_shape[:-1], out_features)
 
-    # Native INT8 matmul: (M, K) @ (K, N) → (M, N) int32
-    # weight_int8 is (out, in), need (in, out) for second operand
-    wt = weight_int8.t().contiguous()
-    result_i32 = torch._int_mm(x_int8, wt)
+    # GPU-only accelerated fallbacks
+    if x.is_cuda:
+        # Priority 1: CUDA I64_gemm_dequant_int8
+        try:
+            from vllm_i64.kernels.cuda import get_i64_cuda_ops
+            cuda_ops = get_i64_cuda_ops()
+            if cuda_ops is not None:
+                out = cuda_ops.gemm_dequant_int8(x_2d.float(), weight_int8, weight_scale)
+                if bias is not None:
+                    out = out + bias
+                return out.reshape(*orig_shape[:-1], out_features)
+        except (ImportError, Exception):
+            pass
+        # Priority 2: Triton fused dequant+GEMM
+        try:
+            from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
+            out = triton_dequant_gemm_int8(x_2d, weight_int8, weight_scale, bias)
+            if out is not None:
+                return out.reshape(*orig_shape[:-1], out_features)
+        except ImportError:
+            pass
 
-    # Rescale: y[i,j] = result_i32[i,j] * x_scale[i] * w_scale[j]
-    out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
-
-    if bias is not None:
-        out = out + bias
-
-    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+    # Final fallback: dequant weight → float32 matmul
+    w_float = dequantize_int8(weight_int8, weight_scale)
+    out = F.linear(x_2d.float(), w_float, bias)
+    return out.reshape(*orig_shape[:-1], out_features)
 
 
 def int8_fused_gate_up_native(
@@ -174,20 +185,16 @@ def int8_fused_gate_up_native(
     """
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
+    use_int_mm = _INT_MM_AVAILABLE and (x.is_cuda or _INT_MM_CPU_OK)
 
-    if not (_INT_MM_AVAILABLE and x.is_cuda):
+    if use_int_mm:
+        x_int8, x_scale = quantize_activations_int8(x_2d)
+        wt = fused_int8.t().contiguous()
+        result_i32 = torch._int_mm(x_int8, wt)
+        result = result_i32.float() * (x_scale.unsqueeze(1) * fused_scale.unsqueeze(0))
+    else:
         w_float = dequantize_int8(fused_int8, fused_scale)
         result = F.linear(x_2d.float(), w_float)
-        gate, up = result.split(inter_size, dim=-1)
-        return (
-            gate.reshape(*orig_shape[:-1], inter_size),
-            up.reshape(*orig_shape[:-1], inter_size),
-        )
-
-    x_int8, x_scale = quantize_activations_int8(x_2d)
-    wt = fused_int8.t().contiguous()
-    result_i32 = torch._int_mm(x_int8, wt)
-    result = result_i32.float() * (x_scale.unsqueeze(1) * fused_scale.unsqueeze(0))
 
     gate, up = result.split(inter_size, dim=-1)
     return (
@@ -196,14 +203,16 @@ def int8_fused_gate_up_native(
     )
 
 
-def int8_linear_available() -> bool:
-    """Check if native INT8 matmul is available on current hardware."""
+def int8_linear_available(device: str = "cpu") -> bool:
+    """Check if native INT8 matmul is available on the given device."""
     if not _INT_MM_AVAILABLE:
         return False
+    if device == "cpu":
+        return _INT_MM_CPU_OK
+    # GPU probe
     if not torch.cuda.is_available():
         return False
     try:
-        # Probe with tiny matmul
         a = torch.ones(1, 8, dtype=torch.int8, device='cuda')
         b = torch.ones(8, 1, dtype=torch.int8, device='cuda')
         torch._int_mm(a, b)
@@ -290,10 +299,10 @@ def int4_linear(
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Fused INT4 dequant + GEMM: y = x @ dequant(packed).T + bias
+    Vectorized INT4 dequant + GEMM: y = x @ dequant(packed).T + bias
 
-    Instead of materializing the full dequantized weight, this processes
-    by groups to reduce peak memory. For each group, unpack + dequant + partial GEMM.
+    Fully vectorized — no Python loops. Unpacks all groups at once,
+    dequantizes in one broadcast op, then single F.linear GEMM.
 
     Args:
         x: (batch, in_features) or (in_features,)
@@ -308,40 +317,25 @@ def int4_linear(
     """
     out_features = packed.shape[0]
     in_features = packed.shape[1] * 2
-    num_groups = in_features // group_size
 
     squeeze = x.dim() == 1
     if squeeze:
         x = x.unsqueeze(0)
 
-    # Always compute in float32 (bf16/fp16 mixed with dequant float would crash)
-    x = x.float()
-    batch = x.shape[0]
-    y = torch.zeros(batch, out_features, dtype=torch.float32, device=x.device)
+    # Vectorized unpack: extract all nibbles at once
+    high = ((packed >> 4) & 0xF).float()
+    low = (packed & 0xF).float()
+    unpacked = torch.stack([high, low], dim=-1).reshape(out_features, in_features)
 
-    # Process by groups: unpack + dequant + accumulate partial GEMM
-    for g in range(num_groups):
-        col_start = g * group_size
-        col_end = col_start + group_size
-        pack_start = col_start // 2
-        pack_end = col_end // 2
+    # Vectorized dequant: reshape to (out, groups, group_size), broadcast scale/zero
+    num_groups = in_features // group_size
+    w_grouped = unpacked.reshape(out_features, num_groups, group_size)
+    w_float = ((w_grouped - zero.unsqueeze(-1)) * scale.unsqueeze(-1)).reshape(out_features, in_features)
 
-        # Unpack this group
-        group_packed = packed[:, pack_start:pack_end]
-        high = ((group_packed >> 4) & 0xF).float()
-        low = (group_packed & 0xF).float()
-        group_unpacked = torch.stack([high, low], dim=-1).reshape(out_features, group_size)
+    # Single GEMM — one big matmul instead of N small ones
+    out = F.linear(x.float(), w_float, bias)
 
-        # Dequant: (unpacked - zero) * scale
-        group_weight = (group_unpacked - zero[:, g:g+1]) * scale[:, g:g+1]
-
-        # Partial GEMM: y += x[:, group_cols] @ group_weight.T
-        y += x[:, col_start:col_end] @ group_weight.T
-
-    if bias is not None:
-        y += bias
-
-    return y.squeeze(0) if squeeze else y
+    return out.squeeze(0) if squeeze else out
 
 
 def quantize_experts(

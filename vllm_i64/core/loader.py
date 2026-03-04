@@ -402,6 +402,13 @@ def load_model_by_name(
         if tp.tp_rank == 0:
             print(f"  Quantized weights: {quantization}")
 
+    # torch.compile optimization — fuses ops, eliminates Python overhead
+    try:
+        from vllm_i64.core.compile import compile_model
+        model = compile_model(model)
+    except Exception:
+        pass
+
     return model.to(device)
 
 
