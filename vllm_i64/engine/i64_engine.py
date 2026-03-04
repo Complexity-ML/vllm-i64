@@ -302,9 +302,15 @@ class I64Engine:
             logger.info(f"CUDA graphs captured for sizes: {sorted(self.cuda_graph_runner._captured_sizes)}")
         except Exception as e:
             logger.warning(f"CUDA graph capture failed: {e}")
+            # Free all partially-captured graphs and release private pool memory
+            if self.cuda_graph_runner is not None:
+                self.cuda_graph_runner.graphs.clear()
+                self.cuda_graph_runner.static_inputs.clear()
+                self.cuda_graph_runner.static_outputs.clear()
             self.cuda_graph_runner = None
             if self.kv_cache is not None:
                 self.kv_cache._graph_mode = False
+            torch.cuda.empty_cache()
 
     def enable_metrics(self, port: int = 9090, model_name: str = ""):
         """Enable Prometheus metrics collection."""

@@ -140,7 +140,8 @@ def cmd_serve(args):
         print(f"  speculative: {args.speculative_model} (K={num_spec})")
 
     # CUDA graph warmup (captures decode graphs for common batch sizes)
-    engine.warmup_and_capture_graphs()
+    if not getattr(args, 'no_cuda_graphs', False):
+        engine.warmup_and_capture_graphs()
     server = I64Server(
         engine=engine,
         tokenizer=tokenizer,
@@ -287,6 +288,8 @@ def main():
     p_serve.add_argument("--compile-mode", default="reduce-overhead",
                          choices=["default", "reduce-overhead", "max-autotune"],
                          help="torch.compile mode (default: reduce-overhead)")
+    p_serve.add_argument("--no-cuda-graphs", action="store_true",
+                         help="Disable CUDA graph capture (saves ~4 GiB VRAM, use when GPU is shared)")
     p_serve.add_argument("--max-kv-blocks", type=int, default=0,
                          help="Total KV cache blocks (0 = auto: max(256, max_seqs*8)). "
                               "Reduce to save VRAM, e.g. --max-kv-blocks 128")
