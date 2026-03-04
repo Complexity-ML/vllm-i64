@@ -482,6 +482,54 @@ def naive_integer_paged_decode_attention(
     return torch.stack(outputs)
 
 
+def _tensor_paged_decode_attention(
+    q: torch.Tensor,              # (batch, num_heads, head_dim)
+    k_cache: torch.Tensor,        # (num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,    # (batch, max_blocks_per_seq) int32
+    cache_seqlens: torch.Tensor,  # (batch,) int32
+    num_kv_groups: int,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """
+    Fully vectorized paged decode attention — CUDA graph compatible.
+
+    No Python loops, no .item() calls. Gathers all K/V blocks at once via
+    advanced indexing, masks padding positions with -inf before softmax.
+
+    Used automatically during CUDA graph capture instead of naive_paged_decode_attention.
+    """
+    batch, num_heads, head_dim = q.shape
+    block_size = k_cache.shape[1]
+    num_kv_heads = k_cache.shape[2]
+    max_blocks = block_table.shape[1]
+    max_seq_len = max_blocks * block_size
+
+    # Gather all K/V blocks for all seqs in one shot (no loop over batch or blocks)
+    bt = block_table.clamp(min=0).long().view(-1)         # (batch * max_blocks,)
+    k_all = k_cache[bt].view(batch, max_seq_len, num_kv_heads, head_dim).to(q.dtype)
+    v_all = v_cache[bt].view(batch, max_seq_len, num_kv_heads, head_dim).to(q.dtype)
+
+    # GQA: repeat K/V heads to match Q heads
+    if num_kv_groups > 1:
+        k_all = k_all.repeat_interleave(num_kv_groups, dim=2)
+        v_all = v_all.repeat_interleave(num_kv_groups, dim=2)
+
+    # Attention scores: (batch, num_heads, 1, max_seq_len)
+    q_exp = q.unsqueeze(2)                                    # (batch, num_heads, 1, head_dim)
+    k_t = k_all.permute(0, 2, 3, 1)                          # (batch, num_heads, head_dim, max_seq_len)
+    scores = torch.matmul(q_exp, k_t) * softmax_scale
+
+    # Mask padding positions (positions >= cache_seqlens) with -inf
+    pos = torch.arange(max_seq_len, device=q.device)          # (max_seq_len,)
+    pad_mask = pos.unsqueeze(0) >= cache_seqlens.unsqueeze(1) # (batch, max_seq_len)
+    scores = scores.masked_fill(pad_mask[:, None, None, :], float('-inf'))
+
+    attn = F.softmax(scores, dim=-1)
+    v_t = v_all.permute(0, 2, 1, 3)                          # (batch, num_heads, max_seq_len, head_dim)
+    return torch.matmul(attn, v_t).squeeze(2)                 # (batch, num_heads, head_dim)
+
+
 def naive_paged_decode_attention(
     q: torch.Tensor,              # (batch, num_heads, head_dim)
     k_cache: torch.Tensor,        # (num_blocks, block_size, num_kv_heads, head_dim)
@@ -509,12 +557,11 @@ def naive_paged_decode_attention(
     Returns:
         output: (batch, num_heads, head_dim)
     """
-    # Bail out early during CUDA graph capture — .item() and Python loops invalidate the stream.
-    # The engine catches this exception and falls back to eager mode.
+    # During CUDA graph capture use the fully vectorized path (no .item(), no Python loops).
     if q.is_cuda and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "naive_paged_decode_attention is not CUDA graph compatible "
-            "(requires flash_attn for graph capture)"
+        return _tensor_paged_decode_attention(
+            q, k_cache, v_cache, block_table, cache_seqlens, num_kv_groups,
+            softmax_scale or 1.0 / math.sqrt(q.shape[-1]),
         )
 
     batch = q.shape[0]
