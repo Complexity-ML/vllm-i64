@@ -48,6 +48,12 @@ def _detect_backend() -> Optional[str]:
     if not _COMPILE_AVAILABLE:
         return None
 
+    # torch.compile on CPU requires a C++ compiler (inductor) or causes
+    # silent fallbacks that break inference — skip entirely on CPU
+    if not torch.cuda.is_available():
+        _logger.info("torch.compile skipped (CPU-only — no C++ compiler required)")
+        return None
+
     # Try inductor first (best perf, needs C++ compiler)
     for backend in ('inductor', 'aot_eager'):
         try:
