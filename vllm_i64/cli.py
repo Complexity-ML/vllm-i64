@@ -42,6 +42,8 @@ def cmd_serve(args):
 
     # Single-GPU: run directly
     import torch
+    from vllm_i64.core.logging import setup_logging
+    setup_logging(level="INFO")
     from vllm_i64.core.loader import load_model_by_name
     from vllm_i64.engine.i64_engine import I64Engine
     from vllm_i64.cpu.engine import CPUEngine

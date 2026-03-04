@@ -182,7 +182,6 @@ class AsyncCPUEngine(AsyncI64Engine):
             if has_work:
                 batch_size = len(self.engine.scheduler.running)
                 self.peak_batch_size = max(self.peak_batch_size, batch_size)
-
                 try:
                     # Always run in thread executor on CPU — forward pass can
                     # take several seconds and must not block the event loop.

@@ -115,6 +115,8 @@ class I64Engine:
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
+        if max_kv_blocks <= 0:  # 0 = auto
+            max_kv_blocks = max(256, max_batch_size * 8)
         self.max_kv_blocks = max_kv_blocks
         self.device = device
         self.enable_prefix_caching = enable_prefix_caching
