@@ -93,13 +93,15 @@ class LlamaAttention(nn.Module):
             getattr(config, 'rope_theta', 10000.0),
         )
 
-    def _project_qkv(self, hidden: torch.Tensor) -> tuple:
-        """Project hidden → Q, K, V. Uses fused INT8 matmul when quantized."""
+    def _project_qkv(self, hidden: torch.Tensor, x_preq=None) -> tuple:
+        """Project hidden → Q, K, V. Uses fused INT8 matmul when quantized.
+        x_preq: pre-quantized (int8, scale) from fused RMSNorm+quant."""
         bsz = hidden.shape[0]
         if hasattr(self, 'qkv_int8'):
             from vllm_i64.core.quantization import int8_linear_native
             bias = getattr(self, 'qkv_bias', None)
-            qkv = int8_linear_native(hidden, self.qkv_int8, self.qkv_scale, bias)
+            qkv = int8_linear_native(hidden, self.qkv_int8, self.qkv_scale, bias,
+                                     x_preq=x_preq)
             q = qkv[..., :self.q_size]
             k = qkv[..., self.q_size:self.q_size + self.kv_size]
             v = qkv[..., self.q_size + self.kv_size:]
@@ -193,10 +195,11 @@ class LlamaAttention(nn.Module):
         layer_idx: int = 0,
         seq_ids: Optional[List[int]] = None,
         tokens_per_seq: Optional[List[int]] = None,
+        x_preq=None,
     ) -> torch.Tensor:
         bsz = hidden.shape[0]
 
-        q, k, v = self._project_qkv(hidden)
+        q, k, v = self._project_qkv(hidden, x_preq=x_preq)
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -236,6 +239,7 @@ class LlamaAttention(nn.Module):
         kv_cache,
         layer_idx: int,
         seq_ids_tensor: torch.Tensor,
+        x_preq=None,
     ) -> torch.Tensor:
         """Decode-only attention. CUDA-graph compatible (all tensor ops)."""
         from vllm_i64.layers.attention import (
@@ -245,7 +249,7 @@ class LlamaAttention(nn.Module):
 
         bsz = hidden.shape[0]
 
-        q, k, v = self._project_qkv(hidden)
+        q, k, v = self._project_qkv(hidden, x_preq=x_preq)
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -419,18 +423,27 @@ class LlamaDecoderLayer(nn.Module):
         tokens_per_seq: Optional[List[int]] = None,
     ) -> torch.Tensor:
         residual = hidden
+
+        # Fused RMSNorm+Quant: compute norm + INT8 quantize in 1 kernel pass
+        # when INT8 pipeline active. Falls back to norm(hidden) if unavailable.
+        norm_out = self.input_layernorm(hidden)
+        x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
+
         hidden = self.self_attn(
-            self.input_layernorm(hidden),
+            norm_out,
             positions,
             kv_cache=kv_cache,
             layer_idx=layer_idx,
             seq_ids=seq_ids,
             tokens_per_seq=tokens_per_seq,
+            x_preq=x_preq,
         )
         hidden = residual + hidden
 
         residual = hidden
-        hidden = self.mlp(self.post_attention_layernorm(hidden))
+        norm_out = self.post_attention_layernorm(hidden)
+        x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_int8') or hasattr(self.mlp, 'gate_up_int8') else None
+        hidden = self.mlp(norm_out, x_preq=x_preq)
         return residual + hidden
 
     def decode_step(
@@ -443,17 +456,24 @@ class LlamaDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Decode-only layer forward. CUDA-graph compatible."""
         residual = hidden
+
+        norm_out = self.input_layernorm(hidden)
+        x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
+
         hidden = self.self_attn.decode_step(
-            self.input_layernorm(hidden),
+            norm_out,
             positions,
             kv_cache=kv_cache,
             layer_idx=layer_idx,
             seq_ids_tensor=seq_ids_tensor,
+            x_preq=x_preq,
         )
         hidden = residual + hidden
 
         residual = hidden
-        hidden = self.mlp(self.post_attention_layernorm(hidden))
+        norm_out = self.post_attention_layernorm(hidden)
+        x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_int8') or hasattr(self.mlp, 'gate_up_int8') else None
+        hidden = self.mlp(norm_out, x_preq=x_preq)
         return residual + hidden
 
 

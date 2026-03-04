@@ -43,18 +43,19 @@ class DenseMLP(nn.Module):
         # RowParallel: input dim sharded (inter_per_tp → hidden) + all_reduce
         self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, x_preq=None, **kwargs) -> torch.Tensor:
         """
         Dense SwiGLU forward.
 
+        x_preq: optional (int8, scale) from fused RMSNorm+quant — skips re-quantizing x.
         **kwargs absorbs token_ids, expert_ids, mu — dense ignores all routing args.
         """
         if hasattr(self, 'gate_fp8'):
             return self._forward_fp8(x)
         if hasattr(self, 'gate_up_int8'):
-            return self._forward_int8_fused(x)
+            return self._forward_int8_fused(x, x_preq=x_preq)
         if hasattr(self, 'gate_int8'):
-            return self._forward_int8(x)
+            return self._forward_int8(x, x_preq=x_preq)
         if hasattr(self, 'gate_int4'):
             return self._forward_int4(x)
 
@@ -81,27 +82,47 @@ class DenseMLP(nn.Module):
         out = fp8_linear(inter, self.down_fp8, self.down_fp8_scale)
         return all_reduce(out)
 
-    def _forward_int8_fused(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_int8_fused(self, x: torch.Tensor, x_preq=None) -> torch.Tensor:
         """Fused gate+up: 1 quantization + 1 matmul, then down.
-        Integer SiLU LUT + INT32 gate*up multiply."""
+        x_preq: pre-quantized (int8, scale) from fused RMSNorm+quant."""
         from vllm_i64.core.quantization import int8_fused_gate_up_native, int8_linear_native
         from vllm_i64.layers.moe import silu_multiply_integer
 
         gate, up = int8_fused_gate_up_native(
             x, self.gate_up_int8, self.gate_up_scale, self.gate_up_inter,
+            x_preq=x_preq,
         )
         inter = silu_multiply_integer(gate, up)
         out = int8_linear_native(inter, self.down_int8, self.down_scale)
         return all_reduce(out)
 
-    def _forward_int8(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_int8(self, x: torch.Tensor, x_preq=None) -> torch.Tensor:
         """Separate gate/up INT8 matmuls (no fused weights).
-        Integer SiLU LUT + INT32 gate*up multiply."""
+        Priority: CUDA I64_gemm_silu_int8 (fused gate+up+SiLU) → fallback."""
         from vllm_i64.core.quantization import int8_linear_native
         from vllm_i64.layers.moe import silu_multiply_integer
 
-        gate = int8_linear_native(x, self.gate_int8, self.gate_scale)
-        up = int8_linear_native(x, self.up_int8, self.up_scale)
+        # Priority 1: CUDA fused gate+up+SiLU — 1 kernel instead of 3
+        if x.is_cuda:
+            try:
+                from vllm_i64.kernels.cuda import get_i64_cuda_ops
+                cuda_ops = get_i64_cuda_ops()
+                if cuda_ops is not None:
+                    x_f = (x_preq[0].float() * x_preq[1].unsqueeze(1)
+                           if x_preq is not None else x.float())
+                    inter = cuda_ops.gemm_silu_int8(
+                        x_f, self.gate_int8, self.gate_scale,
+                        self.up_int8, self.up_scale,
+                    )
+                    if inter is not None:
+                        out = int8_linear_native(inter, self.down_int8, self.down_scale)
+                        return all_reduce(out)
+            except (ImportError, AttributeError, Exception):
+                pass
+
+        # Fallback: separate matmuls
+        gate = int8_linear_native(x, self.gate_int8, self.gate_scale, x_preq=x_preq)
+        up = int8_linear_native(x, self.up_int8, self.up_scale, x_preq=x_preq)
         inter = silu_multiply_integer(gate, up)
         out = int8_linear_native(inter, self.down_int8, self.down_scale)
         return all_reduce(out)

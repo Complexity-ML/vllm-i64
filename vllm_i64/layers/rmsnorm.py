@@ -26,6 +26,32 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
+    def _try_fused_quant(self, x: torch.Tensor):
+        """
+        Fused RMSNorm + INT8 quantization in 1 kernel pass.
+        Returns (int8_tensor, scale_tensor) or None if unavailable.
+        Eliminates the DRAM round-trip between norm and downstream INT8 matmul.
+        """
+        if not (x.is_cuda and x.dim() == 2):
+            return None
+        # Priority 1: CUDA I64_rmsnorm_quant_forward
+        try:
+            from vllm_i64.kernels.cuda import get_i64_cuda_ops
+            cuda_ops = get_i64_cuda_ops()
+            if cuda_ops is not None:
+                return cuda_ops.rmsnorm_quant_forward(x, self.weight.data, self.eps)
+        except (ImportError, AttributeError, Exception):
+            pass
+        # Priority 2: Triton fused RMSNorm+quant
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm_quant
+            result = triton_fused_rmsnorm_quant(x, self.weight.data, self.eps)
+            if result is not None:
+                return result
+        except ImportError:
+            pass
+        return None
+
     def _try_gpu_rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
         """Try CUDA → Triton fused RMSNorm on GPU. Returns None if unavailable."""
         if not (x.is_cuda and x.dim() == 2):

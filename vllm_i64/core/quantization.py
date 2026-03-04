@@ -92,6 +92,7 @@ def int8_linear_native(
     weight_int8: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    x_preq: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """
     INT8 linear: y = x @ W^T, with native INT8 matmul when available.
@@ -121,7 +122,11 @@ def int8_linear_native(
 
     if use_int_mm:
         # Native INT8 matmul path — CPU (VNNI/AMX) or GPU (tensor cores)
-        x_int8, x_scale = quantize_activations_int8(x_2d)
+        # x_preq: pre-quantized (int8, scale) from fused RMSNorm+quant kernel
+        if x_preq is not None:
+            x_int8, x_scale = x_preq[0], x_preq[1]
+        else:
+            x_int8, x_scale = quantize_activations_int8(x_2d)
         wt = weight_int8.t().contiguous()
         result_i32 = torch._int_mm(x_int8, wt)
         out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
@@ -162,6 +167,7 @@ def int8_fused_gate_up_native(
     fused_int8: torch.Tensor,
     fused_scale: torch.Tensor,
     inter_size: int,
+    x_preq: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Fused gate+up: single activation quantization + single INT8 matmul.
@@ -188,7 +194,10 @@ def int8_fused_gate_up_native(
     use_int_mm = _INT_MM_AVAILABLE and (x.is_cuda or _INT_MM_CPU_OK)
 
     if use_int_mm:
-        x_int8, x_scale = quantize_activations_int8(x_2d)
+        if x_preq is not None:
+            x_int8, x_scale = x_preq[0], x_preq[1]
+        else:
+            x_int8, x_scale = quantize_activations_int8(x_2d)
         wt = fused_int8.t().contiguous()
         result_i32 = torch._int_mm(x_int8, wt)
         result = result_i32.float() * (x_scale.unsqueeze(1) * fused_scale.unsqueeze(0))
