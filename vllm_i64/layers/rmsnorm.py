@@ -29,6 +29,15 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, 'weight_q12'):
             return self._forward_integer(x)
+        # Try Triton fused RMSNorm on GPU
+        if x.is_cuda and x.dim() == 2:
+            try:
+                from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm
+                out = triton_fused_rmsnorm(x, self.weight.data, self.eps)
+                if out is not None:
+                    return out
+            except ImportError:
+                pass
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * norm).type_as(x) * self.weight
 

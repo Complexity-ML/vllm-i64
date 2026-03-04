@@ -49,6 +49,8 @@ class DenseMLP(nn.Module):
 
         **kwargs absorbs token_ids, expert_ids, mu — dense ignores all routing args.
         """
+        if hasattr(self, 'gate_fp8'):
+            return self._forward_fp8(x)
         if hasattr(self, 'gate_up_int8'):
             return self._forward_int8_fused(x)
         if hasattr(self, 'gate_int8'):
@@ -58,7 +60,26 @@ class DenseMLP(nn.Module):
 
         gate = self.gate_proj(x)
         up = self.up_proj(x)
+        # Try Triton fused SiLU*up on GPU
+        if gate.is_cuda:
+            try:
+                from vllm_i64.kernels.triton.I64_fused_silu_mul import triton_fused_silu_mul
+                inter = triton_fused_silu_mul(gate, up)
+                if inter is not None:
+                    return self.down_proj(inter)
+            except ImportError:
+                pass
         return self.down_proj(F.silu(gate) * up)
+
+    def _forward_fp8(self, x: torch.Tensor) -> torch.Tensor:
+        """FP8 E4M3 forward — native tensor core ops on H100/Ada."""
+        from vllm_i64.core.fp8 import fp8_linear
+
+        gate = fp8_linear(x, self.gate_fp8, self.gate_fp8_scale)
+        up = fp8_linear(x, self.up_fp8, self.up_fp8_scale)
+        inter = F.silu(gate) * up
+        out = fp8_linear(inter, self.down_fp8, self.down_fp8_scale)
+        return all_reduce(out)
 
     def _forward_int8_fused(self, x: torch.Tensor) -> torch.Tensor:
         """Fused gate+up: 1 quantization + 1 matmul, then down.

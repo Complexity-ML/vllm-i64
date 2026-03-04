@@ -392,10 +392,13 @@ def load_model_by_name(
 
     # Post-load quantization
     if quantization and quantization != "none":
-        _quantize_experts(model, quantization)
-        _quantize_dense_mlp(model, quantization)
-        _quantize_attention(model, quantization)
-        _quantize_rmsnorm(model, quantization)
+        if quantization == "fp8":
+            _quantize_dense_mlp_fp8(model)
+        else:
+            _quantize_experts(model, quantization)
+            _quantize_dense_mlp(model, quantization)
+            _quantize_attention(model, quantization)
+            _quantize_rmsnorm(model, quantization)
         if tp.tp_rank == 0:
             print(f"  Quantized weights: {quantization}")
 
@@ -570,3 +573,35 @@ def _quantize_rmsnorm(model: nn.Module, method: str):
     for name, module in model.named_modules():
         if isinstance(module, RMSNorm):
             quantize_rmsnorm(module)
+
+
+def _quantize_dense_mlp_fp8(model: nn.Module):
+    """
+    Quantize DenseMLP weights to FP8 E4M3 for H100/Ada tensor cores.
+
+    ~2x throughput vs FP16 on Hopper GPUs. Falls back to float dequant on older GPUs.
+    """
+    from vllm_i64.layers.dense_mlp import DenseMLP
+    from vllm_i64.core.fp8 import quantize_fp8
+
+    for name, module in model.named_modules():
+        if not isinstance(module, DenseMLP):
+            continue
+
+        # Gate projection
+        w = module.gate_proj.linear.weight.data
+        w_fp8, w_scale = quantize_fp8(w)
+        module.register_buffer('gate_fp8', w_fp8)
+        module.register_buffer('gate_fp8_scale', w_scale)
+
+        # Up projection
+        w = module.up_proj.linear.weight.data
+        w_fp8, w_scale = quantize_fp8(w)
+        module.register_buffer('up_fp8', w_fp8)
+        module.register_buffer('up_fp8_scale', w_scale)
+
+        # Down projection
+        w = module.down_proj.linear.weight.data
+        w_fp8, w_scale = quantize_fp8(w)
+        module.register_buffer('down_fp8', w_fp8)
+        module.register_buffer('down_fp8_scale', w_scale)

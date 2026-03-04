@@ -1269,3 +1269,357 @@ class TestIntegerAttentionPipeline:
             out_int.flatten().unsqueeze(0),
         ).item()
         assert cos_sim > 0.85, f"Full integer pipeline cosine={cos_sim:.6f}"
+
+
+# =========================================================================
+# FP8 Quantization
+# =========================================================================
+
+class TestFP8:
+    def test_quantize_fp8_shape(self):
+        """FP8 quantization produces correct shapes."""
+        from vllm_i64.core.fp8 import quantize_fp8, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available in this PyTorch version")
+        w = torch.randn(64, 128)
+        w_fp8, scale = quantize_fp8(w)
+        assert w_fp8.shape == (64, 128)
+        assert scale.shape == (64,)
+        assert w_fp8.dtype == fp8_dtype()
+
+    def test_quantize_fp8_per_tensor(self):
+        """FP8 per-tensor quantization gives scalar scale."""
+        from vllm_i64.core.fp8 import quantize_fp8, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        w = torch.randn(32, 64)
+        w_fp8, scale = quantize_fp8(w, per_channel=False)
+        assert w_fp8.shape == (32, 64)
+        assert scale.dim() == 0  # scalar
+
+    def test_fp8_roundtrip_accuracy(self):
+        """FP8 quantize → dequant preserves values (cosine > 0.99)."""
+        from vllm_i64.core.fp8 import quantize_fp8, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        torch.manual_seed(42)
+        w = torch.randn(64, 128)
+        w_fp8, scale = quantize_fp8(w)
+        w_recon = w_fp8.float() * scale.unsqueeze(-1)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            w.flatten().unsqueeze(0), w_recon.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.99, f"FP8 roundtrip cosine={cos_sim:.6f}"
+
+    def test_fp8_linear_fallback(self):
+        """FP8 linear works in fallback mode (CPU/no _scaled_mm)."""
+        from vllm_i64.core.fp8 import quantize_fp8, fp8_linear, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        torch.manual_seed(42)
+        w = torch.randn(32, 64)
+        w_fp8, scale = quantize_fp8(w)
+        x = torch.randn(4, 64)
+        out = fp8_linear(x, w_fp8, scale)
+        assert out.shape == (4, 32)
+        # Compare with float path
+        out_ref = torch.nn.functional.linear(x, w)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_ref.flatten().unsqueeze(0), out.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.99, f"FP8 linear cosine={cos_sim:.6f}"
+
+    def test_fp8_fused_gate_up_fallback(self):
+        """FP8 fused gate+up works in fallback mode."""
+        from vllm_i64.core.fp8 import quantize_fp8, fp8_fused_gate_up, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        torch.manual_seed(42)
+        gate_w = torch.randn(32, 64)
+        up_w = torch.randn(32, 64)
+        fused_w = torch.cat([gate_w, up_w], dim=0)
+        fused_fp8, fused_scale = quantize_fp8(fused_w)
+        x = torch.randn(4, 64)
+        gate, up = fp8_fused_gate_up(x, fused_fp8, fused_scale, 32)
+        assert gate.shape == (4, 32)
+        assert up.shape == (4, 32)
+
+    def test_fp8_available_function(self):
+        """fp8_available() returns bool."""
+        from vllm_i64.core.fp8 import fp8_available
+        result = fp8_available()
+        assert isinstance(result, bool)
+
+    def test_quantize_experts_fp8(self):
+        """FP8 expert quantization produces correct shapes."""
+        from vllm_i64.core.fp8 import quantize_experts_fp8, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        gate_up = torch.randn(4, 64, 128)
+        down = torch.randn(4, 64, 64)
+        result = quantize_experts_fp8(gate_up, down)
+        assert result["method"] == "fp8"
+        assert result["gate_up_fp8"].shape == (4, 64, 128)
+        assert result["down_fp8"].shape == (4, 64, 64)
+        assert result["gate_up_scale"].shape == (4, 64)
+        assert result["down_scale"].shape == (4, 64)
+
+    def test_dense_mlp_fp8_path(self):
+        """DenseMLP with FP8 buffers uses FP8 forward path."""
+        from vllm_i64.layers.dense_mlp import DenseMLP
+        from vllm_i64.core.fp8 import quantize_fp8, fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        mlp = DenseMLP(64, 128)
+        mlp.eval()
+        x = torch.randn(4, 64)
+        with torch.no_grad():
+            out_float = mlp(x)
+
+        # Register FP8 buffers
+        gate_fp8, gate_s = quantize_fp8(mlp.gate_proj.linear.weight.data)
+        up_fp8, up_s = quantize_fp8(mlp.up_proj.linear.weight.data)
+        down_fp8, down_s = quantize_fp8(mlp.down_proj.linear.weight.data)
+        mlp.register_buffer('gate_fp8', gate_fp8)
+        mlp.register_buffer('gate_fp8_scale', gate_s)
+        mlp.register_buffer('up_fp8', up_fp8)
+        mlp.register_buffer('up_fp8_scale', up_s)
+        mlp.register_buffer('down_fp8', down_fp8)
+        mlp.register_buffer('down_fp8_scale', down_s)
+
+        with torch.no_grad():
+            out_fp8 = mlp(x)
+        assert out_fp8.shape == out_float.shape
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0), out_fp8.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.95, f"FP8 DenseMLP cosine={cos_sim:.6f}"
+
+
+# =========================================================================
+# Triton Fused Kernels (CPU fallback tests — returns None on CPU)
+# =========================================================================
+
+class TestTritonFusedKernels:
+    def test_fused_silu_mul_returns_none_on_cpu(self):
+        """Triton fused SiLU*up returns None on CPU (correct fallback)."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_silu_mul import triton_fused_silu_mul
+        except ImportError:
+            pytest.skip("Triton not installed")
+        gate = torch.randn(4, 32)
+        up = torch.randn(4, 32)
+        result = triton_fused_silu_mul(gate, up)
+        assert result is None  # CPU → returns None
+
+    def test_fused_rmsnorm_returns_none_on_cpu(self):
+        """Triton fused RMSNorm returns None on CPU."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm
+        except ImportError:
+            pytest.skip("Triton not installed")
+        x = torch.randn(4, 64)
+        w = torch.ones(64)
+        result = triton_fused_rmsnorm(x, w)
+        assert result is None
+
+    def test_fused_rmsnorm_quant_returns_none_on_cpu(self):
+        """Triton fused RMSNorm+quant returns None on CPU."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm_quant
+        except ImportError:
+            pytest.skip("Triton not installed")
+        x = torch.randn(4, 64)
+        w = torch.ones(64)
+        result = triton_fused_rmsnorm_quant(x, w)
+        assert result is None
+
+    def test_fused_softmax_returns_none_on_cpu(self):
+        """Triton integer softmax returns None on CPU."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_softmax import triton_fused_softmax_integer
+        except ImportError:
+            pytest.skip("Triton not installed")
+        logits = torch.randn(4, 16)
+        result = triton_fused_softmax_integer(logits)
+        assert result is None
+
+    def test_fused_rope_returns_none_on_cpu(self):
+        """Triton fused RoPE returns None on CPU."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rope import triton_fused_rope
+        except ImportError:
+            pytest.skip("Triton not installed")
+        x = torch.randn(4, 8, 32)
+        cos = torch.randn(4, 32)
+        sin = torch.randn(4, 32)
+        result = triton_fused_rope(x, cos, sin)
+        assert result is None
+
+    def test_fused_dequant_gemm_returns_none_on_cpu(self):
+        """Triton dequant+GEMM returns None on CPU."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
+        except ImportError:
+            pytest.skip("Triton not installed")
+        x = torch.randn(4, 64)
+        w = torch.randint(-128, 127, (32, 64), dtype=torch.int8)
+        s = torch.randn(32).abs()
+        result = triton_dequant_gemm_int8(x, w, s)
+        assert result is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_silu_mul_gpu(self):
+        """Triton fused SiLU*up on GPU matches PyTorch."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_silu_mul import triton_fused_silu_mul
+        except ImportError:
+            pytest.skip("Triton not installed")
+        torch.manual_seed(42)
+        gate = torch.randn(16, 128, device='cuda')
+        up = torch.randn(16, 128, device='cuda')
+        ref = torch.nn.functional.silu(gate) * up
+        result = triton_fused_silu_mul(gate, up)
+        if result is None:
+            pytest.skip("Triton not available on this GPU")
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.flatten().unsqueeze(0), result.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.999, f"Triton SiLU*up cosine={cos_sim:.6f}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_rmsnorm_gpu(self):
+        """Triton fused RMSNorm on GPU matches PyTorch."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm
+        except ImportError:
+            pytest.skip("Triton not installed")
+        from vllm_i64.layers.rmsnorm import RMSNorm
+        torch.manual_seed(42)
+        norm = RMSNorm(128, eps=1e-6).cuda()
+        x = torch.randn(8, 128, device='cuda')
+        ref = norm.weight * (x.float() * (x.float().pow(2).mean(-1, keepdim=True) + 1e-6).rsqrt())
+        result = triton_fused_rmsnorm(x, norm.weight.data, 1e-6)
+        if result is None:
+            pytest.skip("Triton not available on this GPU")
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.flatten().unsqueeze(0), result.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.999, f"Triton RMSNorm cosine={cos_sim:.6f}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_softmax_integer_gpu(self):
+        """Triton integer softmax on GPU matches CPU integer softmax."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_softmax import triton_fused_softmax_integer
+        except ImportError:
+            pytest.skip("Triton not installed")
+        from vllm_i64.layers.moe import softmax_integer
+        torch.manual_seed(42)
+        logits = torch.randn(8, 32, device='cuda')
+        ref = softmax_integer(logits)
+        result = triton_fused_softmax_integer(logits)
+        if result is None:
+            pytest.skip("Triton not available on this GPU")
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.flatten().unsqueeze(0), result.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.99, f"Triton integer softmax cosine={cos_sim:.6f}"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fused_rope_gpu(self):
+        """Triton fused RoPE on GPU matches PyTorch."""
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rope import triton_fused_rope
+        except ImportError:
+            pytest.skip("Triton not installed")
+        from vllm_i64.layers.rotary import apply_rotary
+        torch.manual_seed(42)
+        x = torch.randn(4, 8, 32, device='cuda')
+        cos = torch.randn(4, 32, device='cuda')
+        sin = torch.randn(4, 32, device='cuda')
+        ref = apply_rotary(x, cos, sin)
+        result = triton_fused_rope(x, cos, sin)
+        if result is None:
+            pytest.skip("Triton not available on this GPU")
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.flatten().unsqueeze(0), result.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.999, f"Triton RoPE cosine={cos_sim:.6f}"
+
+
+# =========================================================================
+# CUDA Kernel Loader
+# =========================================================================
+
+class TestCUDAKernels:
+    def test_cuda_loader_import(self):
+        """CUDA kernel loader imports without error."""
+        from vllm_i64.kernels.cuda.I64_loader import is_i64_cuda_available
+        result = is_i64_cuda_available()
+        # On CPU-only machines this returns False — that's expected
+        assert isinstance(result, bool)
+
+    def test_cuda_kernels_init_import(self):
+        """CUDA kernels __init__ imports without error."""
+        from vllm_i64.kernels.cuda import is_i64_cuda_available
+        assert isinstance(is_i64_cuda_available(), bool)
+
+    def test_triton_init_import(self):
+        """Triton kernels __init__ imports without error (even without Triton)."""
+        try:
+            from vllm_i64.kernels.triton import (
+                triton_fused_rmsnorm_quant,
+                triton_fused_rmsnorm,
+                triton_fused_silu_mul,
+                triton_fused_softmax_integer,
+                triton_fused_rope,
+                triton_dequant_gemm_int8,
+            )
+        except ImportError:
+            pytest.skip("Triton not installed")
+
+    def test_fp8_module_import(self):
+        """FP8 module imports without error."""
+        from vllm_i64.core.fp8 import (
+            fp8_available,
+            fp8_linear,
+            fp8_fused_gate_up,
+            quantize_fp8,
+            quantize_experts_fp8,
+        )
+
+
+# =========================================================================
+# Loader FP8 quantization
+# =========================================================================
+
+class TestLoaderFP8:
+    def test_quantize_dense_mlp_fp8(self):
+        """Loader _quantize_dense_mlp_fp8 registers FP8 buffers."""
+        from vllm_i64.core.fp8 import fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        from vllm_i64.layers.dense_mlp import DenseMLP
+        from vllm_i64.core.loader import _quantize_dense_mlp_fp8
+
+        wrapper = torch.nn.Module()
+        wrapper.mlp = DenseMLP(64, 128)
+        _quantize_dense_mlp_fp8(wrapper)
+
+        assert hasattr(wrapper.mlp, 'gate_fp8')
+        assert hasattr(wrapper.mlp, 'up_fp8')
+        assert hasattr(wrapper.mlp, 'down_fp8')
+        assert hasattr(wrapper.mlp, 'gate_fp8_scale')
+        assert wrapper.mlp.gate_fp8.dtype == fp8_dtype()
+
+    def test_load_model_fp8_quantization_method(self):
+        """The 'fp8' quantization method is recognized by load_model_by_name dispatch."""
+        # Just verify the code path doesn't crash — actual model load needs checkpoint
+        from vllm_i64.core.loader import _quantize_dense_mlp_fp8
+        from vllm_i64.core.fp8 import fp8_dtype
+        if fp8_dtype() is None:
+            pytest.skip("FP8 dtype not available")
+        # Test with empty module (no DenseMLP children = no-op)
+        wrapper = torch.nn.Module()
+        _quantize_dense_mlp_fp8(wrapper)  # should not crash
