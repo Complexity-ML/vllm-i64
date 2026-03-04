@@ -1188,6 +1188,7 @@ class AsyncI64Engine:
         max_kv_blocks: int = 8192,
         device: str = "cuda",
     ):
+        self.device = device
         self.engine = I64Engine(
             model=model,
             num_experts=num_experts,
@@ -1222,6 +1223,7 @@ class AsyncI64Engine:
         instance._running = False
         instance._draining = False
         instance._new_request_event = None
+        instance.device = engine.device
         instance.active_requests = 0
         instance.peak_batch_size = 0
         instance.max_queue_depth = engine.scheduler.max_batch_size * 8
