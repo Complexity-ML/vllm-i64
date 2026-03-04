@@ -19,6 +19,7 @@ INL - 2025
 import torch
 import torch.nn as nn
 import logging
+import warnings
 from typing import Optional
 
 _logger = logging.getLogger("vllm_i64.compile")
@@ -26,6 +27,16 @@ _logger = logging.getLogger("vllm_i64.compile")
 # Detect best available backend once
 _COMPILE_AVAILABLE = hasattr(torch, 'compile')
 _BEST_BACKEND: Optional[str] = None
+
+# Suppress dynamo warnings about untraceable builtins (posix._path_normpath, etc.)
+# These are triggered by try/except ImportError blocks in forward() methods.
+# The warning is harmless — dynamo falls back to eager for those ops.
+if _COMPILE_AVAILABLE:
+    try:
+        import torch._dynamo
+        torch._dynamo.config.suppress_errors = True
+    except (ImportError, AttributeError):
+        pass
 
 
 def _detect_backend() -> Optional[str]:
