@@ -1323,7 +1323,8 @@ class I64Server:
             if self._rag_index_path:
                 self.retriever.save(self._rag_index_path)
 
-            return web.json_response({"status": "ok", "chunks_added": n, "total_chunks": len(self.retriever.index.chunks)})
+            total = len(self.retriever.vector_index.chunks) if self.retriever.vector_index else n
+            return web.json_response({"status": "ok", "chunks_added": n, "total_chunks": total})
         except Exception as e:
             logger.error(f"RAG index error: {e}", exc_info=True)
             return web.json_response(
@@ -1363,7 +1364,9 @@ class I64Server:
         """GET /v1/rag/stats — RAG index statistics."""
         if not self.rag_enabled or self.retriever is None:
             return web.json_response({"enabled": False})
-        idx = self.retriever.index
+        idx = self.retriever.vector_index
+        if idx is None:
+            return web.json_response({"enabled": True, "total_chunks": 0, "dimension": 0, "index_path": getattr(self, '_rag_index_path', None)})
         return web.json_response({
             "enabled": True,
             "total_chunks": len(idx.chunks),
