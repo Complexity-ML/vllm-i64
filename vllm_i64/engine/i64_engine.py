@@ -115,6 +115,7 @@ class I64Engine:
         self.num_experts = num_experts
         self.hidden_dim = hidden_dim
         self.vocab_size = vocab_size
+        self.max_kv_blocks = max_kv_blocks
         self.device = device
         self.enable_prefix_caching = enable_prefix_caching
         self.kv_cache_dtype = kv_cache_dtype
@@ -213,13 +214,21 @@ class I64Engine:
         num_kv_heads = config.num_key_value_heads // tp.tp_size
         dtype = next(self.model.parameters()).dtype
 
+        block_size = 16
+        num_blocks = self.max_kv_blocks if self.max_kv_blocks > 0 else max(256, max_seqs * 8)
+        # Cap max_blocks_per_seq to model's max context window (avoids huge static
+        # tensor allocations in _tensor_paged_decode_attention during CUDA graph capture)
+        max_pos = getattr(config, 'max_position_embeddings', 2048)
+        max_blocks_per_seq = min(num_blocks, (max_pos + block_size - 1) // block_size)
+
         self.kv_cache = PagedKVCache(
             num_layers=config.num_hidden_layers,
             num_kv_heads=num_kv_heads,
             head_dim=config.head_dim,
-            block_size=16,
-            num_blocks=max(256, max_seqs * 8),
+            block_size=block_size,
+            num_blocks=num_blocks,
             max_seqs=max_seqs,
+            max_blocks_per_seq=max_blocks_per_seq,
             dtype=dtype,
             device=self.device,
             kv_cache_dtype=self.kv_cache_dtype,

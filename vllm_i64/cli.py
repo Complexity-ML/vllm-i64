@@ -123,6 +123,7 @@ def cmd_serve(args):
         device=device,
         enable_prefix_caching=getattr(args, 'enable_prefix_caching', False),
         kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
+        max_kv_blocks=getattr(args, 'max_kv_blocks', 0),
     )
 
     # Enable swap-to-CPU for KV cache overflow
@@ -286,6 +287,9 @@ def main():
     p_serve.add_argument("--compile-mode", default="reduce-overhead",
                          choices=["default", "reduce-overhead", "max-autotune"],
                          help="torch.compile mode (default: reduce-overhead)")
+    p_serve.add_argument("--max-kv-blocks", type=int, default=0,
+                         help="Total KV cache blocks (0 = auto: max(256, max_seqs*8)). "
+                              "Reduce to save VRAM, e.g. --max-kv-blocks 128")
     p_serve.add_argument("--enable-swap", action="store_true",
                          help="Enable swap-to-CPU for KV cache overflow")
     p_serve.add_argument("--api-key", default=None,

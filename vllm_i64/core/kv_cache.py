@@ -46,6 +46,7 @@ class PagedKVCache:
         block_size: int = 16,
         num_blocks: int = 256,
         max_seqs: int = 64,
+        max_blocks_per_seq: Optional[int] = None,
         dtype: torch.dtype = torch.float16,
         device: str = "cpu",
         kv_cache_dtype: Optional[str] = None,
@@ -71,9 +72,10 @@ class PagedKVCache:
             self.kv_dtype = dtype
         self.dtype = dtype  # backward compat (read_kv returns this dtype)
 
-        # Max blocks any single sequence can hold — any seq can use all blocks;
-        # LRU eviction handles fair sharing across sequences.
-        self.max_blocks_per_seq = num_blocks
+        # Max blocks any single sequence can hold. Capped at the model's context
+        # window (max_position_embeddings // block_size) to avoid over-allocating
+        # static tensors during CUDA graph capture.
+        self.max_blocks_per_seq = max_blocks_per_seq if max_blocks_per_seq is not None else num_blocks
 
         # KV tensors (stored in kv_dtype — may be FP8 for memory savings)
         # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
