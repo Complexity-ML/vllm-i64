@@ -243,10 +243,11 @@ class I64Server:
         self._detok_cache: Dict[int, str] = {}
 
     def _next_request_id(self) -> str:
-        """Generate a unique request ID (race-free)."""
+        """Generate a unique request ID (OpenAI-compatible format)."""
+        import uuid
         n = next(self._request_counter)
         self.request_counter = n  # Update for stats
-        return f"cmpl-{n}"
+        return f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
     def _tokenize(self, text: str) -> List[int]:
         """Text → i64 token IDs. Boundary operation."""
