@@ -28,9 +28,10 @@ _logger = logging.getLogger("vllm_i64.compile")
 _COMPILE_AVAILABLE = hasattr(torch, 'compile')
 _BEST_BACKEND: Optional[str] = None
 
-# Suppress dynamo warnings about untraceable builtins (posix._path_normpath, etc.)
+# Suppress dynamo warnings about untraceable builtins (posix._path_normpath, pybind11, etc.)
 # These are triggered by try/except ImportError blocks in forward() methods.
 # The warning is harmless — dynamo falls back to eager for those ops.
+warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 if _COMPILE_AVAILABLE:
     try:
         import torch._dynamo
