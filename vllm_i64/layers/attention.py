@@ -241,6 +241,23 @@ def naive_cached_attention(
     return out.transpose(0, 1)    # (n, num_heads, head_dim)
 
 
+def _gpu_softmax_integer(scores: torch.Tensor) -> torch.Tensor:
+    """Integer softmax — Triton GPU kernel when available, else CPU LUT."""
+    if scores.is_cuda:
+        try:
+            from vllm_i64.kernels.triton.I64_fused_softmax import triton_fused_softmax_integer
+            # Triton expects 2D (N, D) — reshape per-head scores
+            orig_shape = scores.shape
+            scores_2d = scores.reshape(-1, scores.shape[-1])
+            result = triton_fused_softmax_integer(scores_2d)
+            if result is not None:
+                return result.reshape(orig_shape)
+        except ImportError:
+            pass
+    from vllm_i64.layers.moe import softmax_integer
+    return softmax_integer(scores)
+
+
 def naive_integer_varlen_attention(
     q: torch.Tensor,           # (total_tokens, num_heads, head_dim)
     k: torch.Tensor,           # (total_tokens, num_kv_heads, head_dim)
@@ -316,8 +333,8 @@ def naive_integer_varlen_attention(
                 causal_mask = causal_mask + sw_mask
             scores = scores + causal_mask.unsqueeze(0)
 
-        # Integer softmax
-        attn = softmax_integer(scores)
+        # Integer softmax — Triton GPU kernel when available
+        attn = _gpu_softmax_integer(scores)
 
         # Float V multiply (V values need full precision for output quality)
         out_i = torch.bmm(attn.to(v_t.dtype), v_t)
@@ -390,8 +407,8 @@ def naive_integer_cached_attention(
 
     scores = scores + causal.unsqueeze(0)
 
-    # Integer softmax
-    attn = softmax_integer(scores)
+    # Integer softmax — Triton GPU kernel when available
+    attn = _gpu_softmax_integer(scores)
 
     # Float V multiply
     out = torch.bmm(attn.to(v_t.dtype), v_t)
@@ -458,7 +475,7 @@ def naive_integer_paged_decode_attention(
         v_t = v_seq.transpose(0, 1)
 
         attn = torch.bmm(q_b.float(), k_t.float().transpose(1, 2)) * softmax_scale
-        attn = softmax_integer(attn)
+        attn = _gpu_softmax_integer(attn)
         out_b = torch.bmm(attn.to(v_t.dtype), v_t).squeeze(1)
         outputs.append(out_b)
 

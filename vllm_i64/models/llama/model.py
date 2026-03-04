@@ -131,13 +131,55 @@ class LlamaAttention(nn.Module):
         return hasattr(self, 'qkv_int8')
 
     def _apply_rope(self, q, k, positions):
-        """Apply rotary embeddings — integer or float path."""
+        """Apply rotary embeddings — CUDA → Triton → integer/float fallback."""
         if self._integer_pipeline:
             cos_q14, sin_q14 = self.rope.forward_integer(positions)
+            if q.is_cuda:
+                # Priority 1: CUDA I64_rope_integer
+                try:
+                    from vllm_i64.kernels.cuda import get_i64_cuda_ops
+                    cuda_ops = get_i64_cuda_ops()
+                    if cuda_ops is not None:
+                        q_out = cuda_ops.rope_integer_forward(q, cos_q14, sin_q14)
+                        k_out = cuda_ops.rope_integer_forward(k, cos_q14, sin_q14)
+                        return q_out, k_out
+                except (ImportError, Exception):
+                    pass
+                # Priority 2: Triton fused integer RoPE
+                try:
+                    from vllm_i64.kernels.triton.I64_fused_rope import triton_fused_rope
+                    q_out = triton_fused_rope(q, cos_q14, sin_q14, integer_mode=True)
+                    if q_out is not None:
+                        k_out = triton_fused_rope(k, cos_q14, sin_q14, integer_mode=True)
+                        return q_out, k_out
+                except ImportError:
+                    pass
+            # Priority 3: PyTorch fallback
             q = apply_rotary_integer(q, cos_q14, sin_q14)
             k = apply_rotary_integer(k, cos_q14, sin_q14)
         else:
             cos, sin = self.rope(positions)
+            if q.is_cuda:
+                # Priority 1: CUDA I64_rope
+                try:
+                    from vllm_i64.kernels.cuda import get_i64_cuda_ops
+                    cuda_ops = get_i64_cuda_ops()
+                    if cuda_ops is not None:
+                        q_out = cuda_ops.rope_forward(q, cos, sin)
+                        k_out = cuda_ops.rope_forward(k, cos, sin)
+                        return q_out, k_out
+                except (ImportError, Exception):
+                    pass
+                # Priority 2: Triton fused float RoPE
+                try:
+                    from vllm_i64.kernels.triton.I64_fused_rope import triton_fused_rope
+                    q_out = triton_fused_rope(q, cos, sin, integer_mode=False)
+                    if q_out is not None:
+                        k_out = triton_fused_rope(k, cos, sin, integer_mode=False)
+                        return q_out, k_out
+                except ImportError:
+                    pass
+            # Priority 3: PyTorch fallback
             q = apply_rotary(q, cos, sin)
             k = apply_rotary(k, cos, sin)
         return q, k

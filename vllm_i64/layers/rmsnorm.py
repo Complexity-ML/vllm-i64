@@ -26,18 +26,34 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
+    def _try_gpu_rmsnorm(self, x: torch.Tensor) -> torch.Tensor:
+        """Try CUDA → Triton fused RMSNorm on GPU. Returns None if unavailable."""
+        if not (x.is_cuda and x.dim() == 2):
+            return None
+        # Priority 1: CUDA I64_rmsnorm
+        try:
+            from vllm_i64.kernels.cuda import get_i64_cuda_ops
+            cuda_ops = get_i64_cuda_ops()
+            if cuda_ops is not None:
+                return cuda_ops.rmsnorm_forward(x, self.weight.data, self.eps)
+        except (ImportError, Exception):
+            pass
+        # Priority 2: Triton fused RMSNorm
+        try:
+            from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm
+            out = triton_fused_rmsnorm(x, self.weight.data, self.eps)
+            if out is not None:
+                return out
+        except ImportError:
+            pass
+        return None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if hasattr(self, 'weight_q12'):
             return self._forward_integer(x)
-        # Try Triton fused RMSNorm on GPU
-        if x.is_cuda and x.dim() == 2:
-            try:
-                from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm
-                out = triton_fused_rmsnorm(x, self.weight.data, self.eps)
-                if out is not None:
-                    return out
-            except ImportError:
-                pass
+        out = self._try_gpu_rmsnorm(x)
+        if out is not None:
+            return out
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * norm).type_as(x) * self.weight
 
@@ -45,11 +61,12 @@ class RMSNorm(nn.Module):
         """
         Integer RMSNorm: float rsqrt (irreducible) + INT32 weight multiply.
 
-        1. Compute variance + rsqrt in float (1 scalar op per token)
-        2. Quantize normalized x to Q7 (×128 → INT32)
-        3. Multiply by pre-quantized weight_q12 in INT32
-        4. Dequant: ÷(128 × 4096) back to float
+        On GPU: CUDA → Triton fused RMSNorm (faster than integer path).
+        On CPU: Q7 normalized × Q12 weight → Q19, dequant to float.
         """
+        out = self._try_gpu_rmsnorm(x)
+        if out is not None:
+            return out
         norm = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
         xn = x.float() * norm
         xn_q7 = (xn * _Q_NORM).round().to(torch.int32)

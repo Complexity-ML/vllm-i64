@@ -104,7 +104,27 @@ def int8_linear_native(
     x_2d = x.reshape(-1, x.shape[-1])
 
     if not (_INT_MM_AVAILABLE and x.is_cuda):
-        # Fallback: dequant weight → float32 matmul (handles bf16/fp16 input)
+        if x.is_cuda:
+            # Priority 1: CUDA I64_gemm_dequant_int8
+            try:
+                from vllm_i64.kernels.cuda import get_i64_cuda_ops
+                cuda_ops = get_i64_cuda_ops()
+                if cuda_ops is not None:
+                    out = cuda_ops.gemm_dequant_int8(x_2d.float(), weight_int8, weight_scale)
+                    if bias is not None:
+                        out = out + bias
+                    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+            except (ImportError, Exception):
+                pass
+            # Priority 2: Triton fused dequant+GEMM
+            try:
+                from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
+                out = triton_dequant_gemm_int8(x_2d, weight_int8, weight_scale, bias)
+                if out is not None:
+                    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+            except ImportError:
+                pass
+        # Priority 3: dequant weight → float32 matmul
         w_float = dequantize_int8(weight_int8, weight_scale)
         out = F.linear(x_2d.float(), w_float, bias)
         return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
