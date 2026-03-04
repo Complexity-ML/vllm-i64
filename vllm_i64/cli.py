@@ -111,7 +111,7 @@ def cmd_serve(args):
     # Create engine + server (async continuous batching)
     engine = I64Engine(
         model=model,
-        num_experts=model.config.num_experts,
+        num_experts=getattr(model.config, 'num_experts', 1),
         vocab_size=model.config.vocab_size,
         device=device,
         enable_prefix_caching=getattr(args, 'enable_prefix_caching', False),

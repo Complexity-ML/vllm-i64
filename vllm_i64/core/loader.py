@@ -390,13 +390,60 @@ def load_model_by_name(
     if ckpt_path:
         load_checkpoint(model, ckpt_path, dtype=dtype, device=device)
 
-    # Post-load quantization of expert weights
+    # Post-load quantization
     if quantization and quantization != "none":
         _quantize_experts(model, quantization)
+        _quantize_dense_mlp(model, quantization)
         if tp.tp_rank == 0:
-            print(f"  Quantized expert weights: {quantization}")
+            print(f"  Quantized weights: {quantization}")
 
     return model.to(device)
+
+
+def _quantize_dense_mlp(model: nn.Module, method: str):
+    """Apply post-load quantization to DenseMLP layers (2D weights, no expert dim)."""
+    from vllm_i64.layers.dense_mlp import DenseMLP
+    from vllm_i64.core.quantization import quantize_int8, quantize_int4
+
+    if method not in ("int8", "int4"):
+        return
+
+    for name, module in model.named_modules():
+        if not isinstance(module, DenseMLP):
+            continue
+
+        gate_w = module.gate_proj.linear.weight.data
+        up_w = module.up_proj.linear.weight.data
+        down_w = module.down_proj.linear.weight.data
+
+        if method == "int8":
+            gq, gs = quantize_int8(gate_w)
+            uq, us = quantize_int8(up_w)
+            dq, ds = quantize_int8(down_w)
+            module.register_buffer("gate_int8", gq)
+            module.register_buffer("gate_scale", gs)
+            module.register_buffer("up_int8", uq)
+            module.register_buffer("up_scale", us)
+            module.register_buffer("down_int8", dq)
+            module.register_buffer("down_scale", ds)
+            # Fused gate+up for single-matmul path
+            module.register_buffer("gate_up_int8", torch.cat([gq, uq], dim=0))
+            module.register_buffer("gate_up_scale", torch.cat([gs, us]))
+            module.gate_up_inter = gq.shape[0]
+
+        elif method == "int4":
+            gp, gs, gz = quantize_int4(gate_w)
+            up, us, uz = quantize_int4(up_w)
+            dp, ds_, dz = quantize_int4(down_w)
+            module.register_buffer("gate_int4", gp)
+            module.register_buffer("gate_scale_int4", gs)
+            module.register_buffer("gate_zero", gz)
+            module.register_buffer("up_int4", up)
+            module.register_buffer("up_scale_int4", us)
+            module.register_buffer("up_zero", uz)
+            module.register_buffer("down_int4", dp)
+            module.register_buffer("down_scale_int4", ds_)
+            module.register_buffer("down_zero", dz)
 
 
 def _quantize_experts(model: nn.Module, method: str):

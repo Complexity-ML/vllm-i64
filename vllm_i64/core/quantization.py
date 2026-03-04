@@ -6,15 +6,27 @@ Routing stays i64 (no quantization needed — it's integer already).
 Only expert MLP weights get quantized.
 
 Strategies:
-  - INT8: per-channel symmetric quantization
+  - INT8: per-channel symmetric quantization (native _int_mm when available)
   - INT4: per-group asymmetric quantization (group_size=128)
+
+Native INT8 matmul:
+  torch._int_mm (PyTorch 2.2+, SM80+ GPU) does true INT8×INT8→INT32.
+  Activations dynamically quantized per-token, weights statically per-channel.
+  Fallback to dequant+F.linear on CPU or older GPUs.
 
 INL - 2025
 """
 
 import torch
+import torch.nn.functional as F
 from typing import Optional, Tuple
 from dataclasses import dataclass
+import logging
+
+_logger = logging.getLogger("vllm_i64.quantization")
+
+# Native INT8 matmul support detection
+_INT_MM_AVAILABLE = hasattr(torch, '_int_mm')
 
 
 @dataclass
@@ -41,6 +53,139 @@ def quantize_int8(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
 def dequantize_int8(quantized: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """INT8 → float."""
     return quantized.float() * scale.unsqueeze(-1)
+
+
+# =========================================================================
+# Native INT8 matmul — torch._int_mm
+# =========================================================================
+
+def quantize_activations_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Dynamic per-token INT8 symmetric quantization of activations.
+
+    x: (tokens, features) float → (tokens, features) int8 + (tokens,) scale
+    """
+    abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    scale = abs_max / 127.0
+    x_int8 = (x / scale).round().clamp(-128, 127).to(torch.int8)
+    return x_int8, scale.squeeze(-1)
+
+
+def int8_linear_native(
+    x: torch.Tensor,
+    weight_int8: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    INT8 linear: y = x @ W^T, with native INT8 matmul when available.
+
+    Uses torch._int_mm (PyTorch 2.2+, SM80+ GPU) for true integer compute:
+        1. Dynamic-quantize activations x → x_int8, x_scale  (per-token)
+        2. _int_mm(x_int8, W_int8^T) → result_int32          (native INT8)
+        3. Rescale: result_float = result_int32 * x_scale * w_scale
+
+    Falls back to dequant + F.linear on CPU or unsupported GPUs.
+
+    Args:
+        x: (*, in_features) float activations
+        weight_int8: (out_features, in_features) int8 weights
+        weight_scale: (out_features,) float per-channel scale
+        bias: optional (out_features,) float
+
+    Returns:
+        y: (*, out_features) float
+    """
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    if not (_INT_MM_AVAILABLE and x.is_cuda):
+        # Fallback: dequant weight → float matmul
+        w_float = dequantize_int8(weight_int8, weight_scale)
+        out = F.linear(x_2d, w_float, bias)
+        return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+
+    # Dynamic quantize activations
+    x_int8, x_scale = quantize_activations_int8(x_2d)
+
+    # Native INT8 matmul: (M, K) @ (K, N) → (M, N) int32
+    # weight_int8 is (out, in), need (in, out) for second operand
+    wt = weight_int8.t().contiguous()
+    result_i32 = torch._int_mm(x_int8, wt)
+
+    # Rescale: y[i,j] = result_i32[i,j] * x_scale[i] * w_scale[j]
+    out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
+
+    if bias is not None:
+        out = out + bias
+
+    return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
+
+
+def int8_fused_gate_up_native(
+    x: torch.Tensor,
+    fused_int8: torch.Tensor,
+    fused_scale: torch.Tensor,
+    inter_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fused gate+up: single activation quantization + single INT8 matmul.
+
+    gate_int8 and up_int8 pre-concatenated along dim 0 into fused_int8.
+    One _int_mm does both projections. Output split at inter_size.
+
+    Saves vs two separate int8_linear_native calls:
+      - 1 fewer activation quantization (expensive: abs, div, round, clamp)
+      - 1 fewer _int_mm kernel launch
+      - Larger matrix → better tensor core utilization
+
+    Args:
+        x: (*, hidden) float activations
+        fused_int8: (2*inter, hidden) int8 — cat([gate, up], dim=0)
+        fused_scale: (2*inter,) float — cat([gate_scale, up_scale])
+        inter_size: intermediate_size (split point)
+
+    Returns:
+        (gate, up) — each (*, inter_size) float
+    """
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+
+    if not (_INT_MM_AVAILABLE and x.is_cuda):
+        w_float = dequantize_int8(fused_int8, fused_scale)
+        result = F.linear(x_2d, w_float)
+        gate, up = result.split(inter_size, dim=-1)
+        return (
+            gate.reshape(*orig_shape[:-1], inter_size),
+            up.reshape(*orig_shape[:-1], inter_size),
+        )
+
+    x_int8, x_scale = quantize_activations_int8(x_2d)
+    wt = fused_int8.t().contiguous()
+    result_i32 = torch._int_mm(x_int8, wt)
+    result = result_i32.float() * (x_scale.unsqueeze(1) * fused_scale.unsqueeze(0))
+
+    gate, up = result.split(inter_size, dim=-1)
+    return (
+        gate.reshape(*orig_shape[:-1], inter_size),
+        up.reshape(*orig_shape[:-1], inter_size),
+    )
+
+
+def int8_linear_available() -> bool:
+    """Check if native INT8 matmul is available on current hardware."""
+    if not _INT_MM_AVAILABLE:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        # Probe with tiny matmul
+        a = torch.ones(1, 8, dtype=torch.int8, device='cuda')
+        b = torch.ones(8, 1, dtype=torch.int8, device='cuda')
+        torch._int_mm(a, b)
+        return True
+    except (RuntimeError, Exception):
+        return False
 
 
 def quantize_int4(
