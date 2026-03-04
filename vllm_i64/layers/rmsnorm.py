@@ -34,14 +34,15 @@ class RMSNorm(nn.Module):
         """
         if not (x.is_cuda and x.dim() == 2):
             return None
-        # Priority 1: CUDA I64_rmsnorm_quant_forward
-        try:
-            from vllm_i64.kernels.cuda import get_i64_cuda_ops
-            cuda_ops = get_i64_cuda_ops()
-            if cuda_ops is not None:
-                return cuda_ops.rmsnorm_quant_forward(x, self.weight.data, self.eps)
-        except (ImportError, AttributeError, Exception):
-            pass
+        # Priority 1: CUDA I64_rmsnorm_quant_forward — skip during graph capture
+        if not torch.cuda.is_current_stream_capturing():
+            try:
+                from vllm_i64.kernels.cuda import get_i64_cuda_ops
+                cuda_ops = get_i64_cuda_ops()
+                if cuda_ops is not None:
+                    return cuda_ops.rmsnorm_quant_forward(x, self.weight.data, self.eps)
+            except (ImportError, AttributeError, Exception):
+                pass
         # Priority 2: Triton fused RMSNorm+quant
         try:
             from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm_quant
@@ -56,14 +57,16 @@ class RMSNorm(nn.Module):
         """Try CUDA → Triton fused RMSNorm on GPU. Returns None if unavailable."""
         if not (x.is_cuda and x.dim() == 2):
             return None
-        # Priority 1: CUDA I64_rmsnorm
-        try:
-            from vllm_i64.kernels.cuda import get_i64_cuda_ops
-            cuda_ops = get_i64_cuda_ops()
-            if cuda_ops is not None:
-                return cuda_ops.rmsnorm_forward(x, self.weight.data, self.eps)
-        except (ImportError, Exception):
-            pass
+        # Priority 1: CUDA I64_rmsnorm — skip during graph capture (pybind11 not capture-safe)
+        capturing = torch.cuda.is_current_stream_capturing()
+        if not capturing:
+            try:
+                from vllm_i64.kernels.cuda import get_i64_cuda_ops
+                cuda_ops = get_i64_cuda_ops()
+                if cuda_ops is not None:
+                    return cuda_ops.rmsnorm_forward(x, self.weight.data, self.eps)
+            except (ImportError, Exception):
+                pass
         # Priority 2: Triton fused RMSNorm
         try:
             from vllm_i64.kernels.triton.I64_fused_rmsnorm_quant import triton_fused_rmsnorm
