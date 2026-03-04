@@ -228,7 +228,7 @@ async def test_completions_response_format(client):
     })
     data = await resp.json()
     assert "id" in data
-    assert data["id"].startswith("cmpl-")
+    assert data["id"].startswith("chatcmpl-")
     assert data["object"] == "text_completion"
     assert "created" in data
     assert data["model"] == "test-model"
