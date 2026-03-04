@@ -287,7 +287,11 @@ class I64Server:
         if self.chat_template:
             from jinja2 import Template
             tmpl = Template(self.chat_template)
-            return tmpl.render(messages=messages, add_generation_prompt=True)
+            prompt = tmpl.render(messages=messages, add_generation_prompt=True)
+            # Ensure the generation prompt is present (template may not handle add_generation_prompt)
+            if not prompt.rstrip().endswith("Assistant:"):
+                prompt = prompt.rstrip("\n") + "\nAssistant:"
+            return prompt
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
