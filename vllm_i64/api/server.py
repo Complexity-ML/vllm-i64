@@ -354,9 +354,8 @@ class I64Server:
         resp = self._build_response(result, prompt_ids)
         latency_ms = (time.monotonic() - t0) * 1000
 
-        # Track usage
-        if api_key:
-            self._usage_tracker.record(api_key, len(prompt_ids), len(result.output_tokens))
+        # Track usage (always, even without api_key)
+        self._usage_tracker.record(api_key or "", len(prompt_ids), len(result.output_tokens))
 
         # Track latency
         self._latency_tracker.record(endpoint, latency_ms)
