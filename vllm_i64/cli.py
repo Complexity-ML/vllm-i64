@@ -44,6 +44,7 @@ def cmd_serve(args):
     import torch
     from vllm_i64.core.loader import load_model_by_name
     from vllm_i64.engine.i64_engine import I64Engine
+    from vllm_i64.cpu.engine import CPUEngine
     from vllm_i64.api.server import I64Server
     from vllm_i64.core.tokenizer import load_tokenizer
     from vllm_i64.core.registry import get_model_entry
@@ -116,15 +117,20 @@ def cmd_serve(args):
                     break
 
     # Create engine + server (async continuous batching)
-    engine = I64Engine(
+    # CPU uses the dedicated CPUEngine (no CUDA graphs, thread-executor step)
+    # GPU uses the full I64Engine (CUDA graphs, Triton, FP8, etc.)
+    common_kwargs = dict(
         model=model,
         num_experts=getattr(model.config, 'num_experts', 1),
         vocab_size=model.config.vocab_size,
-        device=device,
         enable_prefix_caching=getattr(args, 'enable_prefix_caching', False),
         kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
         max_kv_blocks=getattr(args, 'max_kv_blocks', 0),
     )
+    if device == "cpu":
+        engine = CPUEngine(**common_kwargs)
+    else:
+        engine = I64Engine(**common_kwargs, device=device)
 
     # Enable swap-to-CPU for KV cache overflow
     if getattr(args, 'enable_swap', False) and engine.kv_cache is not None:

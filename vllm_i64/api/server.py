@@ -211,8 +211,12 @@ class I64Server:
         rate_limit: int = 0,
         max_pending: int = 0,
     ):
-        # Create AsyncI64Engine properly wrapping the sync engine
-        self.async_engine = AsyncI64Engine.from_sync_engine(engine)
+        # Create async engine — use dedicated CPU engine when on CPU
+        from vllm_i64.cpu.engine import CPUEngine, AsyncCPUEngine
+        if isinstance(engine, CPUEngine):
+            self.async_engine = AsyncCPUEngine.from_cpu_engine(engine)
+        else:
+            self.async_engine = AsyncI64Engine.from_sync_engine(engine)
 
         self.sync_engine = engine
         self.tokenizer = tokenizer
