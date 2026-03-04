@@ -14,12 +14,15 @@ All control flow is integer (`i64`/`i32`). Float exists only inside `model.forwa
 - **Async continuous batching** — multiple requests batched per forward pass
 - **Paged KV cache** — block-level memory management with LRU eviction
 - **Chunked prefill** — long prompts split across steps, mixed with decode
-- **Speculative decoding** — draft+verify for faster generation
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`, SSE streaming, WebSocket
+- **CPU engine** — dedicated CPU inference path, no CUDA required
+- **GPU kernels** — Triton fused experts, CUDA FP8 tensor cores, INT8/INT4 quantization
+- **Dense model support** — Llama, Mistral, Mixtral, Qwen2 (HuggingFace checkpoints)
 - **Structured output** — JSON mode, regex constraints, stop sequences
-- **LoRA hot-swap** — load/unload adapters at runtime via API
-- **Sampling** — temperature, top-k, top-p, min-p, typical-p, repetition/frequency/presence penalties, beam search
-- **Observability** — Prometheus metrics, latency percentiles, usage tracking, request logs
+- **Sampling** — temperature, top-k, top-p, min-p, typical-p, repetition/frequency/presence penalties
+- **Speculative decoding** — draft+verify (opt-in via `engine.enable_speculative()`)
+- **LoRA** — load/unload adapters at runtime (opt-in via `engine.enable_lora()`)
+- **Observability** — JSON metrics, latency percentiles, usage tracking, request logs
 
 ## Quick start
 
@@ -38,13 +41,20 @@ print(result.output_tokens)
 ### Serve
 
 ```bash
+# GPU
 python -m vllm_i64.cli serve my-model --checkpoint ./model --port 8000
+
+# CPU (no CUDA required)
+python -m vllm_i64.cli serve my-model --checkpoint ./model --port 8000 --no-cuda-graphs
+
+# Limit VRAM
+python -m vllm_i64.cli serve my-model --checkpoint ./model --max-kv-blocks 128
 ```
 
 ```bash
-curl -X POST http://localhost:8000/v1/completions \
+curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Hello world", "max_tokens": 50}'
+  -d '{"model": "my-model", "messages": [{"role": "user", "content": "Hello!"}], "max_tokens": 50}'
 ```
 
 ## API endpoints
@@ -88,19 +98,31 @@ vllm_i64/
   engine/
     i64_engine.py      # Sync + async engine, continuous batching
     i64_scheduler.py   # Integer-first scheduler with preemption
+  cpu/
+    engine.py          # Dedicated CPU engine (no CUDA, thread executor)
   api/
     server.py          # aiohttp OpenAI-compatible server
-    middleware.py       # Auth, CORS, rate limiting, load shedding
-    tracking.py         # Usage, latency, logging, priority
+    middleware.py      # Auth, CORS, rate limiting, load shedding
+    tracking.py        # Usage, latency, logging, priority
   core/
-    kv_cache.py        # Paged KV cache with prefix caching
-    sampling.py        # All sampling strategies + beam search
-    speculative.py     # Speculative decoding
-    cuda_graph.py      # CUDA graph capture for decode
+    kv_cache.py        # Paged KV cache with LRU eviction
+    sampling.py        # All sampling strategies
+    loader.py          # Checkpoint loading (FP16, INT8, INT4)
+    compile.py         # torch.compile integration
+  kernels/
+    cuda/              # CUDA kernels (FP8, INT8, attention)
+    triton/            # Triton fused expert kernels
   layers/
-    lora.py            # LoRA adapter hot-swap
-  models/              # Model implementations
-tests/                 # 530+ tests
+    attention.py       # GQA attention (flash, paged, naive)
+    rmsnorm.py         # RMSNorm (float + integer paths)
+    rotary.py          # RoPE (float + integer Q14 LUT)
+  models/
+    complexity_deep/   # Token-routed MoE (Pacific-Prime / INL)
+    llama/             # Llama-family dense models
+    mistral/           # Mistral
+    mixtral/           # Mixtral MoE
+    qwen2/             # Qwen2
+tests/                 # 650+ tests
 ```
 
 ## Tests
