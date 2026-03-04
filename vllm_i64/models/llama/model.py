@@ -90,7 +90,7 @@ class LlamaAttention(nn.Module):
         self.rope = RotaryEmbedding(
             self.head_dim,
             config.max_position_embeddings,
-            config.rope_theta,
+            getattr(config, 'rope_theta', 10000.0),
         )
 
     def _project_qkv(self, hidden: torch.Tensor) -> tuple:
