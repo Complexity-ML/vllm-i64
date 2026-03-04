@@ -545,6 +545,7 @@ class I64Server:
                 try:
                     async for chunk in self._async_stream(req):
                         await response.write(chunk.encode())
+                        await response.drain()
                 except (ConnectionResetError, ConnectionError):
                     pass  # client disconnected
                 return response
@@ -640,6 +641,7 @@ class I64Server:
                 try:
                     async for chunk in self._async_chat_stream(req, body.get("tools")):
                         await response.write(chunk.encode())
+                        await response.drain()
                 except (ConnectionResetError, ConnectionError):
                     pass  # client disconnected
                 return response

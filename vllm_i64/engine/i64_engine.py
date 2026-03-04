@@ -1355,7 +1355,14 @@ class AsyncI64Engine:
                 self.peak_batch_size = max(self.peak_batch_size, batch_size)
 
                 try:
-                    step_results = self.engine.step()
+                    # Run step() in a thread executor on CPU to avoid blocking
+                    # the event loop during the forward pass (which can take
+                    # several seconds on CPU, causing SSE connection timeouts).
+                    if self.device == "cpu":
+                        loop = asyncio.get_event_loop()
+                        step_results = await loop.run_in_executor(None, self.engine.step)
+                    else:
+                        step_results = self.engine.step()
                     _consecutive_errors = 0  # Reset on success
                 except Exception as e:
                     _consecutive_errors += 1
