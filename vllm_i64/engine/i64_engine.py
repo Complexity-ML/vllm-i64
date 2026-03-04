@@ -785,13 +785,11 @@ class I64Engine:
                 logits = self._model_forward(batch)
             else:
                 logits = torch.randn(batch.num_requests, self.vocab_size)
-        except RuntimeError as e:
-            logger.error(f"Model forward failed: {e}")
+        except Exception as e:
             self._perf_forward_ms += (time.perf_counter() - _t_fwd) * 1000
-            # Unpin and return empty — requests stay running for next step retry
             if self.kv_cache is not None:
                 self.kv_cache._pinned_seq_ids.clear()
-            return {}
+            raise  # propagate to _engine_loop error handler
 
         self._perf_forward_ms += (time.perf_counter() - _t_fwd) * 1000
 

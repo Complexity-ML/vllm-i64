@@ -1336,4 +1336,7 @@ class I64Server:
         except (NotImplementedError, OSError):
             pass  # Windows doesn't support add_signal_handler
 
-        web.run_app(app, host=self.host, port=self.port, print=None)
+        try:
+            web.run_app(app, host=self.host, port=self.port, print=None)
+        except KeyboardInterrupt:
+            pass  # Clean exit on Ctrl+C — cleanup handlers already ran

@@ -186,7 +186,7 @@ class AsyncCPUEngine(AsyncI64Engine):
                 try:
                     # Always run in thread executor on CPU — forward pass can
                     # take several seconds and must not block the event loop.
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     step_results = await loop.run_in_executor(
                         None, self.engine.step
                     )
