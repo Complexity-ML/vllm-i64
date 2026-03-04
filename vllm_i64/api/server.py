@@ -370,11 +370,13 @@ class I64Server:
         stream_id = self._next_request_id()
         created = int(time.time())
 
+        last_token_id = None
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
+            last_token_id = token_id
             token_text = self._detokenize_token(token_id)
             chunk = {
                 "id": stream_id,
@@ -389,7 +391,12 @@ class I64Server:
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-        # Final chunk with finish_reason
+        # Detect finish reason from last token
+        finish_reason = "length"
+        eos_id = getattr(self.tokenizer, 'eos_token_id', None)
+        if eos_id is not None and last_token_id == eos_id:
+            finish_reason = "stop"
+
         final = {
             "id": stream_id,
             "object": "text_completion",
@@ -398,7 +405,7 @@ class I64Server:
             "choices": [{
                 "index": 0,
                 "text": "",
-                "finish_reason": "length",
+                "finish_reason": finish_reason,
             }],
         }
         yield f"data: {json.dumps(final)}\n\n"
@@ -427,11 +434,13 @@ class I64Server:
         yield f"data: {json.dumps(first_chunk)}\n\n"
 
         # Content chunks
+        last_token_id = None
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
+            last_token_id = token_id
             token_text = self._detokenize_token(token_id)
             chunk = {
                 "id": stream_id,
@@ -446,7 +455,12 @@ class I64Server:
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-        # Final chunk with finish_reason
+        # Detect finish reason from last token
+        finish_reason = "length"
+        eos_id = getattr(self.tokenizer, 'eos_token_id', None)
+        if eos_id is not None and last_token_id == eos_id:
+            finish_reason = "stop"
+
         final = {
             "id": stream_id,
             "object": "chat.completion.chunk",
@@ -455,7 +469,7 @@ class I64Server:
             "choices": [{
                 "index": 0,
                 "delta": {},
-                "finish_reason": "stop",
+                "finish_reason": finish_reason,
             }],
         }
         yield f"data: {json.dumps(final)}\n\n"
@@ -1102,11 +1116,13 @@ class I64Server:
                 prompt_ids = self._tokenize(prompt)
 
                 try:
+                    last_token_id = None
                     async for token_id in self.async_engine.generate_stream(
                         prompt_token_ids=prompt_ids,
                         max_new_tokens=req.max_tokens,
                         sampling_params=req.to_sampling_params(tokenizer=self.tokenizer),
                     ):
+                        last_token_id = token_id
                         token_text = self._detokenize_token(token_id)
                         await ws.send_json({
                             "id": stream_id,
@@ -1115,12 +1131,16 @@ class I64Server:
                             "model": self.model_name,
                             "choices": [{"index": 0, "text": token_text, "finish_reason": None}],
                         })
+                    ws_finish = "length"
+                    eos_id = getattr(self.tokenizer, 'eos_token_id', None)
+                    if eos_id is not None and last_token_id == eos_id:
+                        ws_finish = "stop"
                     await ws.send_json({
                         "id": stream_id,
                         "object": "text_completion.chunk",
                         "created": created,
                         "model": self.model_name,
-                        "choices": [{"index": 0, "text": "", "finish_reason": "length"}],
+                        "choices": [{"index": 0, "text": "", "finish_reason": ws_finish}],
                         "done": True,
                     })
                 except Exception as e:

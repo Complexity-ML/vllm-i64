@@ -396,10 +396,13 @@ class MuGuidedAttention(nn.Module):
             cu_k = torch.zeros(len(seq_ids) + 1, dtype=torch.int32, device=q.device)
             k_parts, v_parts = [], []
 
+            # Batch-read all seq_lens in one GPU→CPU transfer
+            seq_ids_tensor = torch.tensor(seq_ids, dtype=torch.long, device=kv_cache.seq_lens.device)
+            cached_lens = kv_cache.seq_lens[seq_ids_tensor].tolist()
+
             for i, seq_id in enumerate(seq_ids):
                 cu_q[i + 1] = cu_q[i] + tokens_per_seq[i]
-                cached_len = kv_cache.seq_lens[seq_id].item()
-                cu_k[i + 1] = cu_k[i] + cached_len
+                cu_k[i + 1] = cu_k[i] + cached_lens[i]
                 kf, vf = kv_cache.read_kv(layer_idx, seq_id)
                 k_parts.append(kf)
                 v_parts.append(vf)
@@ -411,7 +414,7 @@ class MuGuidedAttention(nn.Module):
                 q, k_all, v_all,
                 cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
                 max_seqlen_q=max(tokens_per_seq),
-                max_seqlen_k=max(kv_cache.seq_lens[sid].item() for sid in seq_ids),
+                max_seqlen_k=max(cached_lens) if cached_lens else 0,
                 softmax_scale=scale,
             )
             total_tokens = q.shape[0]

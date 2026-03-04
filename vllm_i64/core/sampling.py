@@ -16,7 +16,7 @@ INL - 2025
 
 import torch
 from typing import Optional, List, Dict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
@@ -264,14 +264,17 @@ def apply_repetition_penalty_batch(
         return logits
 
     device = logits.device
-    for i in range(logits.shape[0]):
+    # Build all past tokens as a flat numpy array → single CPU→GPU transfer
+    import numpy as np
+    batch = logits.shape[0]
+    for i in range(batch):
         past = past_tokens_list[i]
         if not past:
             continue
-        # GPU-side dedup: build tensor then unique() on device
-        past_tensor = torch.tensor(past, dtype=torch.long, device=device)
+        # Single transfer: numpy → GPU tensor
+        past_np = np.array(past, dtype=np.int64)
+        past_tensor = torch.from_numpy(past_np).to(device, non_blocking=True)
         past_tensor = past_tensor.unique()
-        # Filter out-of-range
         past_tensor = past_tensor[(past_tensor >= 0) & (past_tensor < vocab_size)]
         if past_tensor.numel() == 0:
             continue
@@ -285,13 +288,21 @@ def apply_repetition_penalty_batch(
 
 
 def apply_logit_bias(logits: torch.Tensor, logit_bias: Dict[int, float]) -> torch.Tensor:
-    """Apply per-token logit bias. Modifies logits in-place."""
+    """Apply per-token logit bias. Vectorized — single GPU op."""
     if not logit_bias:
         return logits
     vocab_size = logits.shape[-1]
-    for token_id, bias in logit_bias.items():
-        if 0 <= token_id < vocab_size:
-            logits[..., token_id] += bias
+    # Filter valid token IDs and build index/value tensors in one transfer
+    valid = [(tid, b) for tid, b in logit_bias.items() if 0 <= tid < vocab_size]
+    if not valid:
+        return logits
+    ids = torch.tensor([v[0] for v in valid], dtype=torch.long, device=logits.device)
+    biases = torch.tensor([v[1] for v in valid], dtype=logits.dtype, device=logits.device)
+    if logits.dim() == 1:
+        logits.index_add_(0, ids, biases)
+    else:
+        # Broadcast: add bias to all batch rows
+        logits[:, ids] += biases.unsqueeze(0)
     return logits
 
 
@@ -362,12 +373,14 @@ def apply_frequency_presence_penalty_batch(
     if frequency_penalty == 0.0 and presence_penalty == 0.0:
         return logits
     device = logits.device
+    import numpy as np
     for i in range(logits.shape[0]):
         past = past_tokens_list[i]
         if not past:
             continue
-        # Vectorized: tensor → unique with counts in one GPU op
-        past_tensor = torch.tensor(past, dtype=torch.long, device=device)
+        # Single transfer: numpy → GPU tensor (avoids per-request sync)
+        past_np = np.array(past, dtype=np.int64)
+        past_tensor = torch.from_numpy(past_np).to(device, non_blocking=True)
         past_tensor = past_tensor[(past_tensor >= 0) & (past_tensor < vocab_size)]
         if past_tensor.numel() == 0:
             continue
@@ -566,21 +579,32 @@ def _gather_logprobs(
         List of TokenLogprob, one per batch element
     """
     batch = token_ids.shape[0]
+
+    # Batch GPU→CPU transfer: move everything to CPU once
+    token_ids_cpu = token_ids.cpu().tolist()
+    # Gather selected token logprobs: (batch,)
+    selected_lps = log_probs.gather(1, token_ids.unsqueeze(1)).squeeze(1).cpu().tolist()
+
+    # Batch topk if needed
+    top_indices_cpu = None
+    top_values_cpu = None
+    if num_top > 0:
+        k = min(num_top, log_probs.shape[-1])
+        top_values, top_indices = log_probs.topk(k, dim=-1)  # (batch, k)
+        top_indices_cpu = top_indices.cpu().tolist()
+        top_values_cpu = top_values.cpu().tolist()
+
     results = []
     for i in range(batch):
-        tid = int(token_ids[i].item())
-        lp = float(log_probs[i, tid].item())
-
         top_lps = None
-        if num_top > 0:
-            k = min(num_top, log_probs.shape[-1])
-            top_values, top_indices = log_probs[i].topk(k)
+        if top_indices_cpu is not None:
             top_lps = {
-                int(top_indices[j].item()): float(top_values[j].item())
-                for j in range(k)
+                top_indices_cpu[i][j]: top_values_cpu[i][j]
+                for j in range(len(top_indices_cpu[i]))
             }
-
-        results.append(TokenLogprob(token_id=tid, logprob=lp, top_logprobs=top_lps))
+        results.append(TokenLogprob(
+            token_id=token_ids_cpu[i], logprob=selected_lps[i], top_logprobs=top_lps,
+        ))
     return results
 
 

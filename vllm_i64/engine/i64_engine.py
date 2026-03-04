@@ -28,9 +28,8 @@ import torch
 import numpy as np
 import time
 import asyncio
-import signal
 from typing import List, Dict, Optional, Callable, Set, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections import deque
 
 from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
@@ -136,6 +135,8 @@ class I64Engine:
         _max_tokens = max_batch_size * max_seq_len
         self._buf_token_ids = torch.zeros(_max_tokens, dtype=torch.long, device=_buf_device)
         self._buf_positions = torch.zeros(_max_tokens, dtype=torch.long, device=_buf_device)
+        # Static buffer for CUDA graph seq_ids (avoid per-step allocation)
+        self._buf_seq_ids = torch.zeros(max_batch_size, dtype=torch.long, device=_buf_device)
 
         # Step counter (integer)
         self.total_steps: int = 0
@@ -320,11 +321,10 @@ class I64Engine:
         self._merge_enabled = True
 
     def _hash_prompt(self, token_ids: List[int]) -> int:
-        """Fast hash for prompt dedup."""
+        """Fast hash for prompt dedup — single call, no per-token loop."""
         import hashlib
         h = hashlib.md5()
-        for t in token_ids:
-            h.update(t.to_bytes(8, "little", signed=True))
+        h.update(np.array(token_ids, dtype=np.int64).tobytes())
         return int.from_bytes(h.digest()[:8], "little")
 
     def _allocate_slot(self, request_id: int) -> int:
@@ -735,11 +735,11 @@ class I64Engine:
         # Only rebuild if running list changed (skip if same object ids)
         _running_index: Dict[int, I64Request] = {
             req.request_id: req for req in self.scheduler.running
-        }  # TODO: incremental caching possible but dict comp is fast for <128 items
+        }
 
         # 1.5. Speculative decoding for decode-only batches (threshold batch<=8)
         if (self.speculative_decoder is not None
-                and batch.is_prefill.sum() == 0
+                and not batch.is_prefill.any()
                 and batch.num_requests <= 8):
             result = self._speculative_step(batch, _running_index)
             self.scheduler.update_after_step(result)
@@ -1007,7 +1007,7 @@ class I64Engine:
         use_graph = (
             self.cuda_graph_runner is not None
             and self.cuda_graph_runner.is_captured
-            and batch.is_prefill.sum() == 0
+            and not batch.is_prefill.any()
             and seq_ids is not None
             and len(seq_ids) > 0
             and hasattr(self.model, 'decode_step')
@@ -1024,7 +1024,9 @@ class I64Engine:
                 self.kv_cache.exit_graph_mode()
 
                 # Sync real seq_lens from graph (decode adds 1 token per seq)
-                seq_ids_tensor = torch.tensor(seq_ids, dtype=torch.long, device=self.device)
+                n = len(seq_ids)
+                self._buf_seq_ids[:n] = torch.tensor(seq_ids, dtype=torch.long)
+                seq_ids_tensor = self._buf_seq_ids[:n]
                 self.kv_cache.seq_lens[seq_ids_tensor] += 1
                 # Touch LRU tracking
                 for sid in seq_ids:
@@ -1311,7 +1313,10 @@ class AsyncI64Engine:
                 yield item
         finally:
             # Cancel engine-side request if still running (e.g. client disconnect)
-            self.engine.cancel_request(request_id)
+            # Only cancel if not already finished (avoids double-free)
+            if request_id in self._pending_futures:
+                self._pending_futures.pop(request_id, None)
+                self.engine.cancel_request(request_id)
             self.active_requests -= 1
             self._request_times.pop(request_id, None)
 

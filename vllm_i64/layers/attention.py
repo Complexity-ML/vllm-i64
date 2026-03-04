@@ -224,15 +224,14 @@ def naive_cached_attention(
     q_pos = positions.unsqueeze(1).to(compute_dtype)
     k_pos = torch.arange(total, device=q.device, dtype=compute_dtype).unsqueeze(0)
 
-    # Causal mask
-    causal = torch.where(k_pos <= q_pos, torch.zeros(1, device=q.device, dtype=compute_dtype),
-                         torch.tensor(float('-inf'), device=q.device, dtype=compute_dtype))
+    # Causal mask (use pre-computed scalars to avoid per-call tensor allocation)
+    _zero = torch.zeros(1, device=q.device, dtype=compute_dtype)
+    _neginf = torch.full((1,), float('-inf'), device=q.device, dtype=compute_dtype)
+    causal = torch.where(k_pos <= q_pos, _zero, _neginf)
 
     # Sliding window: mask positions outside window
     if sliding_window is not None:
-        sw_mask = torch.where(q_pos - k_pos < sliding_window,
-                              torch.zeros(1, device=q.device, dtype=compute_dtype),
-                              torch.tensor(float('-inf'), device=q.device, dtype=compute_dtype))
+        sw_mask = torch.where(q_pos - k_pos < sliding_window, _zero, _neginf)
         causal = causal + sw_mask
 
     attn = attn + causal.unsqueeze(0)

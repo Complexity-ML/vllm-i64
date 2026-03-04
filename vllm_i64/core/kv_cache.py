@@ -182,6 +182,18 @@ class PagedKVCache:
         self._access_counter += 1
         self._last_access[seq_id] = self._access_counter
         heapq.heappush(self._lru_heap, (self._access_counter, seq_id))
+        # Periodic compaction: if heap has >4x active entries, rebuild
+        if len(self._lru_heap) > max(256, 4 * len(self._active_seq_ids)):
+            self._compact_lru_heap()
+
+    def _compact_lru_heap(self):
+        """Remove stale entries from the LRU heap."""
+        fresh = [
+            (tick, sid) for tick, sid in self._lru_heap
+            if sid in self._active_seq_ids and self._last_access.get(sid) == tick
+        ]
+        heapq.heapify(fresh)
+        self._lru_heap = fresh
 
     def _evict_lru(self, num_blocks_needed: int, protect_seq_id: int = -1) -> int:
         """
@@ -381,20 +393,22 @@ class PagedKVCache:
         block_indices = pos_np // self.block_size
         offsets = pos_np % self.block_size
 
-        # Pre-allocate any missing blocks (single batch call)
+        # Pre-allocate any missing blocks — single batch read (1 GPU→CPU transfer)
         unique_blocks = sorted(set(int(b) for b in block_indices))
-        missing = sum(1 for bidx in unique_blocks if self.block_table[seq_id, bidx].item() < 0)
+        block_vals = self.block_table[seq_id, unique_blocks].tolist()
+        missing = sum(1 for v in block_vals if v < 0)
         if missing > 0:
             self.allocate_blocks(seq_id, missing)
+            # Re-read after allocation
+            block_vals = self.block_table[seq_id, unique_blocks].tolist()
 
-        # Fetch all physical block IDs in one tensor op (1 GPU→CPU transfer)
         # Copy-on-write: ensure shared prefix blocks get private copies
-        for bidx in unique_blocks:
-            pb = self.block_table[seq_id, bidx].item()
-            if pb >= 0:
-                self._cow_if_shared(seq_id, bidx, pb)
-        block_map_tensor = self.block_table[seq_id, unique_blocks]
-        block_map = {bidx: int(block_map_tensor[i]) for i, bidx in enumerate(unique_blocks)}
+        for i, bidx in enumerate(unique_blocks):
+            if block_vals[i] >= 0:
+                self._cow_if_shared(seq_id, bidx, block_vals[i])
+        # Re-read after potential CoW copies
+        block_vals = self.block_table[seq_id, unique_blocks].tolist()
+        block_map = {bidx: block_vals[i] for i, bidx in enumerate(unique_blocks)}
 
         # Write using cached block map — skip dtype conversion if already correct
         k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
@@ -420,7 +434,8 @@ class PagedKVCache:
                 self.v_caches[layer_idx][pb, offs, :, :] = v_kv[idxs]
 
         max_pos = int(pos_np.max()) + 1
-        self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), max_pos)
+        cur_len = int(self.seq_lens[seq_id])
+        self.seq_lens[seq_id] = max(cur_len, max_pos)
         self._touch(seq_id)
 
     def get_cache_tensors(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
