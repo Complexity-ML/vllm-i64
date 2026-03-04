@@ -660,3 +660,286 @@ class TestFusedInt8:
             out_int8.flatten().unsqueeze(0),
         ).item()
         assert cos_sim > 0.90
+
+
+# =========================================================================
+# Integer SiLU LUT + INT32 gate*up multiply
+# =========================================================================
+
+class TestIntegerSiluMultiply:
+    def test_silu_multiply_integer_shape(self):
+        """silu_multiply_integer returns correct shape."""
+        from vllm_i64.layers.moe import silu_multiply_integer
+        gate = torch.randn(8, 128)
+        up = torch.randn(8, 128)
+        out = silu_multiply_integer(gate, up)
+        assert out.shape == (8, 128)
+        assert out.dtype == torch.float32
+
+    def test_silu_multiply_integer_vs_float(self):
+        """Integer SiLU*up is close to float F.silu(gate)*up."""
+        from vllm_i64.layers.moe import silu_multiply_integer
+        torch.manual_seed(42)
+        gate = torch.randn(16, 64)
+        up = torch.randn(16, 64)
+        ref = torch.nn.functional.silu(gate) * up
+        out = silu_multiply_integer(gate, up)
+        cos_sim = torch.nn.functional.cosine_similarity(
+            ref.flatten().unsqueeze(0),
+            out.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.99
+
+    def test_silu_multiply_integer_large_values(self):
+        """Values outside LUT range [-8,8] handled correctly."""
+        from vllm_i64.layers.moe import silu_multiply_integer
+        gate = torch.tensor([[10.0, -10.0, 0.0, 5.0]])
+        up = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        out = silu_multiply_integer(gate, up)
+        ref = torch.nn.functional.silu(gate) * up
+        # For x=10: silu(10) ≈ 10, for x=-10: silu(-10) ≈ 0
+        assert out[0, 0].item() > 9.0   # silu(10) ≈ 10
+        assert abs(out[0, 1].item()) < 0.1  # silu(-10) ≈ 0
+        assert abs(out[0, 2].item()) < 0.01  # silu(0) = 0
+
+    def test_moe_expert_integer_silu_forward(self):
+        """MoEExpert INT8 path now uses integer SiLU + INT32 multiply."""
+        from vllm_i64.layers.moe import MoEExpert
+        from vllm_i64.core.quantization import quantize_int8
+        torch.manual_seed(42)
+        expert = MoEExpert(64, 128)
+        expert.eval()
+        x = torch.randn(8, 64)
+        with torch.no_grad():
+            out_float = expert(x)
+        # Quantize + fuse (triggers integer SiLU path)
+        w1_q, w1_s = quantize_int8(expert.w1.weight.data)
+        w3_q, w3_s = quantize_int8(expert.w3.weight.data)
+        w2_q, w2_s = quantize_int8(expert.w2.weight.data)
+        expert.register_buffer('w13_int8', torch.cat([w1_q, w3_q], dim=0))
+        expert.register_buffer('w13_scale', torch.cat([w1_s, w3_s]))
+        expert.w13_inter = w1_q.shape[0]
+        expert.register_buffer('w2_int8', w2_q)
+        expert.register_buffer('w2_scale', w2_s)
+        with torch.no_grad():
+            out_int = expert(x)
+        assert out_int.shape == out_float.shape
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.93
+
+    def test_dense_mlp_integer_silu(self):
+        """DenseMLP INT8 path uses integer SiLU + INT32 multiply."""
+        from vllm_i64.layers.dense_mlp import DenseMLP
+        from vllm_i64.core.quantization import quantize_int8
+        torch.manual_seed(42)
+        mlp = DenseMLP(64, 128)
+        mlp.eval()
+        x = torch.randn(8, 64)
+        with torch.no_grad():
+            out_float = mlp(x)
+        # Quantize (separate path — gate_int8)
+        gq, gs = quantize_int8(mlp.gate_proj.linear.weight.data)
+        uq, us = quantize_int8(mlp.up_proj.linear.weight.data)
+        dq, ds = quantize_int8(mlp.down_proj.linear.weight.data)
+        mlp.register_buffer("gate_int8", gq)
+        mlp.register_buffer("gate_scale", gs)
+        mlp.register_buffer("up_int8", uq)
+        mlp.register_buffer("up_scale", us)
+        mlp.register_buffer("down_int8", dq)
+        mlp.register_buffer("down_scale", ds)
+        with torch.no_grad():
+            out_int = mlp(x)
+        assert out_int.shape == out_float.shape
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.93
+
+
+# =========================================================================
+# INT8 Attention QKV + O
+# =========================================================================
+
+class TestInt8Attention:
+    def _make_config(self):
+        """Create a minimal config for LlamaAttention."""
+        class Config:
+            hidden_size = 64
+            num_attention_heads = 4
+            num_key_value_heads = 2
+            head_dim = 16
+            attention_bias = False
+            use_qk_norm = False
+            max_position_embeddings = 128
+            rope_theta = 10000.0
+        return Config()
+
+    def test_qkv_int8_forward_shape(self):
+        """LlamaAttention with INT8 QKV produces correct output shape."""
+        from vllm_i64.models.llama.model import LlamaAttention
+        from vllm_i64.core.quantization import quantize_int8
+        config = self._make_config()
+        attn = LlamaAttention(config)
+        attn.eval()
+        # Quantize QKV
+        q_w = attn.q_proj.linear.weight.data
+        k_w = attn.k_proj.linear.weight.data
+        v_w = attn.v_proj.linear.weight.data
+        qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+        qkv_q, qkv_s = quantize_int8(qkv_w)
+        attn.register_buffer("qkv_int8", qkv_q)
+        attn.register_buffer("qkv_scale", qkv_s)
+        attn.q_size = q_w.shape[0]
+        attn.kv_size = k_w.shape[0]
+        # Quantize O
+        o_w = attn.o_proj.linear.weight.data
+        o_q, o_s = quantize_int8(o_w)
+        attn.register_buffer("o_int8", o_q)
+        attn.register_buffer("o_scale", o_s)
+        # Forward
+        hidden = torch.randn(8, 64)
+        positions = torch.arange(8)
+        with torch.no_grad():
+            out = attn(hidden, positions, tokens_per_seq=[8])
+        assert out.shape == (8, 64)
+
+    def test_qkv_int8_vs_float(self):
+        """INT8 QKV+O attention is close to float attention."""
+        from vllm_i64.models.llama.model import LlamaAttention
+        from vllm_i64.core.quantization import quantize_int8
+        torch.manual_seed(42)
+        config = self._make_config()
+        attn = LlamaAttention(config)
+        attn.eval()
+        hidden = torch.randn(8, 64)
+        positions = torch.arange(8)
+        with torch.no_grad():
+            out_float = attn(hidden, positions, tokens_per_seq=[8])
+        # Quantize
+        q_w = attn.q_proj.linear.weight.data
+        k_w = attn.k_proj.linear.weight.data
+        v_w = attn.v_proj.linear.weight.data
+        qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+        qkv_q, qkv_s = quantize_int8(qkv_w)
+        attn.register_buffer("qkv_int8", qkv_q)
+        attn.register_buffer("qkv_scale", qkv_s)
+        attn.q_size = q_w.shape[0]
+        attn.kv_size = k_w.shape[0]
+        o_w = attn.o_proj.linear.weight.data
+        o_q, o_s = quantize_int8(o_w)
+        attn.register_buffer("o_int8", o_q)
+        attn.register_buffer("o_scale", o_s)
+        with torch.no_grad():
+            out_int8 = attn(hidden, positions, tokens_per_seq=[8])
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int8.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.95
+
+    def test_qkv_int8_with_bias(self):
+        """INT8 QKV with attention_bias=True works correctly."""
+        from vllm_i64.models.llama.model import LlamaAttention
+        from vllm_i64.core.quantization import quantize_int8
+        torch.manual_seed(42)
+        config = self._make_config()
+        config.attention_bias = True
+        attn = LlamaAttention(config)
+        attn.eval()
+        hidden = torch.randn(4, 64)
+        positions = torch.arange(4)
+        with torch.no_grad():
+            out_float = attn(hidden, positions, tokens_per_seq=[4])
+        # Quantize with bias
+        q_w = attn.q_proj.linear.weight.data
+        k_w = attn.k_proj.linear.weight.data
+        v_w = attn.v_proj.linear.weight.data
+        qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+        qkv_q, qkv_s = quantize_int8(qkv_w)
+        attn.register_buffer("qkv_int8", qkv_q)
+        attn.register_buffer("qkv_scale", qkv_s)
+        attn.q_size = q_w.shape[0]
+        attn.kv_size = k_w.shape[0]
+        qkv_bias = torch.cat([
+            attn.q_proj.linear.bias.data,
+            attn.k_proj.linear.bias.data,
+            attn.v_proj.linear.bias.data,
+        ])
+        attn.register_buffer("qkv_bias", qkv_bias)
+        o_w = attn.o_proj.linear.weight.data
+        o_q, o_s = quantize_int8(o_w)
+        attn.register_buffer("o_int8", o_q)
+        attn.register_buffer("o_scale", o_s)
+        attn.register_buffer("o_bias", attn.o_proj.linear.bias.data.clone())
+        with torch.no_grad():
+            out_int8 = attn(hidden, positions, tokens_per_seq=[4])
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int8.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.95
+
+    def test_quantize_attention_loader(self):
+        """_quantize_attention from loader creates correct buffers."""
+        from vllm_i64.models.llama.model import LlamaAttention
+        config = self._make_config()
+        attn = LlamaAttention(config)
+        # Wrap in module for named_modules iteration
+        wrapper = torch.nn.Module()
+        wrapper.attn = attn
+        from vllm_i64.core.loader import _quantize_attention
+        _quantize_attention(wrapper, "int8")
+        assert hasattr(attn, 'qkv_int8')
+        assert hasattr(attn, 'qkv_scale')
+        assert hasattr(attn, 'o_int8')
+        assert hasattr(attn, 'o_scale')
+        # Check shapes: QKV fused = (q + k + v output dims, hidden)
+        q_size = config.num_attention_heads * config.head_dim  # 4*16 = 64
+        kv_size = config.num_key_value_heads * config.head_dim  # 2*16 = 32
+        assert attn.qkv_int8.shape == (q_size + 2 * kv_size, config.hidden_size)
+        assert attn.q_size == q_size
+        assert attn.kv_size == kv_size
+        assert attn.o_int8.shape == (config.hidden_size, q_size)
+
+    def test_quantize_attention_skips_int4(self):
+        """_quantize_attention does nothing for int4 method."""
+        from vllm_i64.models.llama.model import LlamaAttention
+        config = self._make_config()
+        attn = LlamaAttention(config)
+        wrapper = torch.nn.Module()
+        wrapper.attn = attn
+        from vllm_i64.core.loader import _quantize_attention
+        _quantize_attention(wrapper, "int4")
+        assert not hasattr(attn, 'qkv_int8')
+
+    def test_full_llama_layer_int8(self):
+        """Full LlamaDecoderLayer with INT8 attention + INT8 MLP."""
+        from vllm_i64.models.llama.model import LlamaDecoderLayer
+        from vllm_i64.core.loader import _quantize_attention, _quantize_dense_mlp
+        torch.manual_seed(42)
+        config = self._make_config()
+        config.intermediate_size = 128
+        config.rms_norm_eps = 1e-5
+        layer = LlamaDecoderLayer(config)
+        layer.eval()
+        hidden = torch.randn(8, 64)
+        positions = torch.arange(8)
+        with torch.no_grad():
+            out_float = layer(hidden, positions, tokens_per_seq=[8])
+        # Quantize everything
+        wrapper = torch.nn.Module()
+        wrapper.layer = layer
+        _quantize_attention(wrapper, "int8")
+        _quantize_dense_mlp(wrapper, "int8")
+        with torch.no_grad():
+            out_int8 = layer(hidden, positions, tokens_per_seq=[8])
+        assert out_int8.shape == out_float.shape
+        cos_sim = torch.nn.functional.cosine_similarity(
+            out_float.flatten().unsqueeze(0),
+            out_int8.flatten().unsqueeze(0),
+        ).item()
+        assert cos_sim > 0.90

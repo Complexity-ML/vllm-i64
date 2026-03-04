@@ -63,11 +63,15 @@ def quantize_activations_int8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tens
     """
     Dynamic per-token INT8 symmetric quantization of activations.
 
-    x: (tokens, features) float → (tokens, features) int8 + (tokens,) scale
+    x: (tokens, features) any float → (tokens, features) int8 + (tokens,) float32 scale
+
+    Always computes in float32 — bf16 has only 8-bit mantissa,
+    not enough precision for scale computation before INT8 quantization.
     """
-    abs_max = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+    x_f32 = x.float()
+    abs_max = x_f32.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
     scale = abs_max / 127.0
-    x_int8 = (x / scale).round().clamp(-128, 127).to(torch.int8)
+    x_int8 = (x_f32 / scale).round().clamp(-128, 127).to(torch.int8)
     return x_int8, scale.squeeze(-1)
 
 
@@ -100,9 +104,9 @@ def int8_linear_native(
     x_2d = x.reshape(-1, x.shape[-1])
 
     if not (_INT_MM_AVAILABLE and x.is_cuda):
-        # Fallback: dequant weight → float matmul
+        # Fallback: dequant weight → float32 matmul (handles bf16/fp16 input)
         w_float = dequantize_int8(weight_int8, weight_scale)
-        out = F.linear(x_2d, w_float, bias)
+        out = F.linear(x_2d.float(), w_float, bias)
         return out.reshape(*orig_shape[:-1], weight_int8.shape[0])
 
     # Dynamic quantize activations
@@ -153,7 +157,7 @@ def int8_fused_gate_up_native(
 
     if not (_INT_MM_AVAILABLE and x.is_cuda):
         w_float = dequantize_int8(fused_int8, fused_scale)
-        result = F.linear(x_2d, w_float)
+        result = F.linear(x_2d.float(), w_float)
         gate, up = result.split(inter_size, dim=-1)
         return (
             gate.reshape(*orig_shape[:-1], inter_size),
@@ -290,8 +294,10 @@ def int4_linear(
     if squeeze:
         x = x.unsqueeze(0)
 
+    # Always compute in float32 (bf16/fp16 mixed with dequant float would crash)
+    x = x.float()
     batch = x.shape[0]
-    y = torch.zeros(batch, out_features, dtype=x.dtype, device=x.device)
+    y = torch.zeros(batch, out_features, dtype=torch.float32, device=x.device)
 
     # Process by groups: unpack + dequant + accumulate partial GEMM
     for g in range(num_groups):

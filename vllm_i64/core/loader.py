@@ -394,6 +394,7 @@ def load_model_by_name(
     if quantization and quantization != "none":
         _quantize_experts(model, quantization)
         _quantize_dense_mlp(model, quantization)
+        _quantize_attention(model, quantization)
         if tp.tp_rank == 0:
             print(f"  Quantized weights: {quantization}")
 
@@ -498,3 +499,56 @@ def _quantize_experts(model: nn.Module, method: str):
             module.register_buffer("down_int4", torch.stack(dn_p))
             module.register_buffer("down_scale_int4", torch.stack(dn_s))
             module.register_buffer("down_zero", torch.stack(dn_z))
+
+
+def _quantize_attention(model: nn.Module, method: str):
+    """
+    Apply post-load INT8 quantization to LlamaAttention layers.
+
+    Fused QKV: cat([Q, K, V], dim=0) → single INT8 matmul, split output.
+    O: separate INT8 matmul + all_reduce (RowParallel replacement).
+    """
+    from vllm_i64.models.llama.model import LlamaAttention
+    from vllm_i64.core.quantization import quantize_int8
+
+    if method != "int8":
+        return  # Only INT8 for attention (INT4 attention has too much error)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, LlamaAttention):
+            continue
+
+        # Fused QKV — single matmul for all three projections
+        q_w = module.q_proj.linear.weight.data
+        k_w = module.k_proj.linear.weight.data
+        v_w = module.v_proj.linear.weight.data
+        qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+        qkv_q, qkv_s = quantize_int8(qkv_w)
+        module.register_buffer("qkv_int8", qkv_q)
+        module.register_buffer("qkv_scale", qkv_s)
+        module.q_size = q_w.shape[0]
+        module.kv_size = k_w.shape[0]
+
+        # QKV bias (if present)
+        if module.q_proj.linear.bias is not None:
+            qkv_bias = torch.cat([
+                module.q_proj.linear.bias.data,
+                module.k_proj.linear.bias.data,
+                module.v_proj.linear.bias.data,
+            ])
+            module.register_buffer("qkv_bias", qkv_bias)
+
+        # O projection — INT8 matmul (replaces RowParallelLinear)
+        o_w = module.o_proj.linear.weight.data
+        o_q, o_s = quantize_int8(o_w)
+        module.register_buffer("o_int8", o_q)
+        module.register_buffer("o_scale", o_s)
+
+        if module.o_proj.linear.bias is not None:
+            module.register_buffer("o_bias", module.o_proj.linear.bias.data.clone())
+
+        # Free float weights — INT8 buffers replace them
+        module.q_proj.linear.weight = None
+        module.k_proj.linear.weight = None
+        module.v_proj.linear.weight = None
+        module.o_proj.linear.weight = None

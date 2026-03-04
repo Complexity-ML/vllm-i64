@@ -61,23 +61,27 @@ class DenseMLP(nn.Module):
         return self.down_proj(F.silu(gate) * up)
 
     def _forward_int8_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused gate+up: 1 quantization + 1 matmul, then down."""
+        """Fused gate+up: 1 quantization + 1 matmul, then down.
+        Integer SiLU LUT + INT32 gate*up multiply."""
         from vllm_i64.core.quantization import int8_fused_gate_up_native, int8_linear_native
+        from vllm_i64.layers.moe import silu_multiply_integer
 
         gate, up = int8_fused_gate_up_native(
             x, self.gate_up_int8, self.gate_up_scale, self.gate_up_inter,
         )
-        inter = F.silu(gate) * up
+        inter = silu_multiply_integer(gate, up)
         out = int8_linear_native(inter, self.down_int8, self.down_scale)
         return all_reduce(out)
 
     def _forward_int8(self, x: torch.Tensor) -> torch.Tensor:
-        """Separate gate/up INT8 matmuls (no fused weights)."""
+        """Separate gate/up INT8 matmuls (no fused weights).
+        Integer SiLU LUT + INT32 gate*up multiply."""
         from vllm_i64.core.quantization import int8_linear_native
+        from vllm_i64.layers.moe import silu_multiply_integer
 
         gate = int8_linear_native(x, self.gate_int8, self.gate_scale)
         up = int8_linear_native(x, self.up_int8, self.up_scale)
-        inter = F.silu(gate) * up
+        inter = silu_multiply_integer(gate, up)
         out = int8_linear_native(inter, self.down_int8, self.down_scale)
         return all_reduce(out)
 

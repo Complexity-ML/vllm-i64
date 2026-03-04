@@ -93,6 +93,38 @@ class LlamaAttention(nn.Module):
             config.rope_theta,
         )
 
+    def _project_qkv(self, hidden: torch.Tensor) -> tuple:
+        """Project hidden → Q, K, V. Uses fused INT8 matmul when quantized."""
+        bsz = hidden.shape[0]
+        if hasattr(self, 'qkv_int8'):
+            from vllm_i64.core.quantization import int8_linear_native
+            bias = getattr(self, 'qkv_bias', None)
+            qkv = int8_linear_native(hidden, self.qkv_int8, self.qkv_scale, bias)
+            q = qkv[..., :self.q_size]
+            k = qkv[..., self.q_size:self.q_size + self.kv_size]
+            v = qkv[..., self.q_size + self.kv_size:]
+        else:
+            q = self.q_proj(hidden)
+            k = self.k_proj(hidden)
+            v = self.v_proj(hidden)
+        q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
+        k = k.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+        v = v.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+        return q, k, v
+
+    def _apply_o_proj(self, out: torch.Tensor) -> torch.Tensor:
+        """Apply output projection. Uses INT8 matmul + all_reduce when quantized."""
+        if hasattr(self, 'o_int8'):
+            from vllm_i64.core.quantization import int8_linear_native
+            from vllm_i64.parallel.tensor_parallel import all_reduce
+            bias = getattr(self, 'o_bias', None)
+            result = int8_linear_native(out, self.o_int8, self.o_scale, bias)
+            return all_reduce(result)
+        # Attention may compute in float32; cast to match o_proj weight dtype
+        if out.dtype != self.o_proj.linear.weight.dtype:
+            out = out.to(self.o_proj.linear.weight.dtype)
+        return self.o_proj(out)
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -105,13 +137,7 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         bsz = hidden.shape[0]
 
-        q = self.q_proj(hidden)
-        k = self.k_proj(hidden)
-        v = self.v_proj(hidden)
-
-        q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
-        k = k.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
-        v = v.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+        q, k, v = self._project_qkv(hidden)
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -141,7 +167,7 @@ class LlamaAttention(nn.Module):
             out = naive_varlen_attention(q, k, v, tps, self.num_kv_groups, softmax_scale=scale)
 
         out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
-        return self.o_proj(out)
+        return self._apply_o_proj(out)
 
     def decode_step(
         self,
@@ -159,13 +185,7 @@ class LlamaAttention(nn.Module):
 
         bsz = hidden.shape[0]
 
-        q = self.q_proj(hidden)
-        k = self.k_proj(hidden)
-        v = self.v_proj(hidden)
-
-        q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
-        k = k.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
-        v = v.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
+        q, k, v = self._project_qkv(hidden)
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -200,7 +220,7 @@ class LlamaAttention(nn.Module):
             )
 
         out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
-        return self.o_proj(out)
+        return self._apply_o_proj(out)
 
     def _cached_attention(
         self,
@@ -249,7 +269,7 @@ class LlamaAttention(nn.Module):
             )
             out = out.squeeze(1)
             out = out.reshape(batch_size, self.num_heads_per_tp * self.head_dim)
-            return self.o_proj(out)
+            return self._apply_o_proj(out)
 
         if use_flash:
             cu_q = torch.zeros(len(seq_ids) + 1, dtype=torch.int32, device=q.device)
@@ -281,7 +301,7 @@ class LlamaAttention(nn.Module):
             )
             total_tokens = q.shape[0]
             out = out.reshape(total_tokens, self.num_heads_per_tp * self.head_dim)
-            return self.o_proj(out)
+            return self._apply_o_proj(out)
 
         # === Naive fallback ===
         outputs = []
@@ -300,9 +320,10 @@ class LlamaAttention(nn.Module):
             offset += n
 
         out = torch.cat(outputs, dim=0)
-        if out.dtype != self.o_proj.linear.weight.dtype:
-            out = out.to(self.o_proj.linear.weight.dtype)
-        return self.o_proj(out)
+        if not hasattr(self, 'o_int8'):
+            if out.dtype != self.o_proj.linear.weight.dtype:
+                out = out.to(self.o_proj.linear.weight.dtype)
+        return self._apply_o_proj(out)
 
 
 # =========================================================================

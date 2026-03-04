@@ -60,8 +60,8 @@ def softmax_integer(logits: torch.Tensor) -> torch.Tensor:
     5. Normalize: weight_i = exp_i / sum(exp)
     6. Return float (experts still compute in float)
     """
-    # Q7 quantization
-    logits_i32 = (logits * _Q_IN).round().to(torch.int32)
+    # Q7 quantization — float32 for precision (bf16/fp16 mantissa too short)
+    logits_i32 = (logits.float() * _Q_IN).round().to(torch.int32)
 
     # Subtract row max → all values ≤ 0
     row_max = logits_i32.max(dim=-1, keepdim=True).values
@@ -119,6 +119,27 @@ def silu_integer(x_q7: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def silu_multiply_integer(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """
+    Integer SiLU + multiply: silu(gate) * up, all in fixed-point INT32.
+
+    Replaces F.silu(gate) * up with:
+        1. Quantize gate/up to Q7 (×128, round to INT32)
+        2. SiLU via 2049-entry LUT on gate
+        3. Multiply in INT32 (Q7 × Q7 → Q14)
+        4. Dequantize back to float (÷ 128²)
+
+    Q7 covers [-8.0, 8.0] at 1/128 resolution.
+    Outside: silu(x) ≈ x for x >> 0, ≈ 0 for x << 0.
+    """
+    # float32 for quantization — bf16 mantissa (8-bit) loses precision at Q7 scale
+    gate_q7 = (gate.float() * _Q_IN).round().to(torch.int32)
+    silu_q7 = silu_integer(gate_q7)
+    up_q7 = (up.float() * _Q_IN).round().to(torch.int32)
+    inter_q14 = silu_q7 * up_q7
+    return inter_q14.float() / (_Q_IN * _Q_IN)
+
+
 class MoEExpert(nn.Module):
     """
     Single expert MLP (SwiGLU). HF naming: w1/w2/w3.
@@ -142,19 +163,23 @@ class MoEExpert(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def _forward_int8_fused(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused gate+up: 1 quantization + 1 matmul for w1/w3, then w2."""
+        """Fused gate+up: 1 quantization + 1 matmul for w1/w3, then w2.
+        Integer SiLU LUT + INT32 gate*up multiply."""
         from vllm_i64.core.quantization import int8_fused_gate_up_native, int8_linear_native
         gate, up = int8_fused_gate_up_native(
             x, self.w13_int8, self.w13_scale, self.w13_inter,
         )
-        return int8_linear_native(F.silu(gate) * up, self.w2_int8, self.w2_scale)
+        inter = silu_multiply_integer(gate, up)
+        return int8_linear_native(inter, self.w2_int8, self.w2_scale)
 
     def _forward_int8(self, x: torch.Tensor) -> torch.Tensor:
-        """Separate gate/up INT8 matmuls (no fused weights available)."""
+        """Separate gate/up INT8 matmuls (no fused weights available).
+        Integer SiLU LUT + INT32 gate*up multiply."""
         from vllm_i64.core.quantization import int8_linear_native
         gate = int8_linear_native(x, self.w1_int8, self.w1_scale)
         up = int8_linear_native(x, self.w3_int8, self.w3_scale)
-        return int8_linear_native(F.silu(gate) * up, self.w2_int8, self.w2_scale)
+        inter = silu_multiply_integer(gate, up)
+        return int8_linear_native(inter, self.w2_int8, self.w2_scale)
 
 
 class MixtralMoE(nn.Module):
