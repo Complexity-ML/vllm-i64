@@ -160,6 +160,7 @@ def cmd_serve(args):
         api_key=getattr(args, 'api_key', None),
         rate_limit=getattr(args, 'rate_limit', 0),
         max_pending=getattr(args, 'max_pending', 0),
+        rag_index_path=getattr(args, 'rag_index', None),
     )
     server.run()
 
@@ -309,6 +310,8 @@ def main():
                          help="Max requests per minute per IP (0 = unlimited)")
     p_serve.add_argument("--max-pending", type=int, default=0,
                          help="Max pending requests before rejecting (0 = unlimited)")
+    p_serve.add_argument("--rag-index", default=None,
+                         help="Path to RAG index directory (enables /v1/rag/* endpoints)")
     p_serve.set_defaults(func=cmd_serve)
 
     # list

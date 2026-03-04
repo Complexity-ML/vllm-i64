@@ -210,6 +210,7 @@ class I64Server:
         api_key: Optional[str] = None,
         rate_limit: int = 0,
         max_pending: int = 0,
+        rag_index_path: Optional[str] = None,
     ):
         # Create async engine — use dedicated CPU engine when on CPU
         from vllm_i64.cpu.engine import CPUEngine, AsyncCPUEngine
@@ -241,6 +242,33 @@ class I64Server:
         self._tokenize_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tokenize")
         # Single-token detokenize cache: token_id → text (avoids repeated decode calls)
         self._detok_cache: Dict[int, str] = {}
+        # RAG — native retrieval-augmented generation
+        self.retriever = None
+        self.rag_enabled = False
+        if rag_index_path:
+            try:
+                import os
+                from vllm_i64.rag import Retriever
+                if os.path.exists(rag_index_path):
+                    self.retriever = Retriever.load(rag_index_path)
+                    self.rag_enabled = True
+                    logger.info(f"RAG enabled: loaded index from {rag_index_path}")
+                else:
+                    self.retriever = Retriever()
+                    self.rag_enabled = True
+                    logger.info(f"RAG enabled: empty index (will save to {rag_index_path})")
+                self._rag_index_path = rag_index_path
+            except Exception as e:
+                logger.warning(f"RAG init failed: {e}")
+        else:
+            # RAG always available for runtime indexing even without --rag-index
+            try:
+                from vllm_i64.rag import Retriever
+                self.retriever = Retriever()
+                self.rag_enabled = True
+                self._rag_index_path = None
+            except ImportError:
+                pass
 
     def _next_request_id(self) -> str:
         """Generate a unique request ID (OpenAI-compatible format)."""
@@ -604,6 +632,15 @@ class I64Server:
                 status=400,
             )
         prompt = self._apply_chat_template(messages)
+
+        # RAG context injection (opt-in via "rag": true in request body)
+        if body.get("rag") and self.rag_enabled and self.retriever is not None:
+            user_query = messages[-1].get("content", "") if messages else ""
+            if user_query:
+                rag_k = body.get("rag_k", 3)
+                context = self.retriever.get_context(user_query, k=rag_k)
+                if context:
+                    prompt = f"Context:\n{context}\n\n{prompt}"
 
         req = CompletionRequest(
             prompt=prompt,
@@ -1249,6 +1286,91 @@ class I64Server:
         }
         return web.json_response(spec)
 
+    # =========================================================================
+    # RAG endpoints
+    # =========================================================================
+
+    async def handle_rag_index(self, request: web.Request) -> web.Response:
+        """POST /v1/rag/index — index text or a file for RAG retrieval."""
+        if not self.rag_enabled or self.retriever is None:
+            return web.json_response(
+                {"error": {"message": "RAG not enabled", "type": "server_error"}}, status=503,
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400,
+            )
+
+        text = body.get("text")
+        file_path = body.get("file")
+        chunk_size = body.get("chunk_size", 200)
+        overlap = body.get("overlap", 50)
+
+        if not text and not file_path:
+            return web.json_response(
+                {"error": {"message": "Provide 'text' or 'file'", "type": "invalid_request_error"}}, status=400,
+            )
+
+        try:
+            if file_path:
+                n = self.retriever.index_file(file_path, chunk_size=chunk_size, overlap=overlap)
+            else:
+                n = self.retriever.index_text(text, chunk_size=chunk_size, overlap=overlap)
+
+            # Auto-save if index path configured
+            if self._rag_index_path:
+                self.retriever.save(self._rag_index_path)
+
+            return web.json_response({"status": "ok", "chunks_added": n, "total_chunks": len(self.retriever.index.chunks)})
+        except Exception as e:
+            logger.error(f"RAG index error: {e}", exc_info=True)
+            return web.json_response(
+                {"error": {"message": str(e), "type": "server_error"}}, status=500,
+            )
+
+    async def handle_rag_search(self, request: web.Request) -> web.Response:
+        """POST /v1/rag/search — search indexed documents."""
+        if not self.rag_enabled or self.retriever is None:
+            return web.json_response(
+                {"error": {"message": "RAG not enabled", "type": "server_error"}}, status=503,
+            )
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400,
+            )
+
+        query = body.get("query")
+        k = body.get("k", 3)
+        if not query:
+            return web.json_response(
+                {"error": {"message": "Missing 'query'", "type": "invalid_request_error"}}, status=400,
+            )
+
+        try:
+            results = self.retriever.retrieve(query, k=k)
+            return web.json_response({"query": query, "results": results, "count": len(results)})
+        except Exception as e:
+            logger.error(f"RAG search error: {e}", exc_info=True)
+            return web.json_response(
+                {"error": {"message": str(e), "type": "server_error"}}, status=500,
+            )
+
+    async def handle_rag_stats(self, request: web.Request) -> web.Response:
+        """GET /v1/rag/stats — RAG index statistics."""
+        if not self.rag_enabled or self.retriever is None:
+            return web.json_response({"enabled": False})
+        idx = self.retriever.index
+        return web.json_response({
+            "enabled": True,
+            "total_chunks": len(idx.chunks),
+            "dimension": idx.dim,
+            "index_path": getattr(self, '_rag_index_path', None),
+        })
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
         middlewares = [make_cors_middleware()]
@@ -1282,6 +1404,12 @@ class I64Server:
         app.router.add_post("/v1/cancel/{request_id}", self.handle_cancel)
         app.router.add_get("/v1/ws/completions", self.handle_ws_completions)
         app.router.add_get("/docs", self.handle_openapi)
+        # RAG endpoints
+        app.router.add_post("/v1/rag/index", self.handle_rag_index)
+        app.router.add_post("/v1/rag/search", self.handle_rag_search)
+        app.router.add_get("/v1/rag/stats", self.handle_rag_stats)
+        app.router.add_route("OPTIONS", "/v1/rag/index", self._handle_options)
+        app.router.add_route("OPTIONS", "/v1/rag/search", self._handle_options)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app
@@ -1316,6 +1444,8 @@ class I64Server:
         logger.info(f"  POST /v1/completions | POST /v1/chat/completions | GET /health")
         logger.info(f"  POST /v1/batch | GET /v1/models/{{id}} | GET /v1/metrics | GET /v1/logs")
         logger.info(f"  POST /v1/cancel/{{id}} | WS /v1/ws/completions | GET /docs")
+        if self.rag_enabled:
+            logger.info(f"  POST /v1/rag/index | POST /v1/rag/search | GET /v1/rag/stats")
         logger.info(f"  mode: async continuous batching")
         app = self.create_app()
 
