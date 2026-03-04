@@ -509,6 +509,14 @@ def naive_paged_decode_attention(
     Returns:
         output: (batch, num_heads, head_dim)
     """
+    # Bail out early during CUDA graph capture — .item() and Python loops invalidate the stream.
+    # The engine catches this exception and falls back to eager mode.
+    if q.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "naive_paged_decode_attention is not CUDA graph compatible "
+            "(requires flash_attn for graph capture)"
+        )
+
     batch = q.shape[0]
     bs = k_cache.shape[1]  # block_size
 
