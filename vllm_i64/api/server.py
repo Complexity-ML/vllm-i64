@@ -370,6 +370,15 @@ class I64Server:
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         )
 
+        # Debug: log prompt and output tokens for short generations (helps diagnose early-EOS)
+        if len(result.output_tokens) <= 3:
+            eos_cfg = getattr(self.async_engine.engine.model, 'config', None)
+            eos_id = getattr(eos_cfg, 'eos_token_id', '?') if eos_cfg else '?'
+            logger.warning(
+                "[DEBUG] Short generation: prompt_ids=%s output_tokens=%s eos_config=%s finish=%s",
+                prompt_ids[-5:], result.output_tokens, eos_id, result.finish_reason,
+            )
+
         resp = self._build_response(result, prompt_ids)
         latency_ms = (time.monotonic() - t0) * 1000
 
@@ -539,11 +548,8 @@ class I64Server:
                 status=400,
             )
 
-        # Wrap raw prompt in chat template if model is chat-trained
-        if self.chat_template:
-            prompt = self._apply_chat_template([
-                {"role": "user", "content": prompt},
-            ])
+        # /v1/completions: send raw prompt as-is (caller controls formatting).
+        # Chat template is only applied by /v1/chat/completions.
 
         req = CompletionRequest(
             prompt=prompt,
