@@ -240,8 +240,6 @@ class I64Server:
         self._shutting_down = False
         # Thread pool for tokenization (avoids blocking the event loop)
         self._tokenize_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tokenize")
-        # Single-token detokenize cache: token_id → text (avoids repeated decode calls)
-        self._detok_cache: Dict[int, str] = {}
         # RAG — native retrieval-augmented generation
         self.retriever = None
         self.rag_enabled = False
@@ -301,15 +299,6 @@ class I64Server:
         """Detokenize in thread pool to avoid blocking the event loop."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._tokenize_pool, self._detokenize, token_ids)
-
-    def _detokenize_token(self, token_id: int) -> str:
-        """Single token → text with cache. For streaming."""
-        text = self._detok_cache.get(token_id)
-        if text is None:
-            text = self._detokenize([token_id])
-            if len(self._detok_cache) < 100000:  # Cap cache size
-                self._detok_cache[token_id] = text
-        return text
 
     def _apply_chat_template(self, messages: List[Dict]) -> str:
         """Apply chat template to messages → prompt string."""
@@ -406,13 +395,23 @@ class I64Server:
         created = int(time.time())
 
         last_token_id = None
+        # Incremental detokenization: decode growing token list, emit diff.
+        # Prevents cross-request pollution from single-token detok cache and
+        # handles multi-byte UTF-8 sequences spanning token boundaries.
+        output_ids: List[int] = []
+        prev_text = ""
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
             last_token_id = token_id
-            token_text = self._detokenize_token(token_id)
+            output_ids.append(token_id)
+            full_text = self._detokenize(output_ids)
+            token_text = full_text[len(prev_text):]
+            prev_text = full_text
+            if not token_text:
+                continue
             chunk = {
                 "id": stream_id,
                 "object": "text_completion",
@@ -468,15 +467,22 @@ class I64Server:
         }
         yield f"data: {json.dumps(first_chunk)}\n\n"
 
-        # Content chunks
+        # Content chunks — incremental detokenization (same as _async_stream)
         last_token_id = None
+        output_ids: List[int] = []
+        prev_text = ""
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
         ):
             last_token_id = token_id
-            token_text = self._detokenize_token(token_id)
+            output_ids.append(token_id)
+            full_text = self._detokenize(output_ids)
+            token_text = full_text[len(prev_text):]
+            prev_text = full_text
+            if not token_text:
+                continue
             chunk = {
                 "id": stream_id,
                 "object": "chat.completion.chunk",
@@ -1163,13 +1169,20 @@ class I64Server:
 
                 try:
                     last_token_id = None
+                    ws_output_ids: List[int] = []
+                    ws_prev_text = ""
                     async for token_id in self.async_engine.generate_stream(
                         prompt_token_ids=prompt_ids,
                         max_new_tokens=req.max_tokens,
                         sampling_params=req.to_sampling_params(tokenizer=self.tokenizer),
                     ):
                         last_token_id = token_id
-                        token_text = self._detokenize_token(token_id)
+                        ws_output_ids.append(token_id)
+                        ws_full = self._detokenize(ws_output_ids)
+                        token_text = ws_full[len(ws_prev_text):]
+                        ws_prev_text = ws_full
+                        if not token_text:
+                            continue
                         await ws.send_json({
                             "id": stream_id,
                             "object": "text_completion.chunk",
