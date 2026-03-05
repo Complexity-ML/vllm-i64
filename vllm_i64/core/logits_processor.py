@@ -256,10 +256,13 @@ class OutputConstraints:
     regex_pattern: Optional[str] = None
     choices: Optional[List[str]] = None
     stop_sequences: Optional[List[List[int]]] = None
+    suppress_first_tokens: Optional[List[int]] = None
 
     def build_processors(self, tokenizer=None) -> List[LogitsProcessor]:
         """Build the chain of logits processors."""
         processors = []
+        if self.suppress_first_tokens:
+            processors.append(SuppressTokensProcessor(self.suppress_first_tokens))
         if self.json_mode:
             processors.append(JSONLogitsProcessor(tokenizer=tokenizer))
         if self.regex_pattern:
@@ -269,6 +272,27 @@ class OutputConstraints:
         if self.stop_sequences:
             processors.append(StopSequenceProcessor(self.stop_sequences))
         return processors
+
+
+class SuppressTokensProcessor(LogitsProcessor):
+    """
+    Suppress specific tokens at step 0 only.
+
+    Used by chat/completions to prevent the model from generating a bare space
+    token as the first output token (which triggers immediate EOS in some models).
+    The suppressed tokens are masked to -inf only when generated_ids is empty (step 0).
+    """
+
+    def __init__(self, suppress_ids: List[int]):
+        self.suppress_ids = suppress_ids
+
+    def __call__(self, logits: torch.Tensor, generated_ids: List[int]) -> torch.Tensor:
+        if len(generated_ids) == 0:
+            logits = logits.clone()
+            for tid in self.suppress_ids:
+                if tid < logits.shape[-1]:
+                    logits[tid] = float("-inf")
+        return logits
 
 
 def apply_logits_processors(

@@ -79,6 +79,8 @@ class CompletionRequest:
     presence_penalty: float = 0.0
     # Priority (higher = sooner)
     priority: int = 0
+    # Suppress specific token IDs at step 0 (chat first-token fix)
+    suppress_first_tokens: Optional[List[int]] = None
 
     def validate(self, max_seq_len: int = 2048) -> Optional[str]:
         """Validate request parameters. Returns error message or None."""
@@ -118,16 +120,14 @@ class CompletionRequest:
 
     def to_sampling_params(self, tokenizer=None) -> SamplingParams:
         """Convert API request to engine sampling params."""
-        # Build output constraints from response_format and stop sequences
+        # Build output constraints from response_format, stop sequences, and suppress_first_tokens
         constraints = None
-        has_constraints = self.response_format or self.stop
+        has_constraints = self.response_format or self.stop or self.suppress_first_tokens
         if has_constraints:
             stop_seqs = None
             if self.stop and tokenizer is not None:
-                # Encode stop sequences using the tokenizer for correct token-level matching
                 stop_seqs = [tokenizer.encode(s) for s in self.stop]
             elif self.stop:
-                # Fallback: byte-level encoding (works for byte-level tokenizers)
                 stop_seqs = [[int(b) for b in s.encode("utf-8")] for s in self.stop]
             constraints = OutputConstraints(
                 json_mode=bool(self.response_format and self.response_format.get("type") == "json_object"),
@@ -137,6 +137,7 @@ class CompletionRequest:
                     else None
                 ),
                 stop_sequences=stop_seqs,
+                suppress_first_tokens=self.suppress_first_tokens,
             )
 
         # Convert logit_bias from {str: float} to {int: float}
@@ -318,8 +319,6 @@ class I64Server:
             # Ensure the generation prompt is present (template may not handle add_generation_prompt)
             if not prompt.rstrip().endswith("Assistant:"):
                 prompt = prompt.rstrip("\n") + "\nAssistant:"
-            # Double-wrap: model requires \nAssistant: repeated to generate properly
-            prompt = prompt.rstrip() + "\nAssistant:"
             logger.info(f"[CHAT] Rendered prompt: {repr(prompt)}")
             return prompt
         parts = []
@@ -328,7 +327,7 @@ class I64Server:
             role = role_map.get(msg.get("role", "user"), "User")
             content = msg.get("content", "")
             parts.append(f"{role}: {content}")
-        parts.append("Assistant:\nAssistant:")
+        parts.append("Assistant:")
         return "\n".join(parts)
 
     def _build_response(self, result: GenerationResult, prompt_ids: List[int]) -> CompletionResponse:
@@ -667,6 +666,18 @@ class I64Server:
                 if context:
                     prompt = f"Context:\n{context}\n\n{prompt}"
 
+        # Suppress bare space token at step 0 to prevent early EOS in chat mode.
+        # The model tends to generate space→EOS after "Assistant:"; suppressing the
+        # bare space forces a merged token like " The" which continues normally.
+        suppress_ids = None
+        if self.tokenizer:
+            space_ids = self.tokenizer.encode(" ")
+            if len(space_ids) == 1:
+                # Strip BOS if tokenizer prepends it
+                suppress_ids = [space_ids[0]]
+            elif len(space_ids) == 2 and space_ids[0] == self.tokenizer.bos_token_id:
+                suppress_ids = [space_ids[1]]
+
         req = CompletionRequest(
             prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
@@ -688,6 +699,7 @@ class I64Server:
             frequency_penalty=body.get("frequency_penalty", 0.0),
             presence_penalty=body.get("presence_penalty", 0.0),
             priority=body.get("priority", 0),
+            suppress_first_tokens=suppress_ids,
         )
 
         # Validate
