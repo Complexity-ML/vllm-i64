@@ -561,6 +561,15 @@ class I64Server:
         # /v1/completions: send raw prompt as-is (caller controls formatting).
         # Chat template is only applied by /v1/chat/completions.
 
+        # Suppress bare space token at step 0 (same as chat handler)
+        suppress_ids = None
+        if self.tokenizer:
+            space_ids = self.tokenizer.encode(" ")
+            if len(space_ids) == 1:
+                suppress_ids = [space_ids[0]]
+            elif len(space_ids) == 2 and space_ids[0] == self.tokenizer.bos_token_id:
+                suppress_ids = [space_ids[1]]
+
         req = CompletionRequest(
             prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
@@ -582,6 +591,7 @@ class I64Server:
             frequency_penalty=body.get("frequency_penalty", 0.0),
             presence_penalty=body.get("presence_penalty", 0.0),
             priority=body.get("priority", 0),
+            suppress_first_tokens=suppress_ids,
         )
 
         # Validate request parameters
