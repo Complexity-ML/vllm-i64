@@ -222,6 +222,15 @@ class I64Server:
         self.sync_engine = engine
         self.tokenizer = tokenizer
         self.chat_template = chat_template
+
+        # Fix EOS token: model config default (0) is often wrong (<unk>).
+        # Use tokenizer's EOS which actually looks up </s>, <|endoftext|>, etc.
+        if tokenizer and hasattr(engine, 'model') and engine.model is not None:
+            tok_eos = tokenizer.eos_token_id
+            cfg_eos = getattr(engine.model.config, 'eos_token_id', 0)
+            if cfg_eos != tok_eos:
+                logger.info("Fixing eos_token_id: config=%d → tokenizer=%d", cfg_eos, tok_eos)
+                engine.model.config.eos_token_id = tok_eos
         self.model_name = model_name
         self.host = host
         self.port = port
