@@ -694,13 +694,13 @@ class ComplexityDeepModel(nn.Module):
                 "mu_residual": mu_residual,
             })
 
-        # Last stage: norm + logits
+        # Last stage: norm + logits (computed in float32 for numerical stability)
         hidden = self.norm(hidden)
 
         if self.tie_word_embeddings and self.embed_tokens is not None:
-            logits = F.linear(hidden, self.embed_tokens.weight)
+            logits = F.linear(hidden.float(), self.embed_tokens.weight.float())
         elif hasattr(self, 'lm_head'):
-            logits = self.lm_head(hidden)
+            logits = F.linear(hidden.float(), self.lm_head.weight.float())
         else:
             raise RuntimeError(
                 "No lm_head or tied embeddings found — cannot compute logits. "
