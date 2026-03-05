@@ -93,6 +93,8 @@ class I64Request:
 
     @property
     def is_finished(self) -> bool:
+        if self.status == RequestStatus.FINISHED:
+            return True
         if self.num_generated >= self.max_new_tokens:
             return True
         # Stop on EOS token

@@ -1117,10 +1117,22 @@ class I64Engine:
                 # Collect logprobs if tracked
                 token_logprobs = self._request_logprobs.pop(request_id, None)
 
+                # Truncate stop sequence tokens from output
+                output_tokens = req.output_token_ids
+                if request_id in self._request_processors:
+                    for proc in self._request_processors[request_id]:
+                        if hasattr(proc, 'should_stop') and proc.should_stop:
+                            idx = proc.stop_index
+                            if 0 <= idx < len(output_tokens):
+                                output_tokens = output_tokens[:idx]
+                                if token_logprobs:
+                                    token_logprobs = token_logprobs[:idx]
+                            break
+
                 return GenerationResult(
                     request_id=request_id,
                     prompt_tokens=req.prompt_list,
-                    output_tokens=req.output_token_ids,
+                    output_tokens=output_tokens,
                     num_steps=steps,
                     elapsed_ms=elapsed,
                     finish_reason=finish_reason,
@@ -1418,10 +1430,21 @@ class AsyncI64Engine:
                                 else:
                                     finish_reason = "length"
                             token_logprobs = self.engine._request_logprobs.pop(rid, None)
+                            # Truncate stop sequence tokens from output
+                            output_tokens = req.output_token_ids
+                            if rid in self.engine._request_processors:
+                                for proc in self.engine._request_processors[rid]:
+                                    if hasattr(proc, 'should_stop') and proc.should_stop:
+                                        idx = proc.stop_index
+                                        if 0 <= idx < len(output_tokens):
+                                            output_tokens = output_tokens[:idx]
+                                            if token_logprobs:
+                                                token_logprobs = token_logprobs[:idx]
+                                        break
                             result = GenerationResult(
                                 request_id=rid,
                                 prompt_tokens=req.prompt_list,
-                                output_tokens=req.output_token_ids,
+                                output_tokens=output_tokens,
                                 num_steps=req.num_generated,
                                 elapsed_ms=elapsed,
                                 finish_reason=finish_reason,

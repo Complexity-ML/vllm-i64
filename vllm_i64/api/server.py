@@ -339,6 +339,18 @@ class I64Server:
         parts.append("Assistant:")
         return "\n".join(parts)
 
+    @staticmethod
+    def _chat_stop_sequences(user_stop: Optional[List[str]] = None) -> List[str]:
+        """Merge user stop sequences with default chat template stop strings."""
+        defaults = ["\nAssistant:", "\nUser:"]
+        if not user_stop:
+            return defaults
+        merged = list(user_stop)
+        for s in defaults:
+            if s not in merged:
+                merged.append(s)
+        return merged
+
     def _build_response(self, result: GenerationResult, prompt_ids: List[int]) -> CompletionResponse:
         """Build completion response from generation result (OpenAI-compatible)."""
         output_text = self._detokenize(result.output_tokens)
@@ -688,7 +700,7 @@ class I64Server:
             min_tokens=body.get("min_tokens", 0),
             stream=body.get("stream", False),
             response_format=body.get("response_format"),
-            stop=body.get("stop"),
+            stop=self._chat_stop_sequences(body.get("stop")),
             n=body.get("n", 1),
             best_of=body.get("best_of", 1),
             logprobs=body.get("logprobs"),
@@ -731,6 +743,15 @@ class I64Server:
             if result_dict["choices"]:
                 text = result_dict["choices"][0]["text"]
                 finish_reason = result_dict["choices"][0].get("finish_reason", "length")
+
+                # Strip hallucinated chat template markers from output
+                for marker in ("Assistant:", "User:"):
+                    idx = text.find(marker)
+                    if idx != -1:
+                        text = text[:idx].rstrip()
+                        finish_reason = "stop"
+                        break
+
                 message = {"role": "assistant", "content": text}
 
                 # Parse tool calls if tools were provided
@@ -753,11 +774,15 @@ class I64Server:
                         ]
                         finish_reason = "tool_calls"
 
-                result_dict["choices"][0] = {
+                chat_choice = {
                     "message": message,
                     "index": 0,
                     "finish_reason": finish_reason,
                 }
+                # Preserve logprobs if requested
+                if "logprobs" in result_dict["choices"][0]:
+                    chat_choice["logprobs"] = result_dict["choices"][0]["logprobs"]
+                result_dict["choices"][0] = chat_choice
             result_dict["object"] = "chat.completion"
             return web.json_response(result_dict)
         except (ConnectionResetError, ConnectionError):
