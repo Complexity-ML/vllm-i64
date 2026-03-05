@@ -232,6 +232,15 @@ class I64Server:
             if cfg_eos != tok_eos:
                 logger.info("Fixing eos_token_id: config=%d → tokenizer=%d", cfg_eos, tok_eos)
                 engine.model.config.eos_token_id = tok_eos
+        # Pre-compute space token suppression IDs (used by all generation endpoints)
+        self._space_suppress_ids = None
+        if tokenizer:
+            space_ids = tokenizer.encode(" ")
+            if len(space_ids) == 1:
+                self._space_suppress_ids = [space_ids[0]]
+            elif len(space_ids) == 2 and space_ids[0] == tokenizer.bos_token_id:
+                self._space_suppress_ids = [space_ids[1]]
+
         self.model_name = model_name
         self.host = host
         self.port = port
@@ -561,15 +570,6 @@ class I64Server:
         # /v1/completions: send raw prompt as-is (caller controls formatting).
         # Chat template is only applied by /v1/chat/completions.
 
-        # Suppress bare space token at step 0 (same as chat handler)
-        suppress_ids = None
-        if self.tokenizer:
-            space_ids = self.tokenizer.encode(" ")
-            if len(space_ids) == 1:
-                suppress_ids = [space_ids[0]]
-            elif len(space_ids) == 2 and space_ids[0] == self.tokenizer.bos_token_id:
-                suppress_ids = [space_ids[1]]
-
         req = CompletionRequest(
             prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
@@ -591,7 +591,7 @@ class I64Server:
             frequency_penalty=body.get("frequency_penalty", 0.0),
             presence_penalty=body.get("presence_penalty", 0.0),
             priority=body.get("priority", 0),
-            suppress_first_tokens=suppress_ids,
+            suppress_first_tokens=self._space_suppress_ids,
         )
 
         # Validate request parameters
@@ -676,18 +676,6 @@ class I64Server:
                 if context:
                     prompt = f"Context:\n{context}\n\n{prompt}"
 
-        # Suppress bare space token at step 0 to prevent early EOS in chat mode.
-        # The model tends to generate space→EOS after "Assistant:"; suppressing the
-        # bare space forces a merged token like " The" which continues normally.
-        suppress_ids = None
-        if self.tokenizer:
-            space_ids = self.tokenizer.encode(" ")
-            if len(space_ids) == 1:
-                # Strip BOS if tokenizer prepends it
-                suppress_ids = [space_ids[0]]
-            elif len(space_ids) == 2 and space_ids[0] == self.tokenizer.bos_token_id:
-                suppress_ids = [space_ids[1]]
-
         req = CompletionRequest(
             prompt=prompt,
             max_tokens=body.get("max_tokens", 256),
@@ -709,7 +697,7 @@ class I64Server:
             frequency_penalty=body.get("frequency_penalty", 0.0),
             presence_penalty=body.get("presence_penalty", 0.0),
             priority=body.get("priority", 0),
-            suppress_first_tokens=suppress_ids,
+            suppress_first_tokens=self._space_suppress_ids,
         )
 
         # Validate
@@ -1052,6 +1040,7 @@ class I64Server:
                 logit_bias=rd.get("logit_bias"),
                 frequency_penalty=rd.get("frequency_penalty", 0.0),
                 presence_penalty=rd.get("presence_penalty", 0.0),
+                suppress_first_tokens=self._space_suppress_ids,
             )
             error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
             if error:
@@ -1197,6 +1186,7 @@ class I64Server:
                     top_k=body.get("top_k", 50),
                     top_p=body.get("top_p", 0.9),
                     stream=True,
+                    suppress_first_tokens=self._space_suppress_ids,
                 )
 
                 error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
