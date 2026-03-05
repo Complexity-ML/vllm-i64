@@ -309,13 +309,15 @@ class I64Server:
             # Ensure the generation prompt is present (template may not handle add_generation_prompt)
             if not prompt.rstrip().endswith("Assistant:"):
                 prompt = prompt.rstrip("\n") + "\nAssistant:"
+            logger.info(f"[CHAT] Rendered prompt: {repr(prompt)}")
             return prompt
         parts = []
+        role_map = {"system": "System", "user": "User", "assistant": "Assistant"}
         for msg in messages:
-            role = msg.get("role", "user")
+            role = role_map.get(msg.get("role", "user"), "User")
             content = msg.get("content", "")
-            parts.append(f"<|{role}|>\n{content}")
-        parts.append("<|assistant|>\n")
+            parts.append(f"{role}: {content}")
+        parts.append("Assistant:")
         return "\n".join(parts)
 
     def _build_response(self, result: GenerationResult, prompt_ids: List[int]) -> CompletionResponse:
