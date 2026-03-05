@@ -26,6 +26,9 @@ except ImportError:
 
 
 def is_flash_attn_available() -> bool:
+    import os
+    if os.environ.get("VLLM_NO_FLASH_ATTN", "").strip() == "1":
+        return False
     return _FLASH_ATTN_AVAILABLE
 
 
