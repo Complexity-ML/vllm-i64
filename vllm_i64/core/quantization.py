@@ -114,7 +114,6 @@ def int8_linear_native(
         y: (*, out_features) float
     """
     orig_shape = x.shape
-    orig_dtype = x.dtype
     x_2d = x.reshape(-1, x.shape[-1])
     out_features = weight_int8.shape[0]
 
@@ -143,7 +142,7 @@ def int8_linear_native(
         out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
         if bias is not None:
             out = out + bias
-        return out.to(orig_dtype).reshape(*orig_shape[:-1], out_features)
+        return out.reshape(*orig_shape[:-1], out_features)
 
     # GPU-only accelerated fallbacks
     if x.is_cuda:
@@ -155,7 +154,7 @@ def int8_linear_native(
                 out = cuda_ops.gemm_dequant_int8(x_2d.float(), weight_int8, weight_scale)
                 if bias is not None:
                     out = out + bias
-                return out.to(orig_dtype).reshape(*orig_shape[:-1], out_features)
+                return out.reshape(*orig_shape[:-1], out_features)
         except (ImportError, Exception):
             pass
         # Priority 2: Triton fused dequant+GEMM
@@ -163,14 +162,14 @@ def int8_linear_native(
             from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
             out = triton_dequant_gemm_int8(x_2d, weight_int8, weight_scale, bias)
             if out is not None:
-                return out.to(orig_dtype).reshape(*orig_shape[:-1], out_features)
+                return out.reshape(*orig_shape[:-1], out_features)
         except ImportError:
             pass
 
     # Final fallback: dequant weight → float32 matmul
     w_float = dequantize_int8(weight_int8, weight_scale)
     out = F.linear(x_2d.float(), w_float, bias)
-    return out.to(orig_dtype).reshape(*orig_shape[:-1], out_features)
+    return out.reshape(*orig_shape[:-1], out_features)
 
 
 def int8_fused_gate_up_native(
@@ -201,7 +200,6 @@ def int8_fused_gate_up_native(
         (gate, up) — each (*, inter_size) float
     """
     orig_shape = x.shape
-    orig_dtype = x.dtype
     x_2d = x.reshape(-1, x.shape[-1])
     use_int_mm = _INT_MM_AVAILABLE and (x.is_cuda or _INT_MM_CPU_OK)
 
@@ -227,7 +225,6 @@ def int8_fused_gate_up_native(
         w_float = dequantize_int8(fused_int8, fused_scale)
         result = F.linear(x_2d.float(), w_float)
 
-    result = result.to(orig_dtype)
     gate, up = result.split(inter_size, dim=-1)
     return (
         gate.reshape(*orig_shape[:-1], inter_size),

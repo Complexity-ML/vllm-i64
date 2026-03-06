@@ -77,6 +77,12 @@ class INLDynamics(nn.Module):
         if v is None:
             v = torch.zeros_like(h)
 
+        # Cast to weight dtype — h may be float32 from INT8 linear output
+        w_dtype = self.controller_in.weight.dtype
+        if h.dtype != w_dtype:
+            h = h.to(w_dtype)
+            v = v.to(w_dtype)
+
         hv = torch.cat([h, v], dim=-1)
         ctrl = F.silu(self.controller_in(hv))
         ctrl_out = self.controller_out(ctrl)
@@ -130,7 +136,7 @@ class MuGuidedTokenRoutedMLP(TokenRoutedMLP):
         base_ids = super().route(token_ids, num_tokens, device)
 
         if mu is not None:
-            mu_logits = self.mu_router(mu)
+            mu_logits = self.mu_router(mu.to(self.mu_router.weight.dtype))
             base_one_hot = F.one_hot(base_ids, self.num_experts).float()
             combined = base_one_hot * self._BASE_ROUTING_SCALE + mu_logits
             return combined.argmax(dim=-1)
