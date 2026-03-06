@@ -315,7 +315,19 @@ def naive_integer_varlen_attention(
                 k_h = k_t[h]
                 q_int8, q_scale = quantize_activations_int8(q_h)
                 k_int8, k_scale = quantize_activations_int8(k_h)
-                s_i32 = torch._int_mm(q_int8, k_int8.t().contiguous())
+                # torch._int_mm requires size(0) > 16 on CUDA — pad small seqs
+                if n <= 16:
+                    pad = 17 - n
+                    q_int8 = torch.nn.functional.pad(q_int8, (0, 0, 0, pad))
+                    k_int8 = torch.nn.functional.pad(k_int8, (0, 0, 0, pad))
+                    q_scale = torch.nn.functional.pad(q_scale, (0, pad))
+                    k_scale = torch.nn.functional.pad(k_scale, (0, pad))
+                    s_i32 = torch._int_mm(q_int8, k_int8.t().contiguous())
+                    s_i32 = s_i32[:n, :n]
+                    q_scale = q_scale[:n]
+                    k_scale = k_scale[:n]
+                else:
+                    s_i32 = torch._int_mm(q_int8, k_int8.t().contiguous())
                 scores[h] = s_i32.float() * (q_scale.unsqueeze(1) * k_scale.unsqueeze(0))
             scores = scores * softmax_scale
         else:
@@ -392,8 +404,25 @@ def naive_integer_cached_attention(
         for h in range(num_heads):
             q_int8, q_scale = quantize_activations_int8(q_t[h])
             k_int8, k_scale = quantize_activations_int8(k_t[h])
-            s_i32 = torch._int_mm(q_int8, k_int8.t().contiguous())
-            scores[h] = s_i32.float() * (q_scale.unsqueeze(1) * k_scale.unsqueeze(0))
+            # torch._int_mm requires size(0) > 16 on CUDA — pad small seqs
+            need_pad_q = n <= 16
+            need_pad_k = history <= 16
+            q_pad, k_pad = q_int8, k_int8
+            qs, ks = q_scale, k_scale
+            if need_pad_q:
+                pq = 17 - n
+                q_pad = torch.nn.functional.pad(q_int8, (0, 0, 0, pq))
+                qs = torch.nn.functional.pad(q_scale, (0, pq))
+            if need_pad_k:
+                pk = 17 - history
+                k_pad = torch.nn.functional.pad(k_int8, (0, 0, 0, pk))
+                ks = torch.nn.functional.pad(k_scale, (0, pk))
+            s_i32 = torch._int_mm(q_pad, k_pad.t().contiguous())
+            if need_pad_q or need_pad_k:
+                s_i32 = s_i32[:n, :history]
+                qs = qs[:n]
+                ks = ks[:history]
+            scores[h] = s_i32.float() * (qs.unsqueeze(1) * ks.unsqueeze(0))
         scores = scores * softmax_scale
     else:
         scores = torch.bmm(q_t.float(), k_t.float().transpose(1, 2)) * softmax_scale

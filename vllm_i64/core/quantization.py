@@ -128,7 +128,17 @@ def int8_linear_native(
         else:
             x_int8, x_scale = quantize_activations_int8(x_2d)
         wt = weight_int8.t().contiguous()
-        result_i32 = torch._int_mm(x_int8, wt)
+        # torch._int_mm requires size(0) > 16 on CUDA — pad if needed
+        m = x_int8.shape[0]
+        if x_int8.is_cuda and m <= 16:
+            pad = 17 - m
+            x_int8 = torch.nn.functional.pad(x_int8, (0, 0, 0, pad))
+            x_scale = torch.nn.functional.pad(x_scale, (0, pad))
+            result_i32 = torch._int_mm(x_int8, wt)
+            result_i32 = result_i32[:m]
+            x_scale = x_scale[:m]
+        else:
+            result_i32 = torch._int_mm(x_int8, wt)
         out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
         if bias is not None:
             out = out + bias
@@ -199,7 +209,17 @@ def int8_fused_gate_up_native(
         else:
             x_int8, x_scale = quantize_activations_int8(x_2d)
         wt = fused_int8.t().contiguous()
-        result_i32 = torch._int_mm(x_int8, wt)
+        # torch._int_mm requires size(0) > 16 on CUDA — pad if needed
+        m = x_int8.shape[0]
+        if x_int8.is_cuda and m <= 16:
+            pad = 17 - m
+            x_int8 = torch.nn.functional.pad(x_int8, (0, 0, 0, pad))
+            x_scale = torch.nn.functional.pad(x_scale, (0, pad))
+            result_i32 = torch._int_mm(x_int8, wt)
+            result_i32 = result_i32[:m]
+            x_scale = x_scale[:m]
+        else:
+            result_i32 = torch._int_mm(x_int8, wt)
         result = result_i32.float() * (x_scale.unsqueeze(1) * fused_scale.unsqueeze(0))
     else:
         w_float = dequantize_int8(fused_int8, fused_scale)
