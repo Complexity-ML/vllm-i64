@@ -60,6 +60,11 @@ def cmd_serve(args):
         print(f"  [note] CPU detected — overriding {dtype} to float32")
         dtype = torch.float32
 
+    # INT8 on CPU is slower than float32 — quantize/dequant overhead per layer kills throughput
+    if device == "cpu" and args.quantization == "int8":
+        print(f"  [note] CPU detected — disabling INT8 quantization (float32 is faster)")
+        args.quantization = "none"
+
     entry = get_model_entry(args.model)
     print(f"vllm-i64 :: serving {args.model}")
     print(f"  host={args.host} port={args.port} dtype={dtype} device={device}")
