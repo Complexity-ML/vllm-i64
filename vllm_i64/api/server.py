@@ -327,7 +327,7 @@ class I64Server:
             prompt = tmpl.render(messages=messages, add_generation_prompt=True)
             # Ensure the generation prompt is present (template may not handle add_generation_prompt)
             if not prompt.rstrip().endswith("Assistant:"):
-                prompt = prompt.rstrip("\n") + "\nAssistant:"
+                prompt = prompt.rstrip("\n") + "\n\nAssistant:"
             logger.info(f"[CHAT] Rendered prompt: {repr(prompt)}")
             return prompt
         parts = []
@@ -337,7 +337,7 @@ class I64Server:
             content = msg.get("content", "")
             parts.append(f"{role}: {content}")
         parts.append("Assistant:")
-        return "\n".join(parts)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _chat_stop_sequences(user_stop: Optional[List[str]] = None) -> List[str]:
