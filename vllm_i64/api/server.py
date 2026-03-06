@@ -232,16 +232,9 @@ class I64Server:
             if cfg_eos != tok_eos:
                 logger.info("Fixing eos_token_id: config=%d → tokenizer=%d", cfg_eos, tok_eos)
                 engine.model.config.eos_token_id = tok_eos
-        # Pre-compute space token suppression IDs (used by all generation endpoints)
-        # Models generate a leading space after "Assistant:" then immediately EOS.
-        # Suppressing space at step 0 lets the model produce meaningful content directly.
+        # Space suppression disabled: template now includes trailing space in
+        # "Assistant: " so the model directly predicts content tokens.
         self._space_suppress_ids = None
-        if tokenizer:
-            space_ids = tokenizer.encode(" ")
-            if len(space_ids) == 1:
-                self._space_suppress_ids = [space_ids[0]]
-            elif len(space_ids) == 2 and space_ids[0] == tokenizer.bos_token_id:
-                self._space_suppress_ids = [space_ids[1]]
 
         self.model_name = model_name
         self.host = host
