@@ -281,6 +281,35 @@ def cmd_bench(args):
     print("\nDone.")
 
 
+def cmd_agent(args):
+    """Run the agentic loop against a vllm-i64 server."""
+    from vllm_i64.agentics import Agent
+
+    agent = Agent(
+        base_url=args.server,
+        api_key=getattr(args, 'api_key', None),
+        allow_shell=args.allow_shell,
+        max_steps=args.max_steps,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        verbose=True,
+    )
+
+    # Check server is reachable
+    if not agent.client.health():
+        print(f"Error: cannot reach vllm-i64 server at {args.server}")
+        print(f"Start it first: vllm-i64 serve pacific-prime-chat --checkpoint ... --port 8000")
+        sys.exit(1)
+
+    if args.interactive:
+        agent.interactive()
+    elif args.task:
+        agent.run(" ".join(args.task))
+    else:
+        # No task given, start interactive
+        agent.interactive()
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="vllm-i64",
@@ -349,6 +378,25 @@ def main():
     p_bench.add_argument("--output-len", type=int, default=64, help="Max output tokens")
     p_bench.add_argument("--concurrency", type=int, default=8, help="Async concurrency")
     p_bench.set_defaults(func=cmd_bench)
+
+    # agent
+    p_agent = sub.add_parser("agent", help="Run AI agent (connects to a running vllm-i64 server)")
+    p_agent.add_argument("task", nargs="*", help="Task to execute (omit for interactive mode)")
+    p_agent.add_argument("--server", default="http://localhost:8000",
+                         help="vllm-i64 server URL (default: http://localhost:8000)")
+    p_agent.add_argument("--interactive", "-i", action="store_true",
+                         help="Interactive REPL mode")
+    p_agent.add_argument("--allow-shell", action="store_true",
+                         help="Enable shell command execution (dangerous)")
+    p_agent.add_argument("--max-steps", type=int, default=20,
+                         help="Max agent steps before stopping (default: 20)")
+    p_agent.add_argument("--temperature", type=float, default=0.6,
+                         help="LLM temperature (default: 0.6)")
+    p_agent.add_argument("--max-tokens", type=int, default=1024,
+                         help="Max tokens per LLM response (default: 1024)")
+    p_agent.add_argument("--api-key", default=None,
+                         help="API key for server authentication")
+    p_agent.set_defaults(func=cmd_agent)
 
     args = parser.parse_args()
     if not args.command:
