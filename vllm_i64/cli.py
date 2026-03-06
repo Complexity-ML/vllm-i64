@@ -34,7 +34,7 @@ def cmd_serve(args):
             forward_args += ["--checkpoint", args.checkpoint]
         if args.chat_template:
             forward_args += ["--chat-template", args.chat_template]
-        if args.quantization:
+        if args.quantization and args.quantization != "none":
             forward_args += ["--quantization", args.quantization]
 
         rc = launch_distributed(tp_size=args.tp, pp_size=args.pp, args=forward_args)
@@ -281,7 +281,8 @@ def main():
     p_serve.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     p_serve.add_argument("--tp", type=int, default=1, help="Tensor parallel size (num GPUs)")
     p_serve.add_argument("--pp", type=int, default=1, help="Pipeline parallel size (num stages)")
-    p_serve.add_argument("--quantization", default=None, choices=["int8", "int4", None])
+    p_serve.add_argument("--quantization", default="int8", choices=["int8", "int4", "none"],
+                         help="Weight quantization (default: int8 — native integer compute)")
     p_serve.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     p_serve.add_argument("--chat-template", default=None, help="Path to chat template")
     p_serve.add_argument("--enable-prefix-caching", action="store_true",
