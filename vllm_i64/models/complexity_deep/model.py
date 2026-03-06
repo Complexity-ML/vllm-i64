@@ -137,7 +137,7 @@ class MuGuidedTokenRoutedMLP(TokenRoutedMLP):
 
         return base_ids
 
-    def forward(self, x, token_ids=None, mu=None, **kwargs):
+    def forward(self, x, token_ids=None, mu=None, x_preq=None, **kwargs):
         expert_ids = self.route(token_ids, x.shape[0], x.device, mu=mu)
         return self.expert_forward(x, expert_ids)
 
@@ -198,6 +198,30 @@ class MuGuidedAttention(nn.Module):
         # RoPE (replicated)
         self.rope = RotaryEmbedding(self.head_dim, config.max_position_embeddings, config.rope_theta)
 
+    def _project_qkv_int8(self, hidden: torch.Tensor, mu_prev: Optional[torch.Tensor], x_preq=None):
+        """INT8 fused QKV + mu projections."""
+        from vllm_i64.core.quantization import int8_linear_native
+
+        # Fused QKV: single INT8 matmul → split
+        qkv = int8_linear_native(hidden, self.qkv_int8, self.qkv_scale,
+                                 getattr(self, 'qkv_bias', None), x_preq=x_preq)
+        q = qkv[:, :self.q_size]
+        k = qkv[:, self.q_size:self.q_size + self.kv_size]
+        v = qkv[:, self.q_size + self.kv_size:]
+
+        # Mu-guidance INT8
+        if mu_prev is not None and hasattr(self, 'mu_qkv_int8'):
+            mu_qkv = int8_linear_native(mu_prev, self.mu_qkv_int8, self.mu_qkv_scale)
+            q = q + mu_qkv[:, :self.q_size]
+            k = k + mu_qkv[:, self.q_size:self.q_size + self.kv_size]
+            v = v + mu_qkv[:, self.q_size + self.kv_size:]
+        elif mu_prev is not None:
+            q = q + self.mu_to_q(mu_prev)
+            k = k + self.mu_to_k(mu_prev)
+            v = v + self.mu_to_v(mu_prev)
+
+        return q, k, v
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -208,19 +232,23 @@ class MuGuidedAttention(nn.Module):
         layer_idx: int = 0,
         seq_ids: Optional[List[int]] = None,
         tokens_per_seq: Optional[List[int]] = None,
+        x_preq=None,
     ) -> torch.Tensor:
         bsz = hidden.shape[0]
 
-        # ColumnParallel: output is (bsz, heads_per_tp * head_dim)
-        q = self.q_proj(hidden)
-        k = self.k_proj(hidden)
-        v = self.v_proj(hidden)
+        # INT8 path: fused QKV + mu projections
+        if hasattr(self, 'qkv_int8'):
+            q, k, v = self._project_qkv_int8(hidden, mu_prev, x_preq=x_preq)
+        else:
+            # Float path
+            q = self.q_proj(hidden)
+            k = self.k_proj(hidden)
+            v = self.v_proj(hidden)
 
-        # Mu-guidance (Complexity Deep specific)
-        if mu_prev is not None:
-            q = q + self.mu_to_q(mu_prev)
-            k = k + self.mu_to_k(mu_prev)
-            v = v + self.mu_to_v(mu_prev)
+            if mu_prev is not None:
+                q = q + self.mu_to_q(mu_prev)
+                k = k + self.mu_to_k(mu_prev)
+                v = v + self.mu_to_v(mu_prev)
 
         # Reshape to per-TP head counts
         q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
@@ -258,6 +286,17 @@ class MuGuidedAttention(nn.Module):
 
         # (total_tokens, num_heads_per_tp, head_dim) → (total_tokens, hidden)
         out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
+        return self._o_proj_int8(out)
+
+    def _o_proj_int8(self, out: torch.Tensor) -> torch.Tensor:
+        """O projection — INT8 if available, else float."""
+        if hasattr(self, 'o_int8'):
+            from vllm_i64.core.quantization import int8_linear_native
+            return int8_linear_native(out, self.o_int8, self.o_scale,
+                                      getattr(self, 'o_bias', None))
+        # Ensure dtype matches o_proj weights
+        if out.dtype != self.o_proj.linear.weight.dtype:
+            out = out.to(self.o_proj.linear.weight.dtype)
         return self.o_proj(out)
 
     def decode_step(
@@ -268,6 +307,7 @@ class MuGuidedAttention(nn.Module):
         kv_cache,
         layer_idx: int,
         seq_ids_tensor: torch.Tensor,
+        x_preq=None,
     ) -> torch.Tensor:
         """
         Decode-only attention with tensor-based KV write. CUDA-graph compatible.
@@ -282,14 +322,18 @@ class MuGuidedAttention(nn.Module):
 
         bsz = hidden.shape[0]
 
-        q = self.q_proj(hidden)
-        k = self.k_proj(hidden)
-        v = self.v_proj(hidden)
+        # INT8 path: fused QKV + mu projections
+        if hasattr(self, 'qkv_int8'):
+            q, k, v = self._project_qkv_int8(hidden, mu_prev, x_preq=x_preq)
+        else:
+            q = self.q_proj(hidden)
+            k = self.k_proj(hidden)
+            v = self.v_proj(hidden)
 
-        if mu_prev is not None:
-            q = q + self.mu_to_q(mu_prev)
-            k = k + self.mu_to_k(mu_prev)
-            v = v + self.mu_to_v(mu_prev)
+            if mu_prev is not None:
+                q = q + self.mu_to_q(mu_prev)
+                k = k + self.mu_to_k(mu_prev)
+                v = v + self.mu_to_v(mu_prev)
 
         q = q.view(bsz, self.num_heads_per_tp, self.head_dim)
         k = k.view(bsz, self.num_kv_heads_per_tp, self.head_dim)
@@ -330,7 +374,7 @@ class MuGuidedAttention(nn.Module):
             )
 
         out = out.reshape(bsz, self.num_heads_per_tp * self.head_dim)
-        return self.o_proj(out)
+        return self._o_proj_int8(out)
 
     def _cached_attention(
         self,
@@ -388,7 +432,7 @@ class MuGuidedAttention(nn.Module):
             )
             out = out.squeeze(1)  # (batch, num_heads, head_dim)
             out = out.reshape(batch_size, self.num_heads_per_tp * self.head_dim)
-            return self.o_proj(out)
+            return self._o_proj_int8(out)
 
         # === Flash prefill with cache ===
         if use_flash:
@@ -422,7 +466,7 @@ class MuGuidedAttention(nn.Module):
             )
             total_tokens = q.shape[0]
             out = out.reshape(total_tokens, self.num_heads_per_tp * self.head_dim)
-            return self.o_proj(out)
+            return self._o_proj_int8(out)
 
         # === Naive fallback ===
         outputs = []
@@ -441,10 +485,7 @@ class MuGuidedAttention(nn.Module):
             offset += n
 
         out = torch.cat(outputs, dim=0)
-        # Ensure dtype matches o_proj weights (attention ops may upcast to float32)
-        if out.dtype != self.o_proj.linear.weight.dtype:
-            out = out.to(self.o_proj.linear.weight.dtype)
-        return self.o_proj(out)
+        return self._o_proj_int8(out)
 
 
 # =========================================================================
@@ -486,19 +527,24 @@ class ComplexityDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode-only layer forward. CUDA-graph compatible (all tensor ops)."""
         residual = hidden
-        hidden = self.input_layernorm(hidden)
+
+        # Fused RMSNorm+Quant: norm (float) + INT8 quantize in 1 kernel
+        norm_out = self.input_layernorm(hidden)
+        x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
         hidden = self.self_attn.decode_step(
-            hidden, positions, mu_prev=mu_prev,
+            norm_out, positions, mu_prev=mu_prev,
             kv_cache=kv_cache, layer_idx=layer_idx,
             seq_ids_tensor=seq_ids_tensor,
+            x_preq=x_preq,
         )
 
         hidden, velocity, mu_current = self.dynamics(hidden, velocity)
         hidden = residual + hidden
 
         residual = hidden
-        hidden = self.post_attention_layernorm(hidden)
-        hidden = self.mlp(hidden, token_ids=token_ids, mu=mu_current)
+        norm_out = self.post_attention_layernorm(hidden)
+        x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
+        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mu_current, x_preq=x_preq)
         hidden = residual + hidden
 
         return hidden, velocity, mu_current
@@ -516,19 +562,23 @@ class ComplexityDecoderLayer(nn.Module):
         tokens_per_seq: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden
-        hidden = self.input_layernorm(hidden)
+
+        norm_out = self.input_layernorm(hidden)
+        x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
         hidden = self.self_attn(
-            hidden, positions, mu_prev=mu_prev,
+            norm_out, positions, mu_prev=mu_prev,
             kv_cache=kv_cache, layer_idx=layer_idx,
             seq_ids=seq_ids, tokens_per_seq=tokens_per_seq,
+            x_preq=x_preq,
         )
 
         hidden, velocity, mu_current = self.dynamics(hidden, velocity)
         hidden = residual + hidden
 
         residual = hidden
-        hidden = self.post_attention_layernorm(hidden)
-        hidden = self.mlp(hidden, token_ids=token_ids, mu=mu_current)
+        norm_out = self.post_attention_layernorm(hidden)
+        x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
+        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mu_current, x_preq=x_preq)
         hidden = residual + hidden
 
         return hidden, velocity, mu_current
@@ -582,6 +632,20 @@ class ComplexityDeepModel(nn.Module):
         if not config.tie_word_embeddings and is_last_pp_rank():
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def _compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Compute logits — INT8 lm_head if available, else float32."""
+        if hasattr(self, 'lm_head_int8'):
+            from vllm_i64.core.quantization import int8_linear_native
+            return int8_linear_native(hidden, self.lm_head_int8, self.lm_head_scale)
+        if self.tie_word_embeddings and self.embed_tokens is not None:
+            if hasattr(self, 'embed_int8'):
+                from vllm_i64.core.quantization import int8_linear_native
+                return int8_linear_native(hidden, self.embed_int8, self.embed_scale)
+            return F.linear(hidden.float(), self.embed_tokens.weight.float())
+        if hasattr(self, 'lm_head'):
+            return F.linear(hidden.float(), self.lm_head.weight.float())
+        raise RuntimeError("No lm_head or tied embeddings found — cannot compute logits.")
+
     def decode_step(
         self,
         token_ids: torch.Tensor,
@@ -626,18 +690,7 @@ class ComplexityDeepModel(nn.Module):
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
 
         hidden = self.norm(hidden)
-
-        # Compute logits in float32 for numerical stability (match forward())
-        if self.tie_word_embeddings and self.embed_tokens is not None:
-            logits = F.linear(hidden.float(), self.embed_tokens.weight.float())
-        elif hasattr(self, 'lm_head'):
-            logits = F.linear(hidden.float(), self.lm_head.weight.float())
-        else:
-            raise RuntimeError(
-                "No lm_head or tied embeddings found — cannot compute logits."
-            )
-
-        return logits
+        return self._compute_logits(hidden)
 
     def forward(
         self,
@@ -695,20 +748,9 @@ class ComplexityDeepModel(nn.Module):
                 "mu_residual": mu_residual,
             })
 
-        # Last stage: norm + logits (computed in float32 for numerical stability)
+        # Last stage: norm + logits
         hidden = self.norm(hidden)
-
-        if self.tie_word_embeddings and self.embed_tokens is not None:
-            logits = F.linear(hidden.float(), self.embed_tokens.weight.float())
-        elif hasattr(self, 'lm_head'):
-            logits = F.linear(hidden.float(), self.lm_head.weight.float())
-        else:
-            raise RuntimeError(
-                "No lm_head or tied embeddings found — cannot compute logits. "
-                "Check model config: tie_word_embeddings or lm_head weight required."
-            )
-
-        return logits
+        return self._compute_logits(hidden)
 
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())

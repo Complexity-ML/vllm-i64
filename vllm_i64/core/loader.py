@@ -398,6 +398,8 @@ def load_model_by_name(
             _quantize_experts(model, quantization)
             _quantize_dense_mlp(model, quantization)
             _quantize_attention(model, quantization)
+            _quantize_mu_attention(model, quantization)
+            _quantize_lm_head(model, quantization)
             _quantize_rmsnorm(model, quantization)
         if tp.tp_rank == 0:
             print(f"  Quantized weights: {quantization}")
@@ -560,6 +562,100 @@ def _quantize_attention(model: nn.Module, method: str):
         module.k_proj.linear.weight = None
         module.v_proj.linear.weight = None
         module.o_proj.linear.weight = None
+
+
+def _quantize_mu_attention(model: nn.Module, method: str):
+    """
+    Apply INT8 quantization to MuGuidedAttention layers.
+
+    Fused QKV: cat([Q, K, V], dim=0) → single INT8 matmul, split output.
+    Fused mu_QKV: cat([mu_to_q, mu_to_k, mu_to_v], dim=0) → single INT8 matmul.
+    O: separate INT8 matmul.
+    """
+    from vllm_i64.models.complexity_deep.model import MuGuidedAttention
+    from vllm_i64.core.quantization import quantize_int8
+
+    if method != "int8":
+        return
+
+    for name, module in model.named_modules():
+        if not isinstance(module, MuGuidedAttention):
+            continue
+
+        # Fused QKV
+        q_w = module.q_proj.linear.weight.data
+        k_w = module.k_proj.linear.weight.data
+        v_w = module.v_proj.linear.weight.data
+        qkv_w = torch.cat([q_w, k_w, v_w], dim=0)
+        qkv_q, qkv_s = quantize_int8(qkv_w)
+        module.register_buffer("qkv_int8", qkv_q)
+        module.register_buffer("qkv_scale", qkv_s)
+        module.q_size = q_w.shape[0]
+        module.kv_size = k_w.shape[0]
+
+        # QKV bias (if present)
+        if module.q_proj.linear.bias is not None:
+            qkv_bias = torch.cat([
+                module.q_proj.linear.bias.data,
+                module.k_proj.linear.bias.data,
+                module.v_proj.linear.bias.data,
+            ])
+            module.register_buffer("qkv_bias", qkv_bias)
+
+        # Fused mu projections: cat([mu_to_q, mu_to_k, mu_to_v])
+        mu_q_w = module.mu_to_q.linear.weight.data
+        mu_k_w = module.mu_to_k.linear.weight.data
+        mu_v_w = module.mu_to_v.linear.weight.data
+        mu_qkv_w = torch.cat([mu_q_w, mu_k_w, mu_v_w], dim=0)
+        mu_qkv_q, mu_qkv_s = quantize_int8(mu_qkv_w)
+        module.register_buffer("mu_qkv_int8", mu_qkv_q)
+        module.register_buffer("mu_qkv_scale", mu_qkv_s)
+
+        # O projection
+        o_w = module.o_proj.linear.weight.data
+        o_q, o_s = quantize_int8(o_w)
+        module.register_buffer("o_int8", o_q)
+        module.register_buffer("o_scale", o_s)
+        if module.o_proj.linear.bias is not None:
+            module.register_buffer("o_bias", module.o_proj.linear.bias.data.clone())
+
+        # Free float weights
+        module.q_proj.linear.weight = None
+        module.k_proj.linear.weight = None
+        module.v_proj.linear.weight = None
+        module.o_proj.linear.weight = None
+        module.mu_to_q.linear.weight = None
+        module.mu_to_k.linear.weight = None
+        module.mu_to_v.linear.weight = None
+
+
+def _quantize_lm_head(model: nn.Module, method: str):
+    """
+    Quantize lm_head (or tied embed_tokens) to INT8.
+
+    lm_head is a large matmul: (batch, hidden) × (vocab, hidden)^T.
+    INT8 accelerates logit computation significantly for large vocabularies.
+    """
+    from vllm_i64.core.quantization import quantize_int8
+
+    if method != "int8":
+        return
+
+    # Tied embeddings: quantize embed_tokens weight for use as lm_head
+    if getattr(model, 'tie_word_embeddings', False) and model.embed_tokens is not None:
+        w = model.embed_tokens.weight.data
+        wq, ws = quantize_int8(w)
+        model.register_buffer("embed_int8", wq)
+        model.register_buffer("embed_scale", ws)
+        return
+
+    # Separate lm_head
+    if hasattr(model, 'lm_head') and model.lm_head is not None:
+        w = model.lm_head.weight.data
+        wq, ws = quantize_int8(w)
+        model.register_buffer("lm_head_int8", wq)
+        model.register_buffer("lm_head_scale", ws)
+        model.lm_head.weight = None
 
 
 def _quantize_rmsnorm(model: nn.Module, method: str):
