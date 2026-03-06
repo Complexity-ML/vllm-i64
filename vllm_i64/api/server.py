@@ -232,10 +232,16 @@ class I64Server:
             if cfg_eos != tok_eos:
                 logger.info("Fixing eos_token_id: config=%d → tokenizer=%d", cfg_eos, tok_eos)
                 engine.model.config.eos_token_id = tok_eos
-        # Space suppression disabled: models are trained to emit a leading space
-        # after "Assistant:" — suppressing it at step 0 diverts the entire
-        # generation trajectory.  Leading spaces are stripped in post-processing.
+        # Pre-compute space token suppression IDs (used by all generation endpoints)
+        # Models generate a leading space after "Assistant:" then immediately EOS.
+        # Suppressing space at step 0 lets the model produce meaningful content directly.
         self._space_suppress_ids = None
+        if tokenizer:
+            space_ids = tokenizer.encode(" ")
+            if len(space_ids) == 1:
+                self._space_suppress_ids = [space_ids[0]]
+            elif len(space_ids) == 2 and space_ids[0] == tokenizer.bos_token_id:
+                self._space_suppress_ids = [space_ids[1]]
 
         self.model_name = model_name
         self.host = host
@@ -509,7 +515,6 @@ class I64Server:
         last_token_id = None
         output_ids: List[int] = []
         prev_text = ""
-        is_first_content = True
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
@@ -520,10 +525,6 @@ class I64Server:
             full_text = self._detokenize(output_ids)
             token_text = full_text[len(prev_text):]
             prev_text = full_text
-            # Strip leading space from first content chunk
-            if is_first_content and token_text:
-                token_text = token_text.lstrip(" ")
-                is_first_content = False
             if not token_text:
                 continue
             chunk = {
@@ -698,7 +699,7 @@ class I64Server:
             min_p=body.get("min_p", 0.0),
             typical_p=body.get("typical_p", 1.0),
             repetition_penalty=body.get("repetition_penalty", 1.1),
-            min_tokens=body.get("min_tokens", 10),  # Chat default: prevent small models from stopping too early
+            min_tokens=body.get("min_tokens", 0),
             stream=body.get("stream", False),
             response_format=body.get("response_format"),
             stop=self._chat_stop_sequences(body.get("stop")),
@@ -744,9 +745,6 @@ class I64Server:
             if result_dict["choices"]:
                 text = result_dict["choices"][0]["text"]
                 finish_reason = result_dict["choices"][0].get("finish_reason", "length")
-
-                # Strip leading space (model generates space after "Assistant:")
-                text = text.lstrip(" ")
 
                 # Strip hallucinated chat template markers from output
                 for marker in ("Assistant:", "User:"):
