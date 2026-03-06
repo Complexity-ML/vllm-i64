@@ -1033,7 +1033,7 @@ class I64Engine:
             and hasattr(self.model, 'decode_step')
         )
 
-        with torch.no_grad():
+        with torch.inference_mode():
             if use_graph:
                 # Enter graph mode: copy block_table + seqlens to static buffers
                 self.kv_cache.enter_graph_mode(seq_ids)
