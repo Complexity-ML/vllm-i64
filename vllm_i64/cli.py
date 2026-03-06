@@ -109,14 +109,21 @@ def cmd_serve(args):
         import os
         ckpt_path = args.checkpoint or entry.checkpoint
         if ckpt_path:
-            ckpt_dir = os.path.dirname(ckpt_path) if os.path.isfile(ckpt_path) else ckpt_path
-            for name in ("chat_template.jinja", "chat_template.j2"):
-                tmpl_path = os.path.join(ckpt_dir, name)
-                if os.path.exists(tmpl_path):
-                    with open(tmpl_path) as f:
-                        chat_template = f.read()
-                    print(f"  chat_template: {tmpl_path}")
+            search_dir = os.path.dirname(ckpt_path) if os.path.isfile(ckpt_path) else ckpt_path
+            for _ in range(4):  # checkpoint, parent, grandparent, great-grandparent
+                for name in ("chat_template.jinja", "chat_template.j2"):
+                    tmpl_path = os.path.join(search_dir, name)
+                    if os.path.exists(tmpl_path):
+                        with open(tmpl_path) as f:
+                            chat_template = f.read()
+                        print(f"  chat_template: {tmpl_path}")
+                        break
+                if chat_template:
                     break
+                parent = os.path.dirname(search_dir)
+                if parent == search_dir:
+                    break
+                search_dir = parent
 
     # Create engine + server (async continuous batching)
     # CPU uses the dedicated CPUEngine (no CUDA graphs, thread-executor step)
