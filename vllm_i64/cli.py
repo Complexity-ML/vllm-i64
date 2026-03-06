@@ -55,9 +55,9 @@ def cmd_serve(args):
     dtype = dtype_map[args.dtype]
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # CPU doesn't support FP16 natively — override to float32 (bfloat16 is OK on CPU)
-    if device == "cpu" and dtype == torch.float16:
-        print(f"  [note] CPU detected — overriding float16 to float32 (FP16 not supported on CPU)")
+    # CPU doesn't support FP16/BF16 natively on most hardware — override to float32
+    if device == "cpu" and dtype in (torch.float16, torch.bfloat16):
+        print(f"  [note] CPU detected — overriding {dtype} to float32")
         dtype = torch.float32
 
     entry = get_model_entry(args.model)
