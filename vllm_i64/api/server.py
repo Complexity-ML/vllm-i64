@@ -697,7 +697,7 @@ class I64Server:
             min_p=body.get("min_p", 0.0),
             typical_p=body.get("typical_p", 1.0),
             repetition_penalty=body.get("repetition_penalty", 1.1),
-            min_tokens=body.get("min_tokens", 0),
+            min_tokens=body.get("min_tokens", 10),  # Chat default: prevent small models from stopping too early
             stream=body.get("stream", False),
             response_format=body.get("response_format"),
             stop=self._chat_stop_sequences(body.get("stop")),
