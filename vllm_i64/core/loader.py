@@ -402,6 +402,10 @@ def load_model_by_name(
         if tp.tp_rank == 0:
             print(f"  Quantized weights: {quantization}")
 
+    # Disable grad tracking — inference only, avoids autograd view conflicts
+    # with quantized buffers that are views of original parameters.
+    model.requires_grad_(False)
+
     return model.to(device)
 
 
