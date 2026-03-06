@@ -126,6 +126,10 @@ _COMPLEXITY_DEEP = (
     "vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
     "vllm_i64.models.complexity_deep.config.ComplexityDeepConfig",
 )
+_COMPLEXITY_I64 = (
+    "vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
+    "vllm_i64.models.complexity_i64.config.ComplexityI64Config",
+)
 
 # Map: HF architectures string → (model_class, config_loader)
 # Each model imported one by one.
@@ -149,6 +153,8 @@ _ARCHITECTURE_MAP: Dict[str, Tuple[str, str]] = {
     "MixtralForCausalLM": _MIXTRAL,
     # --- i64 token-routed MoE ---
     "DeepForCausalLM": _COMPLEXITY_DEEP,
+    # --- i64 integer-native ---
+    "I64ForCausalLM": _COMPLEXITY_I64,
 }
 
 
@@ -273,4 +279,13 @@ register_model(
     checkpoint="checkpoints/pacific-prime-python/converted/fp16",
     parameters="~1.58B",
     description="Complexity Deep v0.13.0 python fine-tune (FP16 safetensors)",
+)
+
+# --- Complexity-I64 (integer-native) ---
+
+register_model(
+    name="complexity-i64",
+    model_class=_COMPLEXITY_I64[0],
+    config_loader=_COMPLEXITY_I64[1],
+    description="Complexity-I64 integer-native model — use --checkpoint to specify model",
 )

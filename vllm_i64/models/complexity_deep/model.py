@@ -50,6 +50,10 @@ class INLDynamics(nn.Module):
         h_next = h + dt * gate * v_next
 
     alpha, beta, gate learned via controller MLP, clamped via sigmoid.
+
+    Supports two modes:
+      - Float (training / unquantized inference): standard F.silu, sigmoid, softplus
+      - INT8 (quantized inference): INT8 controller matmuls + LUT activations
     """
 
     def __init__(self, hidden_size: int, controller_hidden: int = 64, dt: float = 0.1):
@@ -77,6 +81,10 @@ class INLDynamics(nn.Module):
         if v is None:
             v = torch.zeros_like(h)
 
+        # INT8 path: quantized controller + LUT activations
+        if hasattr(self, 'ctrl_in_int8'):
+            return self._forward_int8(h, v)
+
         # Cast to weight dtype — h may be float32 from INT8 linear output
         w_dtype = self.controller_in.weight.dtype
         if h.dtype != w_dtype:
@@ -93,6 +101,53 @@ class INLDynamics(nn.Module):
         gate = torch.sigmoid(gate_raw)
 
         mu_contextual = self.mu + self.mu_proj(h)
+        error = h - mu_contextual
+        v_next = alpha * v - beta * error
+        v_next = torch.clamp(v_next, min=-10.0, max=10.0)
+        h_next = h + self.dt * gate * v_next
+
+        return h_next, v_next, mu_contextual
+
+    def _forward_int8(
+        self, h: torch.Tensor, v: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """INT8 controller + LUT activations (zero-FLOP sigmoid/softplus/silu)."""
+        from vllm_i64.core.quantization import int8_linear_native
+        from vllm_i64.layers.integer_activations import (
+            _Q7, silu_integer, sigmoid_integer, softplus_integer,
+        )
+
+        hv = torch.cat([h, v], dim=-1)
+
+        # Controller in: INT8 matmul + LUT SiLU
+        ctrl = int8_linear_native(hv, self.ctrl_in_int8, self.ctrl_in_scale,
+                                  self.ctrl_in_bias)
+        ctrl_q7 = (ctrl.float() * _Q7).round().to(torch.int32)
+        ctrl = silu_integer(ctrl_q7).float() / _Q7
+
+        # Controller out: INT8 matmul
+        ctrl_out = int8_linear_native(ctrl, self.ctrl_out_int8, self.ctrl_out_scale,
+                                      self.ctrl_out_bias)
+
+        alpha_raw, beta_raw, gate_raw = torch.split(ctrl_out, self.hidden_size, dim=-1)
+
+        # LUT activations for alpha (sigmoid), beta (softplus), gate (sigmoid)
+        alpha_q7 = (alpha_raw.float() * _Q7).round().to(torch.int32)
+        alpha = sigmoid_integer(alpha_q7).float() / _Q7
+
+        beta_q7 = (beta_raw.float() * _Q7).round().to(torch.int32)
+        beta = softplus_integer(beta_q7).float() / _Q7
+        beta = beta.clamp(max=2.0)
+
+        gate_q7 = (gate_raw.float() * _Q7).round().to(torch.int32)
+        gate = sigmoid_integer(gate_q7).float() / _Q7
+
+        # mu projection: INT8 if available
+        if hasattr(self, 'mu_proj_int8'):
+            mu_contextual = self.mu + int8_linear_native(h, self.mu_proj_int8, self.mu_proj_scale)
+        else:
+            mu_contextual = self.mu + self.mu_proj(h)
+
         error = h - mu_contextual
         v_next = alpha * v - beta * error
         v_next = torch.clamp(v_next, min=-10.0, max=10.0)

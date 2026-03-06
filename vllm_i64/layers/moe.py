@@ -83,61 +83,10 @@ def softmax_integer(logits: torch.Tensor) -> torch.Tensor:
 
 
 # =========================================================================
-# Fixed-point SiLU LUT
+# Fixed-point SiLU LUT — re-exported from integer_activations
 # =========================================================================
-#
-# silu(x) = x * sigmoid(x). LUT covers [-8.0, 8.0] at Q7 resolution.
-# Outside this range: silu(x) ≈ x for x >> 0, silu(x) ≈ 0 for x << 0.
 
-_SILU_LUT_MIN = -1024    # -8.0 at Q7
-_SILU_LUT_MAX = 1024     # +8.0 at Q7
-_SILU_LUT_SIZE = _SILU_LUT_MAX - _SILU_LUT_MIN + 1  # 2049 entries
-
-def _build_silu_lut() -> torch.Tensor:
-    """Build SiLU LUT: integer index in [-1024, 1024] → silu(index/128) * 128."""
-    indices = torch.arange(_SILU_LUT_MIN, _SILU_LUT_MAX + 1, dtype=torch.float32)
-    x = indices / _Q_IN
-    return (F.silu(x) * _Q_IN).round().to(torch.int32)
-
-_SILU_LUT = _build_silu_lut()
-
-
-def silu_integer(x_q7: torch.Tensor) -> torch.Tensor:
-    """
-    Fixed-point SiLU via LUT. Input/output in Q7 scale.
-
-    Values outside [-8, 8]: silu(x) ≈ x for x > 8, ≈ 0 for x < -8.
-    """
-    lut = _SILU_LUT.to(x_q7.device)
-    # Clamp to LUT range
-    clamped = x_q7.clamp(_SILU_LUT_MIN, _SILU_LUT_MAX)
-    indices = (clamped - _SILU_LUT_MIN).long()
-    result = lut[indices]
-    # Outside LUT: x > 8 → silu ≈ x, x < -8 → silu ≈ 0
-    result = torch.where(x_q7 > _SILU_LUT_MAX, x_q7, result)
-    result = torch.where(x_q7 < _SILU_LUT_MIN, torch.zeros_like(result), result)
-    return result
-
-
-def silu_multiply_integer(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    """
-    Integer SiLU + multiply: silu(gate) * up, all in fixed-point INT32.
-
-    Replaces F.silu(gate) * up with:
-        1. Quantize gate/up to Q7 (×128, round to INT32)
-        2. SiLU via 2049-entry LUT on gate
-        3. Multiply in INT32 (Q7 × Q7 → Q14)
-        4. Dequantize back to float (÷ 128²)
-
-    Q7 covers [-8.0, 8.0] at 1/128 resolution.
-    Outside: silu(x) ≈ x for x >> 0, ≈ 0 for x << 0.
-    """
-    # float32 for quantization — bf16 mantissa (8-bit) loses precision at Q7 scale
-    gate_q7 = (gate.float() * _Q_IN).round().to(torch.int32)
-    silu_q7 = silu_integer(gate_q7)
-    up_q7 = (up.float() * _Q_IN).round().to(torch.int32)
-    inter_q14 = silu_q7 * up_q7
-    return inter_q14.float() / (_Q_IN * _Q_IN)
+from vllm_i64.layers.integer_activations import silu_integer, silu_multiply_integer
 
 
 class MoEExpert(nn.Module):

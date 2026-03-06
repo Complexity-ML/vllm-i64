@@ -399,6 +399,7 @@ def load_model_by_name(
             _quantize_dense_mlp(model, quantization)
             _quantize_attention(model, quantization)
             _quantize_mu_attention(model, quantization)
+            _quantize_i64_dynamics(model, quantization)
             _quantize_lm_head(model, quantization)
             _quantize_rmsnorm(model, quantization)
         if tp.tp_rank == 0:
@@ -627,6 +628,46 @@ def _quantize_mu_attention(model: nn.Module, method: str):
         module.mu_to_q.linear.weight = None
         module.mu_to_k.linear.weight = None
         module.mu_to_v.linear.weight = None
+
+
+def _quantize_i64_dynamics(model: nn.Module, method: str):
+    """
+    Quantize INLDynamics controller weights to INT8.
+
+    Enables integer dynamics: INT8 controller matmuls + LUT activations
+    (sigmoid, softplus, silu). Zero-FLOP activations after quantization.
+    """
+    from vllm_i64.models.complexity_deep.model import INLDynamics
+    from vllm_i64.core.quantization import quantize_int8
+
+    if method != "int8":
+        return
+
+    for name, module in model.named_modules():
+        if not isinstance(module, INLDynamics):
+            continue
+
+        # Controller in
+        ciq, cis = quantize_int8(module.controller_in.weight.data)
+        module.register_buffer("ctrl_in_int8", ciq)
+        module.register_buffer("ctrl_in_scale", cis)
+        module.register_buffer("ctrl_in_bias", module.controller_in.bias.data.clone())
+
+        # Controller out
+        coq, cos = quantize_int8(module.controller_out.weight.data)
+        module.register_buffer("ctrl_out_int8", coq)
+        module.register_buffer("ctrl_out_scale", cos)
+        module.register_buffer("ctrl_out_bias", module.controller_out.bias.data.clone())
+
+        # mu_proj
+        mpq, mps = quantize_int8(module.mu_proj.weight.data)
+        module.register_buffer("mu_proj_int8", mpq)
+        module.register_buffer("mu_proj_scale", mps)
+
+        # Free float weights
+        module.controller_in.weight = None
+        module.controller_out.weight = None
+        module.mu_proj.weight = None
 
 
 def _quantize_lm_head(model: nn.Module, method: str):
