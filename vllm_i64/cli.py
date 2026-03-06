@@ -15,7 +15,10 @@ INL - 2025
 """
 
 import argparse
+import logging
 import sys
+
+_logger = logging.getLogger("vllm_i64.cli")
 
 
 def cmd_serve(args):
@@ -57,17 +60,17 @@ def cmd_serve(args):
 
     # CPU doesn't support FP16/BF16 natively on most hardware — override to float32
     if device == "cpu" and dtype in (torch.float16, torch.bfloat16):
-        print(f"  [note] CPU detected — overriding {dtype} to float32")
+        _logger.info("CPU detected — overriding %s to float32", dtype)
         dtype = torch.float32
 
     # INT8 on CPU is slower than float32 — quantize/dequant overhead per layer kills throughput
     if device == "cpu" and args.quantization == "int8":
-        print(f"  [note] CPU detected — disabling INT8 quantization (float32 is faster)")
+        _logger.info("CPU detected — disabling INT8 quantization (float32 is faster)")
         args.quantization = "none"
 
     entry = get_model_entry(args.model)
-    print(f"vllm-i64 :: serving {args.model}")
-    print(f"  host={args.host} port={args.port} dtype={dtype} device={device}")
+    _logger.info("vllm-i64 :: serving %s", args.model)
+    _logger.info("host=%s port=%d dtype=%s device=%s", args.host, args.port, dtype, device)
 
     # Load model
     model = load_model_by_name(
@@ -83,7 +86,7 @@ def cmd_serve(args):
         # CPU backend doesn't support reduce-overhead (CUDA graphs)
         if device == "cpu" and compile_mode == "reduce-overhead":
             compile_mode = "default"
-        print(f"  torch.compile: mode={compile_mode}")
+        _logger.info("torch.compile: mode=%s", compile_mode)
         model = torch.compile(model, mode=compile_mode)
 
     # Load tokenizer (from checkpoint dir if overridden, search up 3 parent dirs)
@@ -96,7 +99,7 @@ def cmd_serve(args):
             if os.path.exists(tok_path):
                 from vllm_i64.core.tokenizer import I64Tokenizer
                 tokenizer = I64Tokenizer(tok_path)
-                print(f"  tokenizer: {tok_path}")
+                _logger.info("tokenizer: %s", tok_path)
                 break
             parent = os.path.dirname(search_dir)
             if parent == search_dir:
@@ -121,7 +124,7 @@ def cmd_serve(args):
                     if os.path.exists(tmpl_path):
                         with open(tmpl_path) as f:
                             chat_template = f.read()
-                        print(f"  chat_template: {tmpl_path}")
+                        _logger.info("chat_template: %s", tmpl_path)
                         break
                 if chat_template:
                     break
@@ -149,7 +152,7 @@ def cmd_serve(args):
     # Enable swap-to-CPU for KV cache overflow
     if getattr(args, 'enable_swap', False) and engine.kv_cache is not None:
         engine.kv_cache.enable_swap()
-        print(f"  swap-to-cpu: enabled")
+        _logger.info("swap-to-cpu: enabled")
 
     # Speculative decoding (optional)
     if getattr(args, 'speculative_model', None):
@@ -157,7 +160,7 @@ def cmd_serve(args):
         draft_model.eval()
         num_spec = getattr(args, 'num_speculative_tokens', 5)
         engine.enable_speculative(draft_model, num_spec)
-        print(f"  speculative: {args.speculative_model} (K={num_spec})")
+        _logger.info("speculative: %s (K=%d)", args.speculative_model, num_spec)
 
     # CUDA graph warmup (captures decode graphs for common batch sizes)
     if not getattr(args, 'no_cuda_graphs', False):
