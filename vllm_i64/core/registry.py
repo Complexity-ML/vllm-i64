@@ -259,6 +259,13 @@ register_model(
 )
 
 register_model(
+    name="pacific-ros2",
+    model_class=_COMPLEXITY_DEEP[0],
+    config_loader=_COMPLEXITY_DEEP[1],
+    description="Complexity Deep v0.13.0 ROS2 specialist — use --checkpoint to specify model",
+)
+
+register_model(
     name="pacific-prime-python",
     model_class=_COMPLEXITY_DEEP[0],
     config_loader=_COMPLEXITY_DEEP[1],
