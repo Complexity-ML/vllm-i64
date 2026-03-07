@@ -1250,6 +1250,7 @@ class AsyncI64Engine:
         # Async state
         self._pending_futures: Dict[int, asyncio.Future] = {}
         self._request_times: Dict[int, float] = {}
+        self._request_first_token_sent: Set[int] = set()  # Track TTFT
         self._engine_task: Optional[asyncio.Task] = None
         self._running = False
         self._draining = False
@@ -1267,6 +1268,7 @@ class AsyncI64Engine:
         instance.engine = engine
         instance._pending_futures = {}
         instance._request_times = {}
+        instance._request_first_token_sent = set()
         instance._engine_task = None
         instance._running = False
         instance._draining = False
@@ -1393,6 +1395,7 @@ class AsyncI64Engine:
                 self.engine.cancel_request(request_id)
             self.active_requests -= 1
             self._request_times.pop(request_id, None)
+            self._request_first_token_sent.discard(request_id)
 
     async def _engine_loop(self):
         """Continuous batching loop with crash recovery and event-driven wake-up."""
@@ -1412,12 +1415,18 @@ class AsyncI64Engine:
                     # Run step() in a thread executor on CPU to avoid blocking
                     # the event loop during the forward pass (which can take
                     # several seconds on CPU, causing SSE connection timeouts).
+                    _step_start = time.perf_counter()
                     if self.device == "cpu":
                         loop = asyncio.get_event_loop()
                         step_results = await loop.run_in_executor(None, self.engine.step)
                     else:
                         step_results = self.engine.step()
+                    _step_elapsed = time.perf_counter() - _step_start
                     _consecutive_errors = 0  # Reset on success
+
+                    # ITL: observe per-step decode latency
+                    if self.engine.metrics and step_results:
+                        self.engine.metrics.observe_itl(_step_elapsed)
                 except Exception as e:
                     _consecutive_errors += 1
                     logger.error("Engine step failed (%d/%d): %s", _consecutive_errors, _MAX_CONSECUTIVE_ERRORS, e)
@@ -1449,6 +1458,13 @@ class AsyncI64Engine:
 
                 # Deliver tokens to streaming futures
                 for req_id, token_id in step_results.items():
+                    # TTFT: record time to first token
+                    if req_id not in self._request_first_token_sent:
+                        self._request_first_token_sent.add(req_id)
+                        if self.engine.metrics and req_id in self._request_times:
+                            ttft = time.perf_counter() - self._request_times[req_id]
+                            self.engine.metrics.observe_ttft(ttft)
+
                     if req_id in self._pending_futures:
                         target = self._pending_futures[req_id]
                         if isinstance(target, asyncio.Queue):
@@ -1503,6 +1519,7 @@ class AsyncI64Engine:
 
                 # Clean up finished + all associated engine state
                 for rid in finished_ids:
+                    self._request_first_token_sent.discard(rid)
                     self.engine._free_slot(rid)
                     self.engine._request_deadlines.pop(rid, None)
                     self.engine._request_sampling_params.pop(rid, None)
