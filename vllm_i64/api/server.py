@@ -18,6 +18,7 @@ Endpoints:
     GET  /v1/cache/stats      → KV cache statistics
     POST /v1/cache/purge      → purge prefix cache (admin)
     GET  /v1/experts          → expert routing distribution
+    POST /v1/search/completions → search-augmented generation (Perplexity-style)
     POST /v1/lora/load        → load LoRA adapter (admin)
     POST /v1/lora/unload      → unload LoRA adapter (admin)
     GET  /v1/lora/list        → list loaded adapters
@@ -269,6 +270,18 @@ class I64Server:
         self._shutting_down = False
         # Thread pool for tokenization (avoids blocking the event loop)
         self._tokenize_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="tokenize")
+        # Web search — Perplexity-style search-augmented generation
+        self.web_searcher = None
+        try:
+            from vllm_i64.search import WebSearcher
+            self.web_searcher = WebSearcher()
+            if self.web_searcher.available:
+                logger.info("Web search enabled (Brave Search API)")
+            else:
+                logger.info("Web search module loaded but no API key set (BRAVE_SEARCH_API_KEY)")
+        except ImportError:
+            logger.debug("Web search module not available (missing aiohttp?)")
+
         # RAG — native retrieval-augmented generation
         self.retriever = None
         self.rag_enabled = False
@@ -1533,6 +1546,169 @@ class I64Server:
         return web.json_response(spec)
 
     # =========================================================================
+    # Web Search endpoint — Perplexity-style search-augmented generation
+    # =========================================================================
+
+    _SEARCH_SYSTEM_PROMPT = (
+        "You are a helpful search assistant. Answer the user's question using ONLY the provided sources. "
+        "Cite sources using [1], [2], etc. inline in your answer. "
+        "If the sources don't contain enough information, say so honestly. "
+        "Be concise and factual."
+    )
+
+    def _build_search_prompt(self, query: str, context: str) -> str:
+        """Build a chat prompt with search context for the model."""
+        messages = [
+            {"role": "system", "content": self._SEARCH_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Sources:\n{context}\n\nQuestion: {query}"},
+        ]
+        return self._apply_chat_template(messages)
+
+    async def handle_search_completions(self, request: web.Request) -> web.Response:
+        """
+        POST /v1/search/completions — search-augmented generation.
+
+        Request body:
+            {
+                "query": "What is token routing in MoE?",
+                "max_tokens": 512,
+                "temperature": 0.7,
+                "stream": true,
+                "search_count": 5,       // number of web results (default: 5)
+                "scrape": true            // scrape pages for richer context (default: true)
+            }
+
+        Streaming response: SSE chunks (same as chat/completions) + final sources chunk.
+        Non-streaming response: includes "sources" array in the response.
+        """
+        if self.web_searcher is None or not self.web_searcher.available:
+            return web.json_response(
+                {"error": {"message": "Web search not available — set BRAVE_SEARCH_API_KEY", "type": "server_error"}},
+                status=503,
+            )
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                {"error": {"message": "Invalid JSON in request body", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        query = body.get("query") or body.get("prompt")
+        if not query:
+            # Also accept messages format (like chat completions)
+            messages = body.get("messages")
+            if messages:
+                query = messages[-1].get("content", "") if messages else ""
+            if not query:
+                return web.json_response(
+                    {"error": {"message": "Missing 'query' field", "type": "invalid_request_error"}},
+                    status=400,
+                )
+
+        search_count = body.get("search_count", 5)
+        stream = body.get("stream", False)
+
+        # Step 1: Web search
+        try:
+            results = await self.web_searcher.search(query, count=search_count)
+        except Exception as e:
+            logger.error("Web search failed: %s", e, exc_info=True)
+            return web.json_response(
+                {"error": {"message": f"Web search failed: {e}", "type": "server_error"}},
+                status=502,
+            )
+
+        if not results:
+            return web.json_response(
+                {"error": {"message": "No search results found", "type": "server_error"}},
+                status=404,
+            )
+
+        # Step 2: Build prompt with search context
+        context = self.web_searcher.format_context(results)
+        sources = self.web_searcher.format_sources(results)
+        prompt = self._build_search_prompt(query, context)
+
+        req = CompletionRequest(
+            prompt=prompt,
+            max_tokens=body.get("max_tokens", 512),
+            temperature=body.get("temperature", 0.7),
+            top_k=body.get("top_k", 50),
+            top_p=body.get("top_p", 0.9),
+            min_p=body.get("min_p", 0.0),
+            repetition_penalty=body.get("repetition_penalty", 1.1),
+            stream=stream,
+            stop=self._chat_stop_sequences(body.get("stop")),
+            suppress_first_tokens=self._space_suppress_ids,
+        )
+
+        error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
+        if error:
+            return web.json_response(
+                {"error": {"message": error, "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        try:
+            if stream:
+                # Step 3a: Stream response, then send sources at the end
+                response = web.StreamResponse()
+                response.content_type = "text/event-stream"
+                response.headers["Cache-Control"] = "no-cache"
+                await response.prepare(request)
+                gen = self._async_chat_stream(req)
+                try:
+                    async for chunk in gen:
+                        await response.write(chunk.encode())
+                        await response.drain()
+                except (ConnectionResetError, ConnectionError):
+                    await gen.aclose()
+                    return response
+
+                # Send sources as a final SSE event
+                sources_event = f"data: {json.dumps({'sources': sources})}\n\n"
+                await response.write(sources_event.encode())
+                await response.drain()
+                return response
+
+            else:
+                # Step 3b: Non-streaming — generate and return with sources
+                result = await self._async_complete(req, endpoint="/v1/search/completions")
+                result_dict = result.to_dict()
+                text = ""
+                if result_dict["choices"]:
+                    text = result_dict["choices"][0]["text"]
+                    # Strip hallucinated chat markers
+                    for marker in ("Assistant:", "User:"):
+                        idx = text.find(marker)
+                        if idx != -1:
+                            text = text[:idx].rstrip()
+                            break
+
+                return web.json_response({
+                    "id": result_dict["id"],
+                    "object": "search.completion",
+                    "model": self.model_name,
+                    "query": query,
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": result_dict["choices"][0].get("finish_reason", "stop"),
+                    }],
+                    "sources": sources,
+                    "usage": result_dict.get("usage", {}),
+                })
+
+        except Exception as e:
+            logger.error("Search completion failed: %s", e, exc_info=True)
+            return web.json_response(
+                {"error": {"message": "Search completion failed", "type": "server_error"}},
+                status=500,
+            )
+
+    # =========================================================================
     # RAG endpoints
     # =========================================================================
 
@@ -1800,6 +1976,9 @@ class I64Server:
         app.router.add_get("/v1/monitor", self.handle_monitor)
         app.router.add_get("/v1/experts", self.handle_expert_stats)
         app.router.add_route("OPTIONS", "/v1/cache/purge", self._handle_options)
+        # Search endpoint (Perplexity-style)
+        app.router.add_post("/v1/search/completions", self.handle_search_completions)
+        app.router.add_route("OPTIONS", "/v1/search/completions", self._handle_options)
         # RAG endpoints
         app.router.add_post("/v1/rag/index", self.handle_rag_index)
         app.router.add_post("/v1/rag/search", self.handle_rag_search)
