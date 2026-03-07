@@ -167,7 +167,20 @@ def int8_linear_native(
 
     # GPU-only accelerated fallbacks
     if x.is_cuda:
-        # Priority 1: CUDA I64_gemm_dequant_int8
+        # Priority 1: Triton native INT8x8→INT32 GEMM (no cuBLAS dependency)
+        try:
+            from vllm_i64.kernels.triton.I64_int8_gemm import triton_int8_gemm
+            if x_preq is not None:
+                x_int8, x_scale = x_preq[0], x_preq[1]
+            else:
+                x_int8, x_scale = quantize_activations_int8(x_2d)
+            wt = weight_int8.t().contiguous()
+            out = triton_int8_gemm(x_int8, x_scale, wt, weight_scale, bias)
+            if out is not None:
+                return out.reshape(*orig_shape[:-1], out_features)
+        except (ImportError, Exception):
+            pass
+        # Priority 2: CUDA I64_gemm_dequant_int8
         try:
             from vllm_i64.kernels.cuda import get_i64_cuda_ops
             cuda_ops = get_i64_cuda_ops()
@@ -178,7 +191,7 @@ def int8_linear_native(
                 return out.reshape(*orig_shape[:-1], out_features)
         except (ImportError, Exception):
             pass
-        # Priority 2: Triton fused dequant+GEMM
+        # Priority 3: Triton fused dequant+GEMM
         try:
             from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
             out = triton_dequant_gemm_int8(x_2d, weight_int8, weight_scale, bias)

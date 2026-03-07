@@ -27,3 +27,6 @@ from vllm_i64.kernels.triton.I64_fused_rope import (
 from vllm_i64.kernels.triton.I64_fused_dequant_gemm import (
     triton_dequant_gemm_int8,
 )
+from vllm_i64.kernels.triton.I64_int8_gemm import (
+    triton_int8_gemm,
+)
