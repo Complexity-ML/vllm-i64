@@ -561,7 +561,7 @@ class PagedKVCache:
         """Hash a block of token IDs for prefix matching."""
         h = hashlib.sha256()
         for tid in token_ids:
-            h.update(tid.to_bytes(8, "little", signed=True))
+            h.update(int(tid).to_bytes(8, "little", signed=True))
         return int.from_bytes(h.digest()[:8], "little")
 
     def try_reuse_prefix(
