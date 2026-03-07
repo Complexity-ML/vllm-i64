@@ -149,6 +149,7 @@ class RequestLogger:
         completion_tokens: int = 0,
         api_key: Optional[str] = None,
         error: Optional[str] = None,
+        request_id: Optional[str] = None,
     ):
         if not self.enabled:
             return
@@ -161,6 +162,8 @@ class RequestLogger:
             "completion_tokens": completion_tokens,
             "api_key": api_key[:8] + "..." if api_key and len(api_key) > 8 else api_key,
         }
+        if request_id:
+            entry["request_id"] = request_id
         if error:
             entry["error"] = error
         self._log.append(entry)

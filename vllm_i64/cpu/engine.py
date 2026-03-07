@@ -63,6 +63,7 @@ class CPUEngine(I64Engine):
         max_batch_size: int = 8,
         max_seq_len: int = 2048,
         max_kv_blocks: int = 0,
+        max_prefill_tokens: int = 512,
         enable_prefix_caching: bool = False,
         kv_cache_dtype: Optional[str] = None,
     ):
@@ -73,6 +74,7 @@ class CPUEngine(I64Engine):
             max_batch_size=max_batch_size,
             max_seq_len=max_seq_len,
             max_kv_blocks=max_kv_blocks,
+            max_prefill_tokens=max_prefill_tokens,
             device="cpu",
             enable_prefix_caching=enable_prefix_caching,
             kv_cache_dtype=kv_cache_dtype,

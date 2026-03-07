@@ -305,3 +305,40 @@ register_model(
     config_loader=_LLAVA[1],
     description="LLaVA vision-language model — use --checkpoint for HF dir",
 )
+
+
+# =========================================================================
+# Plugin discovery via entry points
+#
+# Third-party packages can register models by declaring entry points:
+#
+#   [project.entry-points."vllm_i64.models"]
+#   my-model = "my_package.model:register"
+#
+# The entry point must be a callable that receives no arguments
+# and calls register_model() and/or updates _ARCHITECTURE_MAP.
+# =========================================================================
+
+def _discover_plugins():
+    """Load model plugins from installed packages via entry points."""
+    try:
+        from importlib.metadata import entry_points
+    except ImportError:
+        return
+
+    try:
+        eps = entry_points(group="vllm_i64.models")
+    except TypeError:
+        # Python 3.9 compat (shouldn't happen with >=3.10 but defensive)
+        eps = entry_points().get("vllm_i64.models", [])
+
+    for ep in eps:
+        try:
+            register_fn = ep.load()
+            register_fn()
+            _logger.info("Loaded model plugin: %s", ep.name)
+        except Exception:
+            _logger.warning("Failed to load model plugin: %s", ep.name)
+
+
+_discover_plugins()

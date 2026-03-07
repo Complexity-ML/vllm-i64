@@ -6,6 +6,7 @@ Usage:
     vllm-i64 bench [--mode all|routing|engine] [--requests 20] [--concurrency 8]
     vllm-i64 list
     vllm-i64 check <model>
+    vllm-i64 estimate <model> [--dtype float16] [--max-batch-size 32]
 
 Multi-GPU:
     vllm-i64 serve pacific-prime-chat --tp 4
@@ -66,7 +67,7 @@ def cmd_serve(args):
     # Single-GPU: run directly
     import torch
     from vllm_i64.core.logging import setup_logging
-    setup_logging(level="INFO")
+    setup_logging(level="INFO", json_output=getattr(args, 'log_json', False))
     from vllm_i64.core.loader import load_model_by_name
     from vllm_i64.engine.i64_engine import I64Engine
     from vllm_i64.cpu.engine import CPUEngine
@@ -156,13 +157,16 @@ def cmd_serve(args):
     # Create engine + server (async continuous batching)
     # CPU uses the dedicated CPUEngine (no CUDA graphs, thread-executor step)
     # GPU uses the full I64Engine (CUDA graphs, Triton, FP8, etc.)
+    max_batch_size = getattr(args, 'max_batch_size', 32)
     common_kwargs = dict(
         model=model,
         num_experts=getattr(model.config, 'num_experts', 1),
         vocab_size=model.config.vocab_size,
-        enable_prefix_caching=getattr(args, 'enable_prefix_caching', False),
+        max_batch_size=max_batch_size,
+        enable_prefix_caching=not getattr(args, 'no_prefix_caching', False),
         kv_cache_dtype=getattr(args, 'kv_cache_dtype', None),
         max_kv_blocks=getattr(args, 'max_kv_blocks', 0),
+        max_prefill_tokens=getattr(args, 'chunk_size', 512),
     )
     if device == "cpu":
         engine = CPUEngine(**common_kwargs)
@@ -330,6 +334,97 @@ def cmd_agent(args):
         agent.interactive()
 
 
+
+def cmd_estimate(args):
+    """Estimate GPU memory requirements for a model."""
+    import os
+    import torch
+    from pathlib import Path
+
+    # Resolve model config
+    if args.checkpoint:
+        config_path = Path(args.checkpoint) / "config.json"
+    else:
+        from vllm_i64.core.registry import get_model_entry
+        entry = get_model_entry(args.model)
+        config_path = Path(entry.config_path) if entry.config_path else None
+
+    if config_path is None or not config_path.exists():
+        print(f"Error: config.json not found. Use --checkpoint to specify model directory.")
+        sys.exit(1)
+
+    import json
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+
+    hidden = config.get("hidden_size", config.get("d_model", 4096))
+    layers = config.get("num_hidden_layers", config.get("n_layers", 32))
+    heads = config.get("num_attention_heads", config.get("n_heads", 32))
+    kv_heads = config.get("num_key_value_heads", heads)
+    vocab = config.get("vocab_size", 32000)
+    intermediate = config.get("intermediate_size", hidden * 4)
+    num_experts = config.get("num_experts", config.get("num_local_experts", 1))
+    head_dim = hidden // heads
+
+    # Dtype sizes
+    dtype_sizes = {"float16": 2, "bfloat16": 2, "float32": 4, "int8": 1, "int4": 0.5, "fp8": 1}
+    weight_bytes = dtype_sizes.get(args.dtype, 2)
+    kv_bytes = dtype_sizes.get(args.kv_dtype, 2) if args.kv_dtype else weight_bytes
+
+    # Weight memory
+    embed_params = vocab * hidden * 2  # embed + lm_head
+    attn_params_per_layer = hidden * (heads * head_dim + 2 * kv_heads * head_dim + hidden)  # Q,K,V,O
+    mlp_params_per_layer = hidden * intermediate * 3 * max(num_experts, 1)  # gate+up+down
+    norm_params_per_layer = hidden * 2  # layernorm
+    total_params = embed_params + layers * (attn_params_per_layer + mlp_params_per_layer + norm_params_per_layer)
+    weight_mem_gb = total_params * weight_bytes / 1e9
+
+    # KV cache memory
+    max_seqs = args.max_batch_size
+    max_len = args.max_seq_len
+    kv_per_token = 2 * kv_heads * head_dim * kv_bytes  # K + V
+    kv_total = layers * max_seqs * max_len * kv_per_token
+    kv_mem_gb = kv_total / 1e9
+
+    # Activation memory (rough estimate: peak during forward pass)
+    act_mem_gb = max_seqs * max_len * hidden * 2 * 4 / 1e9  # float32 intermediates
+
+    total_gb = weight_mem_gb + kv_mem_gb + act_mem_gb
+    overhead_gb = total_gb * 0.1  # ~10% CUDA overhead
+
+    print(f"{'Model Memory Estimate':=^50}")
+    print(f"  Config:        {config_path}")
+    print(f"  Layers:        {layers}")
+    print(f"  Hidden dim:    {hidden}")
+    print(f"  Heads:         {heads} (KV: {kv_heads})")
+    print(f"  Experts:       {num_experts}")
+    print(f"  Vocab:         {vocab:,}")
+    print(f"  Parameters:    {total_params:,} (~{total_params/1e9:.2f}B)")
+    print(f"  Weight dtype:  {args.dtype}")
+    print()
+    print(f"{'Component':<25} {'Memory':>10}")
+    print(f"{'-'*36}")
+    print(f"  {'Weights':<23} {weight_mem_gb:>8.2f} GB")
+    print(f"  {'KV Cache':<23} {kv_mem_gb:>8.2f} GB")
+    print(f"    (batch={max_seqs}, seq={max_len})")
+    print(f"  {'Activations':<23} {act_mem_gb:>8.2f} GB")
+    print(f"  {'CUDA overhead (~10%)':<23} {overhead_gb:>8.2f} GB")
+    print(f"{'-'*36}")
+    print(f"  {'TOTAL':<23} {total_gb + overhead_gb:>8.2f} GB")
+    print()
+
+    # GPU recommendations
+    gpu_sizes = [(24, "RTX 4090 / A5000"), (40, "A100-40GB"), (48, "A6000 / RTX 6000"),
+                 (80, "A100-80GB / H100")]
+    required = total_gb + overhead_gb
+    print(f"  Fits on:")
+    for size, name in gpu_sizes:
+        marker = "OK" if required <= size else "NO"
+        tp_needed = max(1, int((required + size - 1) // size))
+        extra = f" (TP={tp_needed})" if tp_needed > 1 and marker == "NO" else ""
+        print(f"    [{marker}] {name} ({size} GB){extra}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="vllm-i64",
@@ -351,8 +446,10 @@ def main():
                               "awq/gptq for pre-quantized HF checkpoints)")
     p_serve.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     p_serve.add_argument("--chat-template", default=None, help="Path to chat template")
-    p_serve.add_argument("--enable-prefix-caching", action="store_true",
-                         help="Enable prefix caching for KV cache reuse")
+    p_serve.add_argument("--enable-prefix-caching", action="store_true", default=True,
+                         help="Enable prefix caching for KV cache reuse (default: enabled)")
+    p_serve.add_argument("--no-prefix-caching", action="store_true",
+                         help="Disable prefix caching")
     p_serve.add_argument("--kv-cache-dtype", default=None, choices=["fp8", "fp8_e5m2"],
                          help="KV cache quantization (fp8 for 2x memory savings)")
     p_serve.add_argument("--speculative-model", default=None,
@@ -369,6 +466,12 @@ def main():
     p_serve.add_argument("--max-kv-blocks", type=int, default=0,
                          help="Total KV cache blocks (0 = auto: max(256, max_seqs*8)). "
                               "Reduce to save VRAM, e.g. --max-kv-blocks 128")
+    p_serve.add_argument("--max-batch-size", type=int, default=32,
+                         help="Maximum concurrent batch size for the scheduler (default: 32)")
+    p_serve.add_argument("--chunk-size", type=int, default=512,
+                         help="Chunked prefill: max tokens per prefill chunk (default: 512)")
+    p_serve.add_argument("--log-json", action="store_true",
+                         help="Output logs in JSON format (for production log aggregation)")
     p_serve.add_argument("--enable-swap", action="store_true",
                          help="Enable swap-to-CPU for KV cache overflow")
     p_serve.add_argument("--api-key", default=None,
@@ -422,6 +525,18 @@ def main():
     p_agent.add_argument("--api-key", default=None,
                          help="API key for server authentication")
     p_agent.set_defaults(func=cmd_agent)
+
+    # estimate
+    p_est = sub.add_parser("estimate", help="Estimate GPU memory requirements")
+    p_est.add_argument("model", help="Model name or --checkpoint path")
+    p_est.add_argument("--checkpoint", default=None, help="Checkpoint directory with config.json")
+    p_est.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32", "int8", "int4", "fp8"],
+                       help="Weight dtype (default: float16)")
+    p_est.add_argument("--kv-dtype", default=None, choices=["float16", "bfloat16", "fp8"],
+                       help="KV cache dtype (default: same as --dtype)")
+    p_est.add_argument("--max-batch-size", type=int, default=32, help="Max batch size (default: 32)")
+    p_est.add_argument("--max-seq-len", type=int, default=2048, help="Max sequence length (default: 2048)")
+    p_est.set_defaults(func=cmd_estimate)
 
     args = parser.parse_args()
     if not args.command:

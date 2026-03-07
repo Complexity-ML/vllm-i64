@@ -533,6 +533,7 @@ class I64Server:
             endpoint=endpoint, status=200, latency_ms=latency_ms,
             prompt_tokens=len(prompt_ids), completion_tokens=len(result.output_tokens),
             api_key=api_key,
+            request_id=resp.id,
         )
 
         return resp

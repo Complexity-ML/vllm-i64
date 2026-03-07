@@ -37,6 +37,7 @@ from vllm_i64.core.sampling import (
     SamplingParams, sample_batch, sample_batch_with_logprobs,
     apply_repetition_penalty_batch, TokenLogprob,
 )
+from vllm_i64.engine.sampler import I64Sampler
 from vllm_i64.core.logging import get_logger
 
 logger = get_logger("vllm_i64.engine")
@@ -107,6 +108,7 @@ class I64Engine:
         max_batch_size: int = 32,
         max_seq_len: int = 2048,
         max_kv_blocks: int = 4096,
+        max_prefill_tokens: int = 512,
         device: str = "cuda",
         enable_prefix_caching: bool = False,
         kv_cache_dtype: Optional[str] = None,
@@ -128,6 +130,7 @@ class I64Engine:
             max_seq_len=max_seq_len,
             num_experts=num_experts,
             max_kv_blocks=max_kv_blocks,
+            max_prefill_tokens=max_prefill_tokens,
         )
 
         # Expert mask for routing (i64)
@@ -153,6 +156,7 @@ class I64Engine:
 
         # Sampling parameters (configurable, default greedy)
         self.sampling_params = SamplingParams(temperature=0.0)
+        self.sampler = I64Sampler(default_params=self.sampling_params)
         # Per-request sampling params for multi-user isolation
         self._request_sampling_params: Dict[int, SamplingParams] = {}
 
@@ -548,8 +552,7 @@ class I64Engine:
         """
         Sample next tokens from logits using configured sampling params.
         """
-        token_ids = sample_batch(logits, self.sampling_params, past_tokens_list=past_tokens_list)
-        return token_ids.cpu().numpy().astype(np.int64)
+        return self.sampler.sample(logits, self.sampling_params, past_tokens_list=past_tokens_list)
 
     def _check_timeouts_and_cancellations(self):
         """Remove timed-out and cancelled requests from scheduler. Single-pass O(n)."""

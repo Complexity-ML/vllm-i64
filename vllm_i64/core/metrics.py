@@ -61,6 +61,23 @@ class I64Metrics:
             buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1],
         )
 
+        # Latency histograms (inference-focused)
+        self.ttft = Histogram(
+            "vllm_i64_time_to_first_token_seconds",
+            "Time to first token (prefill latency)",
+            buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0],
+        )
+        self.itl = Histogram(
+            "vllm_i64_inter_token_latency_seconds",
+            "Inter-token latency (decode step)",
+            buckets=[0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1],
+        )
+        self.queue_time = Histogram(
+            "vllm_i64_queue_time_seconds",
+            "Time spent waiting in queue before processing",
+            buckets=[0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0],
+        )
+
         # Gauges
         self.batch_size = Gauge(
             "vllm_i64_batch_size", "Current batch size"
@@ -104,3 +121,18 @@ class I64Metrics:
     def update_pending(self, count: int):
         if self.enabled:
             self.pending_requests.set(count)
+
+    def observe_ttft(self, seconds: float):
+        """Record time to first token."""
+        if self.enabled:
+            self.ttft.observe(seconds)
+
+    def observe_itl(self, seconds: float):
+        """Record inter-token latency."""
+        if self.enabled:
+            self.itl.observe(seconds)
+
+    def observe_queue_time(self, seconds: float):
+        """Record queue wait time."""
+        if self.enabled:
+            self.queue_time.observe(seconds)
