@@ -281,6 +281,13 @@ class I64Server:
                 logger.info("Web search module loaded but no API key set (BRAVE_SEARCH_API_KEY)")
         except ImportError:
             logger.debug("Web search module not available (missing aiohttp?)")
+        # Search history — partitioned by API key (token-routed isolation)
+        self._search_history = None
+        try:
+            from vllm_i64.search import PartitionedSearchHistory
+            self._search_history = PartitionedSearchHistory()
+        except ImportError:
+            pass
 
         # RAG — native retrieval-augmented generation
         self.retriever = None
@@ -1610,6 +1617,10 @@ class I64Server:
         search_count = body.get("search_count", 5)
         stream = body.get("stream", False)
 
+        # Extract API key for history partitioning
+        auth = request.headers.get("Authorization", "")
+        req_api_key = auth[7:] if auth.startswith("Bearer ") else None
+
         # Step 1: Web search
         try:
             results = await self.web_searcher.search(query, count=search_count)
@@ -1687,6 +1698,13 @@ class I64Server:
                             text = text[:idx].rstrip()
                             break
 
+                # Record in partitioned history (isolated by api_key + user_id)
+                if self._search_history and req_api_key:
+                    self._search_history.record(
+                        req_api_key, query, sources, text,
+                        user_id=body.get("user"),
+                    )
+
                 return web.json_response({
                     "id": result_dict["id"],
                     "object": "search.completion",
@@ -1707,6 +1725,45 @@ class I64Server:
                 {"error": {"message": "Search completion failed", "type": "server_error"}},
                 status=500,
             )
+
+    async def handle_search_history(self, request: web.Request) -> web.Response:
+        """GET /v1/search/history — get search history for the authenticated user."""
+        if self._search_history is None:
+            return web.json_response({"history": [], "message": "Search history not enabled"})
+        auth = request.headers.get("Authorization", "")
+        api_key = auth[7:] if auth.startswith("Bearer ") else None
+        if not api_key:
+            return web.json_response(
+                {"error": {"message": "API key required for search history", "type": "auth_error"}},
+                status=401,
+            )
+        limit = int(request.query.get("limit", "20"))
+        user_id = request.query.get("user")  # ?user=alice for team key isolation
+        history = self._search_history.get_history(api_key, limit=limit, user_id=user_id)
+        return web.json_response({"history": history, "count": len(history)})
+
+    async def handle_search_history_clear(self, request: web.Request) -> web.Response:
+        """DELETE /v1/search/history — clear search history for the authenticated user."""
+        if self._search_history is None:
+            return web.json_response({"removed": 0})
+        auth = request.headers.get("Authorization", "")
+        api_key = auth[7:] if auth.startswith("Bearer ") else None
+        if not api_key:
+            return web.json_response(
+                {"error": {"message": "API key required", "type": "auth_error"}},
+                status=401,
+            )
+        user_id = request.query.get("user")
+        removed = self._search_history.clear_history(api_key, user_id=user_id)
+        return web.json_response({"status": "ok", "removed": removed})
+
+    async def handle_search_stats(self, request: web.Request) -> web.Response:
+        """GET /v1/search/stats — search history statistics (admin)."""
+        if self._search_history is None:
+            return web.json_response({"enabled": False})
+        stats = self._search_history.stats()
+        stats["enabled"] = True
+        return web.json_response(stats)
 
     # =========================================================================
     # RAG endpoints
@@ -1976,9 +2033,13 @@ class I64Server:
         app.router.add_get("/v1/monitor", self.handle_monitor)
         app.router.add_get("/v1/experts", self.handle_expert_stats)
         app.router.add_route("OPTIONS", "/v1/cache/purge", self._handle_options)
-        # Search endpoint (Perplexity-style)
+        # Search endpoints (Perplexity-style, partitioned history)
         app.router.add_post("/v1/search/completions", self.handle_search_completions)
+        app.router.add_get("/v1/search/history", self.handle_search_history)
+        app.router.add_delete("/v1/search/history", self.handle_search_history_clear)
+        app.router.add_get("/v1/search/stats", self.handle_search_stats)
         app.router.add_route("OPTIONS", "/v1/search/completions", self._handle_options)
+        app.router.add_route("OPTIONS", "/v1/search/history", self._handle_options)
         # RAG endpoints
         app.router.add_post("/v1/rag/index", self.handle_rag_index)
         app.router.add_post("/v1/rag/search", self.handle_rag_search)
@@ -2019,6 +2080,8 @@ class I64Server:
         logger.info("  POST /v1/completions | POST /v1/chat/completions | GET /health")
         logger.info("  POST /v1/batch | GET /v1/models/{id} | GET /v1/metrics | GET /v1/logs")
         logger.info("  POST /v1/cancel/{id} | WS /v1/ws/completions | GET /docs")
+        if self.web_searcher and self.web_searcher.available:
+            logger.info("  POST /v1/search/completions | GET /v1/search/history | GET /v1/search/stats")
         if self.rag_enabled:
             logger.info("  POST /v1/rag/index | POST /v1/rag/search | GET /v1/rag/stats")
         logger.info("  mode: async continuous batching")
