@@ -3,6 +3,7 @@ vllm-i64 :: Parallelism
 
 Shard expert weights and attention heads across GPUs (TP).
 Distribute layers across pipeline stages (PP).
+Disaggregated prefill/decode across GPU groups (DP).
 Token routing stays on all ranks (integer, cheap).
 """
 
@@ -33,4 +34,14 @@ from vllm_i64.parallel.pp_utils import (
     PPMissingLayer,
     IntermediateTensors,
     make_layers,
+)
+
+from vllm_i64.parallel.disaggregated import (
+    DisaggRole,
+    KVTransfer,
+    PrefillWorker,
+    DecodeWorker,
+    DisaggregatedCoordinator,
+    setup_disaggregated,
+    launch_disaggregated,
 )
