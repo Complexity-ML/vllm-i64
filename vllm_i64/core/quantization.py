@@ -37,7 +37,7 @@ if _INT_MM_AVAILABLE:
         _b = torch.ones(8, 1, dtype=torch.int8)
         torch._int_mm(_a, _b)
         _INT_MM_CPU_OK = True
-    except (RuntimeError, Exception):
+    except (RuntimeError, AttributeError):
         pass
 
 # Probe GPU _int_mm once (lazy, on first use)
@@ -300,7 +300,7 @@ def int8_linear_available(device: str = "cpu") -> bool:
         b = torch.ones(8, 1, dtype=torch.int8, device='cuda')
         torch._int_mm(a, b)
         return True
-    except (RuntimeError, Exception):
+    except (RuntimeError, AttributeError):
         return False
 
 
