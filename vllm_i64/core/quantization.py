@@ -43,6 +43,15 @@ if _INT_MM_AVAILABLE:
 # Probe GPU _int_mm once (lazy, on first use)
 _INT_MM_GPU_OK: Optional[bool] = None
 
+# Log INT8 backend selection once
+_INT8_BACKEND_LOGGED = False
+
+def _log_int8_backend(name: str):
+    global _INT8_BACKEND_LOGGED
+    if not _INT8_BACKEND_LOGGED:
+        _logger.info("INT8 matmul backend: %s", name)
+        _INT8_BACKEND_LOGGED = True
+
 def _probe_int_mm_gpu() -> bool:
     """Test if torch._int_mm works on the current CUDA device."""
     global _INT_MM_GPU_OK
@@ -144,6 +153,7 @@ def int8_linear_native(
 
     if use_int_mm:
         # Native INT8 matmul path — CPU (VNNI/AMX) or GPU (tensor cores)
+        _log_int8_backend("torch._int_mm (native)")
         if x_preq is not None:
             x_int8, x_scale = x_preq[0], x_preq[1]
         else:
@@ -177,6 +187,7 @@ def int8_linear_native(
             wt = weight_int8.t().contiguous()
             out = triton_int8_gemm(x_int8, x_scale, wt, weight_scale, bias)
             if out is not None:
+                _log_int8_backend("Triton INT8x8→INT32 (native)")
                 return out.reshape(*orig_shape[:-1], out_features)
         except (ImportError, Exception):
             pass
@@ -188,6 +199,7 @@ def int8_linear_native(
                 out = cuda_ops.gemm_dequant_int8(x_2d.float(), weight_int8, weight_scale)
                 if bias is not None:
                     out = out + bias
+                _log_int8_backend("CUDA gemm_dequant_int8")
                 return out.reshape(*orig_shape[:-1], out_features)
         except (ImportError, Exception):
             pass
@@ -196,11 +208,13 @@ def int8_linear_native(
             from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
             out = triton_dequant_gemm_int8(x_2d, weight_int8, weight_scale, bias)
             if out is not None:
+                _log_int8_backend("Triton fused dequant+GEMM")
                 return out.reshape(*orig_shape[:-1], out_features)
         except ImportError:
             pass
 
     # Final fallback: dequant weight → float32 matmul
+    _log_int8_backend("dequant + F.linear (float32 fallback)")
     w_float = dequantize_int8(weight_int8, weight_scale)
     out = F.linear(x_2d.float(), w_float, bias)
     return out.reshape(*orig_shape[:-1], out_features)
