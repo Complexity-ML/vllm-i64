@@ -10,10 +10,17 @@ Uses AsyncI64Engine for continuous batching:
   - Maximum GPU utilization and tok/s
 
 Endpoints:
-    POST /v1/completions     → completion (sync + streaming)
-    POST /v1/chat/completions → chat completion (sync + streaming)
-    GET  /health             → health check + engine stats
-    GET  /v1/models          → list models
+    POST /v1/completions      → completion (sync + streaming)
+    POST /v1/chat/completions  → chat completion (sync + streaming)
+    GET  /health              → health check + engine stats
+    GET  /v1/models           → list models
+    GET  /v1/monitor          → live monitoring snapshot
+    GET  /v1/cache/stats      → KV cache statistics
+    POST /v1/cache/purge      → purge prefix cache (admin)
+    GET  /v1/experts          → expert routing distribution
+    POST /v1/lora/load        → load LoRA adapter (admin)
+    POST /v1/lora/unload      → unload LoRA adapter (admin)
+    GET  /v1/lora/list        → list loaded adapters
 
 INL - 2025
 """
@@ -1618,6 +1625,132 @@ class I64Server:
             "index_path": getattr(self, '_rag_index_path', None),
         })
 
+    # =================================================================
+    # Admin endpoints — cache, monitoring, expert routing
+    # =================================================================
+
+    async def handle_cache_stats(self, request: web.Request) -> web.Response:
+        """GET /v1/cache/stats — KV cache and prefix cache statistics."""
+        if self.sync_engine.kv_cache is None:
+            return web.json_response({"error": "No KV cache initialized"}, status=404)
+        stats = self.sync_engine.kv_cache.get_stats()
+        stats["usage_pct"] = round(stats["used_blocks"] / max(stats["num_blocks"], 1) * 100, 1)
+        return web.json_response(stats)
+
+    async def handle_cache_purge(self, request: web.Request) -> web.Response:
+        """POST /v1/cache/purge — purge the prefix cache (not running KV blocks)."""
+        denied = self._require_admin(request)
+        if denied:
+            return denied
+        kv = self.sync_engine.kv_cache
+        if kv is None:
+            return web.json_response({"error": "No KV cache initialized"}, status=404)
+        if not kv.prefix_cache_enabled:
+            return web.json_response({"error": "Prefix caching not enabled"}, status=400)
+        # Clear prefix hash maps (doesn't affect running sequences)
+        before = len(getattr(kv, "_block_to_prefix", {}))
+        kv._prefix_hash_to_blocks.clear()
+        kv._block_to_prefix.clear()
+        return web.json_response({"status": "ok", "purged_blocks": before})
+
+    async def handle_monitor(self, request: web.Request) -> web.Response:
+        """GET /v1/monitor — live monitoring snapshot (batch, queues, KV, perf)."""
+        engine = self.sync_engine
+        async_engine = self.async_engine
+
+        snapshot = {
+            "timestamp": time.time(),
+            "uptime_s": int(time.monotonic() - self._start_time),
+            "requests_served": self.request_counter,
+            "active_requests": async_engine.active_requests,
+            "peak_batch_size": async_engine.peak_batch_size,
+            "scheduler": engine.scheduler.get_stats(),
+            "engine": {
+                "total_steps": engine.total_steps,
+                "total_tokens_generated": engine.total_tokens_generated,
+            },
+        }
+
+        # KV cache
+        if engine.kv_cache is not None:
+            kv = engine.kv_cache.get_stats()
+            kv["usage_pct"] = round(kv["used_blocks"] / max(kv["num_blocks"], 1) * 100, 1)
+            snapshot["kv_cache"] = kv
+
+        # Performance breakdown
+        if engine.total_steps > 0 and engine._perf_total_ms > 0:
+            snapshot["perf"] = {
+                "avg_step_ms": round(engine._perf_total_ms / engine.total_steps, 2),
+                "tok_per_s": round(engine.total_tokens_generated / (engine._perf_total_ms / 1000), 1),
+                "forward_pct": round(engine._perf_forward_ms / engine._perf_total_ms * 100, 1),
+            }
+
+        # GPU memory
+        try:
+            import torch
+            if torch.cuda.is_available():
+                mem = torch.cuda.mem_get_info()
+                snapshot["gpu"] = {
+                    "free_mb": round(mem[0] / 1e6),
+                    "total_mb": round(mem[1] / 1e6),
+                    "utilization_pct": round((1 - mem[0] / mem[1]) * 100, 1),
+                }
+        except Exception:
+            pass
+
+        # LoRA
+        if engine._lora_manager is not None:
+            adapters = engine.list_lora_adapters()
+            snapshot["lora"] = {"loaded_adapters": len(adapters), "adapters": list(adapters.values())}
+
+        return web.json_response(snapshot)
+
+    async def handle_expert_stats(self, request: web.Request) -> web.Response:
+        """
+        GET /v1/experts — expert routing distribution.
+
+        Since routing is deterministic (token_id % num_experts), we compute
+        the distribution from recently generated tokens.
+        """
+        engine = self.sync_engine
+        num_experts = getattr(engine, "num_experts", 0)
+        if num_experts <= 1:
+            return web.json_response({"error": "Not a MoE model (num_experts <= 1)"}, status=400)
+
+        # Collect token IDs from running requests
+        expert_counts = [0] * num_experts
+        total_tokens = 0
+
+        for req in engine.scheduler.running:
+            for tid in req.output_token_ids:
+                expert_counts[int(tid) % num_experts] += 1
+                total_tokens += 1
+
+        # Also check finished requests still in scheduler
+        for req in engine.scheduler.finished:
+            for tid in req.output_token_ids:
+                expert_counts[int(tid) % num_experts] += 1
+                total_tokens += 1
+
+        if total_tokens == 0:
+            return web.json_response({
+                "num_experts": num_experts,
+                "total_tokens": 0,
+                "distribution": [0.0] * num_experts,
+                "counts": expert_counts,
+            })
+
+        distribution = [round(c / total_tokens, 4) for c in expert_counts]
+        imbalance = max(distribution) - min(distribution) if distribution else 0.0
+
+        return web.json_response({
+            "num_experts": num_experts,
+            "total_tokens": total_tokens,
+            "distribution": distribution,
+            "counts": expert_counts,
+            "imbalance": round(imbalance, 4),
+        })
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
         middlewares = [make_cors_middleware()]
@@ -1652,6 +1785,12 @@ class I64Server:
         app.router.add_post("/v1/cancel/{request_id}", self.handle_cancel)
         app.router.add_get("/v1/ws/completions", self.handle_ws_completions)
         app.router.add_get("/docs", self.handle_openapi)
+        # Admin endpoints
+        app.router.add_get("/v1/cache/stats", self.handle_cache_stats)
+        app.router.add_post("/v1/cache/purge", self.handle_cache_purge)
+        app.router.add_get("/v1/monitor", self.handle_monitor)
+        app.router.add_get("/v1/experts", self.handle_expert_stats)
+        app.router.add_route("OPTIONS", "/v1/cache/purge", self._handle_options)
         # RAG endpoints
         app.router.add_post("/v1/rag/index", self.handle_rag_index)
         app.router.add_post("/v1/rag/search", self.handle_rag_search)
