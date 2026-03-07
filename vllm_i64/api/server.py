@@ -263,6 +263,8 @@ class I64Server:
         self._start_time = time.monotonic()
         self._latency_tracker = LatencyTracker()
         self._request_logger = RequestLogger()
+        # Cache last non-empty expert distribution
+        self._last_expert_response: dict | None = None
         self._priority_manager = PriorityManager()
         self._shutting_down = False
         # Thread pool for tokenization (avoids blocking the event loop)
@@ -1709,15 +1711,15 @@ class I64Server:
         """
         GET /v1/experts — expert routing distribution.
 
-        Since routing is deterministic (token_id % num_experts), we compute
-        the distribution from recently generated tokens.
+        Returns the avg distribution for the current request. When no request
+        is active, returns the last known distribution ("photo finish").
         """
         engine = self.sync_engine
         num_experts = getattr(engine, "num_experts", 0)
         if num_experts <= 1:
             return web.json_response({"error": "Not a MoE model (num_experts <= 1)"}, status=400)
 
-        # Collect token IDs from running requests
+        # Collect from running + just-finished requests
         expert_counts = [0] * num_experts
         total_tokens = 0
 
@@ -1726,29 +1728,34 @@ class I64Server:
                 expert_counts[int(tid) % num_experts] += 1
                 total_tokens += 1
 
-        # Also check finished requests still in scheduler
         for req in engine.scheduler.finished:
             for tid in req.output_token_ids:
                 expert_counts[int(tid) % num_experts] += 1
                 total_tokens += 1
 
-        if total_tokens == 0:
-            return web.json_response({
+        if total_tokens > 0:
+            distribution = [round(c / total_tokens, 4) for c in expert_counts]
+            imbalance = max(distribution) - min(distribution)
+            response = {
                 "num_experts": num_experts,
-                "total_tokens": 0,
-                "distribution": [0.0] * num_experts,
+                "total_tokens": total_tokens,
+                "distribution": distribution,
                 "counts": expert_counts,
-            })
+                "imbalance": round(imbalance, 4),
+            }
+            # Cache as photo finish
+            self._last_expert_response = response
+            return web.json_response(response)
 
-        distribution = [round(c / total_tokens, 4) for c in expert_counts]
-        imbalance = max(distribution) - min(distribution) if distribution else 0.0
+        # No active request — return cached photo finish
+        if self._last_expert_response is not None:
+            return web.json_response(self._last_expert_response)
 
         return web.json_response({
             "num_experts": num_experts,
-            "total_tokens": total_tokens,
-            "distribution": distribution,
+            "total_tokens": 0,
+            "distribution": [0.0] * num_experts,
             "counts": expert_counts,
-            "imbalance": round(imbalance, 4),
         })
 
     def create_app(self) -> web.Application:
