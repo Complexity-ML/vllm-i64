@@ -156,6 +156,7 @@ class AsyncCPUEngine(AsyncI64Engine):
         instance.device = "cpu"
         instance._pending_futures = {}
         instance._request_times = {}
+        instance._request_first_token_sent = set()
         instance._engine_task = None
         instance._running = False
         instance._draining = False
@@ -187,11 +188,17 @@ class AsyncCPUEngine(AsyncI64Engine):
                 try:
                     # Always run in thread executor on CPU — forward pass can
                     # take several seconds and must not block the event loop.
+                    _step_start = time.perf_counter()
                     loop = asyncio.get_running_loop()
                     step_results = await loop.run_in_executor(
                         None, self.engine.step
                     )
+                    _step_elapsed = time.perf_counter() - _step_start
                     _consecutive_errors = 0
+
+                    # ITL: observe per-step decode latency
+                    if self.engine.metrics and step_results:
+                        self.engine.metrics.observe_itl(_step_elapsed)
 
                 except Exception as e:
                     _consecutive_errors += 1
@@ -227,6 +234,13 @@ class AsyncCPUEngine(AsyncI64Engine):
 
                 # Deliver tokens to streaming futures
                 for req_id, token_id in step_results.items():
+                    # TTFT: record time to first token
+                    if req_id not in self._request_first_token_sent:
+                        self._request_first_token_sent.add(req_id)
+                        if self.engine.metrics and req_id in self._request_times:
+                            ttft = time.perf_counter() - self._request_times[req_id]
+                            self.engine.metrics.observe_ttft(ttft)
+
                     if req_id in self._pending_futures:
                         target = self._pending_futures[req_id]
                         if isinstance(target, asyncio.Queue):
@@ -287,6 +301,7 @@ class AsyncCPUEngine(AsyncI64Engine):
 
                 # Clean up all engine state for finished requests
                 for rid in finished_ids:
+                    self._request_first_token_sent.discard(rid)
                     self.engine._free_slot(rid)
                     self.engine._request_deadlines.pop(rid, None)
                     self.engine._request_sampling_params.pop(rid, None)
