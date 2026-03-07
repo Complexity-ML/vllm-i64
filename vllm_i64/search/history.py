@@ -2,34 +2,36 @@
 vllm-i64 :: Search History — Partitioned by API key
 
 Token-routed isolation for search history:
-each API key is deterministically routed to its own partition.
+each user identity is deterministically routed to its own partition.
 No cross-partition access is possible by design.
 
-    partition = hash(api_key) % num_partitions
+    partition = sha256(api_key ∥ user_id) mod N
 
 Even if a key leaks, it can only see its own history.
-History is stored in-memory with TTL eviction — never persisted to disk.
+Persistence: optional JSON-per-partition on disk.
+User controls deletion via DELETE /v1/search/history.
 
 INL - 2025
 """
 
+import json
 import time
 import hashlib
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Dict, List, Optional
 
 logger = logging.getLogger("vllm_i64.search.history")
 
-# Number of isolated partitions (power of 2 for fast modulo)
 NUM_PARTITIONS = 64
 
 
 @dataclass
 class SearchEntry:
     query: str
-    sources: List[dict]    # [{"index": 1, "title": ..., "url": ...}, ...]
+    sources: List[dict]
     answer: str
     timestamp: float = field(default_factory=time.time)
 
@@ -40,72 +42,75 @@ class SearchPartition:
     __slots__ = ("entries", "lock")
 
     def __init__(self) -> None:
-        self.entries: Dict[str, List[SearchEntry]] = {}  # api_key → entries
+        self.entries: Dict[str, List[SearchEntry]] = {}
         self.lock = threading.Lock()
 
-    def add(self, api_key: str, entry: SearchEntry, max_per_key: int = 50) -> None:
+    def add(self, identity: str, entry: SearchEntry, max_per_key: int = 200) -> None:
         with self.lock:
-            if api_key not in self.entries:
-                self.entries[api_key] = []
-            history = self.entries[api_key]
+            if identity not in self.entries:
+                self.entries[identity] = []
+            history = self.entries[identity]
             history.append(entry)
-            # Cap history per key
             if len(history) > max_per_key:
-                self.entries[api_key] = history[-max_per_key:]
+                self.entries[identity] = history[-max_per_key:]
 
-    def get(self, api_key: str, limit: int = 20) -> List[SearchEntry]:
+    def get(self, identity: str, limit: int = 50) -> List[SearchEntry]:
         with self.lock:
-            return list(self.entries.get(api_key, []))[-limit:]
+            return list(self.entries.get(identity, []))[-limit:]
 
-    def clear(self, api_key: str) -> int:
+    def clear(self, identity: str) -> int:
         with self.lock:
-            removed = len(self.entries.pop(api_key, []))
-            return removed
+            return len(self.entries.pop(identity, []))
 
-    def evict_expired(self, ttl_seconds: float) -> int:
-        """Remove entries older than TTL. Returns count of evicted entries."""
-        cutoff = time.time() - ttl_seconds
-        evicted = 0
+    def to_dict(self) -> Dict[str, list]:
+        """Serialize for persistence."""
         with self.lock:
-            dead_keys = []
-            for key, entries in self.entries.items():
-                before = len(entries)
-                entries[:] = [e for e in entries if e.timestamp > cutoff]
-                evicted += before - len(entries)
-                if not entries:
-                    dead_keys.append(key)
-            for key in dead_keys:
-                del self.entries[key]
-        return evicted
+            return {
+                k: [asdict(e) for e in v]
+                for k, v in self.entries.items()
+            }
+
+    def load_dict(self, data: Dict[str, list]) -> None:
+        """Restore from serialized data."""
+        with self.lock:
+            for identity, entries in data.items():
+                self.entries[identity] = [
+                    SearchEntry(**e) for e in entries
+                ]
 
 
 class PartitionedSearchHistory:
     """
     Token-routed search history with strict partition isolation.
 
-    Each API key is routed to exactly one partition via:
-        partition_id = hash(api_key) % NUM_PARTITIONS
+    Each user identity is routed to exactly one partition via:
+        partition_id = sha256(api_key ∥ user_id) mod N
 
     Properties:
-        - Deterministic: same key always routes to same partition
+        - Deterministic: same identity always routes to same partition
         - Isolated: no cross-partition data access
-        - In-memory only: never persisted (no disk leakage)
-        - TTL eviction: old entries auto-expire
+        - Persistent: optional save/load to disk (partitioned JSON files)
+        - User-controlled: deletion via API, no forced TTL
     """
 
     def __init__(
         self,
         num_partitions: int = NUM_PARTITIONS,
-        ttl_seconds: float = 3600,      # 1 hour default
-        max_per_key: int = 50,
+        max_per_key: int = 200,
+        persist_dir: Optional[str] = None,
     ):
         self.num_partitions = num_partitions
-        self.ttl_seconds = ttl_seconds
         self.max_per_key = max_per_key
+        self._persist_dir = Path(persist_dir) if persist_dir else None
         self._partitions = [SearchPartition() for _ in range(num_partitions)]
+
+        if self._persist_dir:
+            self._load_from_disk()
+
         logger.info(
-            "Search history: %d partitions, TTL=%ds, max=%d/key",
-            num_partitions, int(ttl_seconds), max_per_key,
+            "Search history: %d partitions, max=%d/key, persist=%s",
+            num_partitions, max_per_key,
+            str(self._persist_dir) if self._persist_dir else "off",
         )
 
     def _identity(self, api_key: str, user_id: Optional[str] = None) -> str:
@@ -138,14 +143,17 @@ class PartitionedSearchHistory:
     ) -> None:
         """Record a search interaction in the user's routed partition."""
         if not api_key:
-            return  # anonymous requests are not tracked
+            return
         identity = self._identity(api_key, user_id)
         entry = SearchEntry(query=query, sources=sources, answer=answer)
         self._partition(identity).add(identity, entry, self.max_per_key)
         logger.debug("Recorded search for %s in partition %d", identity[:16], self._route(identity))
 
+        if self._persist_dir:
+            self._save_partition(self._route(identity))
+
     def get_history(
-        self, api_key: str, limit: int = 20, user_id: Optional[str] = None,
+        self, api_key: str, limit: int = 50, user_id: Optional[str] = None,
     ) -> List[dict]:
         """
         Get search history for a user (only from their own partition).
@@ -170,16 +178,53 @@ class PartitionedSearchHistory:
         if not api_key:
             return 0
         identity = self._identity(api_key, user_id)
-        return self._partition(identity).clear(identity)
+        partition_idx = self._route(identity)
+        removed = self._partition(identity).clear(identity)
 
-    def evict_all(self) -> int:
-        """Run TTL eviction across all partitions."""
-        total = 0
-        for p in self._partitions:
-            total += p.evict_expired(self.ttl_seconds)
-        if total:
-            logger.info("Evicted %d expired search entries", total)
-        return total
+        if self._persist_dir and removed:
+            self._save_partition(partition_idx)
+
+        return removed
+
+    # ── Persistence ───────────────────────────────────────────────────────
+
+    def _partition_path(self, idx: int) -> Path:
+        return self._persist_dir / f"partition_{idx:03d}.json"
+
+    def _save_partition(self, idx: int) -> None:
+        """Save a single partition to disk."""
+        try:
+            self._persist_dir.mkdir(parents=True, exist_ok=True)
+            data = self._partitions[idx].to_dict()
+            if not data:
+                # Remove empty partition file
+                path = self._partition_path(idx)
+                if path.exists():
+                    path.unlink()
+                return
+            with open(self._partition_path(idx), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning("Failed to save partition %d: %s", idx, e)
+
+    def _load_from_disk(self) -> None:
+        """Load all partition files from disk."""
+        if not self._persist_dir or not self._persist_dir.exists():
+            return
+        loaded = 0
+        for idx in range(self.num_partitions):
+            path = self._partition_path(idx)
+            if not path.exists():
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                self._partitions[idx].load_dict(data)
+                loaded += 1
+            except Exception as e:
+                logger.warning("Failed to load partition %d: %s", idx, e)
+        if loaded:
+            logger.info("Loaded %d search history partitions from %s", loaded, self._persist_dir)
 
     def stats(self) -> dict:
         """Aggregate stats across all partitions."""
@@ -193,6 +238,6 @@ class PartitionedSearchHistory:
             "num_partitions": self.num_partitions,
             "total_keys": total_keys,
             "total_entries": total_entries,
-            "ttl_seconds": self.ttl_seconds,
             "max_per_key": self.max_per_key,
+            "persist_dir": str(self._persist_dir) if self._persist_dir else None,
         }
