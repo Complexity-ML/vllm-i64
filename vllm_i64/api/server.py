@@ -745,11 +745,12 @@ class I64Server:
                 response.content_type = "text/event-stream"
                 response.headers["Cache-Control"] = "no-cache"
                 await response.prepare(request)
+                gen = self._async_stream(req)
                 try:
-                    async for chunk in self._async_stream(req):
+                    async for chunk in gen:
                         await response.write(chunk.encode())
                 except (ConnectionResetError, ConnectionError):
-                    pass  # client disconnected
+                    await gen.aclose()  # stop generation on client disconnect
                 return response
 
             # Check dedup cache
@@ -864,12 +865,13 @@ class I64Server:
                 response.content_type = "text/event-stream"
                 response.headers["Cache-Control"] = "no-cache"
                 await response.prepare(request)
+                gen = self._async_chat_stream(req, body.get("tools"))
                 try:
-                    async for chunk in self._async_chat_stream(req, body.get("tools")):
+                    async for chunk in gen:
                         await response.write(chunk.encode())
                         await response.drain()
                 except (ConnectionResetError, ConnectionError):
-                    pass  # client disconnected
+                    await gen.aclose()  # stop generation on client disconnect
                 return response
 
             result = await self._async_complete(req, api_key=req_api_key, endpoint="/v1/chat/completions")
