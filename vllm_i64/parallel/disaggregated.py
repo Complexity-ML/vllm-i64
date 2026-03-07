@@ -31,7 +31,7 @@ import threading
 import numpy as np
 import torch
 import torch.distributed as dist
-from typing import List, Dict, Optional, Tuple, Set
+from typing import Callable, List, Dict, Optional
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -581,9 +581,11 @@ class DecodeWorker:
         self._request_meta[request_id] = meta
 
         # The KV cache already has blocks allocated by recv_kv.
-        # Map request to the seq_id used by recv_kv.
-        seq_id = request_id % self.kv_cache.max_seqs
-        self._request_to_slot[request_id] = seq_id
+        # Allocate a proper KV slot (avoid modulo collisions)
+        seq_id = self._allocate_slot(request_id)
+        if seq_id < 0:
+            logger.error("Cannot accept transferred request %d: no free KV slots", request_id)
+            return None
 
         # Add to scheduler as running (prefill already done)
         from vllm_i64.engine.i64_scheduler import I64Request, RequestStatus
@@ -775,7 +777,7 @@ class DisaggregatedCoordinator:
         self._shutdown = False
 
         # Result callbacks
-        self._result_callbacks: Dict[int, callable] = {}
+        self._result_callbacks: Dict[int, Callable] = {}
 
         if self.disaggregated:
             self._start_prefill_thread()
@@ -839,7 +841,7 @@ class DisaggregatedCoordinator:
         max_new_tokens: int = 256,
         eos_token_id: int = 0,
         sampling_temperature: float = 0.0,
-        callback: Optional[callable] = None,
+        callback: Optional[Callable] = None,
     ) -> int:
         """
         Add a new inference request.
