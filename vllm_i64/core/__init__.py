@@ -14,3 +14,11 @@ from vllm_i64.core.tokenizer import I64Tokenizer, load_tokenizer
 from vllm_i64.core.sampling import SamplingParams, sample_token, sample_batch
 from vllm_i64.core.kv_cache import PagedKVCache
 from vllm_i64.core.loader import load_checkpoint, load_model_by_name
+
+__all__ = [
+    "register_model", "get_model_entry", "get_checkpoint_path", "list_models",
+    "I64Tokenizer", "load_tokenizer",
+    "SamplingParams", "sample_token", "sample_batch",
+    "PagedKVCache",
+    "load_checkpoint", "load_model_by_name",
+]

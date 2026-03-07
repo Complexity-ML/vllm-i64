@@ -184,8 +184,14 @@ class MixtralForCausalLM(nn.Module):
         kv_cache,
         seq_ids_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        """CUDA-graph compatible decode path."""
-        hidden = self.embed_tokens(token_ids.long())
+        """CUDA-graph compatible decode path with PP support."""
+        from vllm_i64.parallel.pipeline_parallel import is_first_pp_rank, is_last_pp_rank
+        from vllm_i64.parallel.pp_utils import IntermediateTensors
+
+        if is_first_pp_rank():
+            hidden = self.embed_tokens(token_ids.long())
+        else:
+            raise RuntimeError("decode_step with pipeline parallelism not yet supported for Mixtral")
 
         for layer_idx in range(self.start_layer, self.end_layer):
             hidden = self.layers[layer_idx].decode_step(
@@ -194,6 +200,9 @@ class MixtralForCausalLM(nn.Module):
                 layer_idx=layer_idx,
                 seq_ids_tensor=seq_ids_tensor,
             )
+
+        if not is_last_pp_rank():
+            return IntermediateTensors({"hidden_states": hidden})
 
         hidden = self.norm(hidden)
 

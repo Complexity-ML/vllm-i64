@@ -38,7 +38,8 @@ class VectorIndex:
         Add chunks and their embeddings to the index.
         vectors : (N, dim) float32
         """
-        assert len(chunks) == len(vectors), "chunks and vectors must have same length"
+        if len(chunks) != len(vectors):
+            raise ValueError("chunks and vectors must have same length")
         self.index.add(vectors.astype(np.float32))
         self.chunks.extend(chunks)
 

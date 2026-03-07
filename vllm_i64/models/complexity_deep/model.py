@@ -230,9 +230,12 @@ class MuGuidedAttention(nn.Module):
         self.head_dim = config.head_dim
         self.tp_size = tp.tp_size
 
-        # TP-sharded head counts
+        # TP-sharded head counts (GQA: replicate KV heads when fewer than TP ranks)
         self.num_heads_per_tp = self.num_heads // tp.tp_size
-        self.num_kv_heads_per_tp = self.num_kv_heads // tp.tp_size
+        if self.num_kv_heads >= tp.tp_size:
+            self.num_kv_heads_per_tp = self.num_kv_heads // tp.tp_size
+        else:
+            self.num_kv_heads_per_tp = self.num_kv_heads
         self.num_kv_groups = self.num_heads_per_tp // self.num_kv_heads_per_tp
 
         # Q/K/V — ColumnParallel (output dim = heads * head_dim, sharded)

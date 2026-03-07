@@ -270,14 +270,14 @@ class I64Server:
                 if os.path.exists(rag_index_path):
                     self.retriever = Retriever.load(rag_index_path)
                     self.rag_enabled = True
-                    logger.info(f"RAG enabled: loaded index from {rag_index_path}")
+                    logger.info("RAG enabled: loaded index from %s", rag_index_path)
                 else:
                     self.retriever = Retriever()
                     self.rag_enabled = True
-                    logger.info(f"RAG enabled: empty index (will save to {rag_index_path})")
+                    logger.info("RAG enabled: empty index (will save to %s)", rag_index_path)
                 self._rag_index_path = rag_index_path
             except Exception as e:
-                logger.warning(f"RAG init failed: {e}")
+                logger.warning("RAG init failed: %s", e)
         else:
             # RAG always available for runtime indexing even without --rag-index
             try:
@@ -396,7 +396,7 @@ class I64Server:
             # Ensure the generation prompt is present (template may not handle add_generation_prompt)
             if not prompt.rstrip().endswith("Assistant:"):
                 prompt = prompt.rstrip("\n") + "\n\nAssistant:"
-            logger.info(f"[CHAT] Rendered prompt: {repr(prompt)}")
+            logger.info("[CHAT] Rendered prompt: %r", prompt)
             return prompt
         parts = []
         role_map = {"system": "System", "user": "User", "assistant": "Assistant"}
@@ -766,7 +766,7 @@ class I64Server:
         except (ConnectionResetError, ConnectionError):
             return web.Response(status=499, text="Client disconnected")
         except Exception as e:
-            logger.error(f"Completion error: {e}", exc_info=True)
+            logger.error("Completion error: %s", e, exc_info=True)
             return web.json_response(
                 {"error": {"message": "Internal server error", "type": "server_error"}},
                 status=500,
@@ -913,7 +913,7 @@ class I64Server:
         except (ConnectionResetError, ConnectionError):
             return web.Response(status=499, text="Client disconnected")
         except Exception as e:
-            logger.error(f"Chat completion error: {e}", exc_info=True)
+            logger.error("Chat completion error: %s", e, exc_info=True)
             return web.json_response(
                 {"error": {"message": "Internal server error", "type": "server_error"}},
                 status=500,
@@ -956,7 +956,8 @@ class I64Server:
                     status = "degraded"
             else:
                 checks["gpu"] = "not_available"
-        except Exception:
+        except Exception as e:
+            logger.warning("GPU health check failed: %s", e)
             checks["gpu"] = "error"
 
         health = {
@@ -1055,7 +1056,7 @@ class I64Server:
                 "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
             })
         except Exception as e:
-            logger.error(f"Embedding error: {e}", exc_info=True)
+            logger.error("Embedding error: %s", e, exc_info=True)
             return web.json_response(
                 {"error": {"message": "Internal server error", "type": "server_error"}},
                 status=500,
@@ -1240,7 +1241,7 @@ class I64Server:
         responses = []
         for i, r in enumerate(results):
             if isinstance(r, Exception):
-                logger.error(f"Batch request {i} error: {r}", exc_info=True)
+                logger.error("Batch request %d error: %s", i, r, exc_info=True)
                 responses.append({"index": i, "error": "Internal server error"})
             else:
                 responses.append({"index": i, "result": r.to_dict()})
@@ -1423,7 +1424,7 @@ class I64Server:
                         "done": True,
                     })
                 except Exception as e:
-                    logger.error(f"WebSocket error: {e}", exc_info=True)
+                    logger.error("WebSocket error: %s", e, exc_info=True)
                     await ws.send_json({"error": {"message": "Internal server error", "type": "server_error"}})
             elif msg.type == web.WSMsgType.ERROR:
                 break
@@ -1569,7 +1570,7 @@ class I64Server:
             total = len(self.retriever.vector_index.chunks) if self.retriever.vector_index else n
             return web.json_response({"status": "ok", "chunks_added": n, "total_chunks": total})
         except Exception as e:
-            logger.error(f"RAG index error: {e}", exc_info=True)
+            logger.error("RAG index error: %s", e, exc_info=True)
             return web.json_response(
                 {"error": {"message": "RAG indexing failed", "type": "server_error"}}, status=500,
             )
@@ -1598,7 +1599,7 @@ class I64Server:
             results = self.retriever.retrieve(query, k=k)
             return web.json_response({"query": query, "results": results, "count": len(results)})
         except Exception as e:
-            logger.error(f"RAG search error: {e}", exc_info=True)
+            logger.error("RAG search error: %s", e, exc_info=True)
             return web.json_response(
                 {"error": {"message": "RAG search failed", "type": "server_error"}}, status=500,
             )
@@ -1686,14 +1687,14 @@ class I64Server:
 
     def run(self):
         """Start the server with async continuous batching and graceful shutdown."""
-        logger.info(f"vllm-i64 :: {self.model_name}")
-        logger.info(f"  http://{self.host}:{self.port}")
-        logger.info(f"  POST /v1/completions | POST /v1/chat/completions | GET /health")
-        logger.info(f"  POST /v1/batch | GET /v1/models/{{id}} | GET /v1/metrics | GET /v1/logs")
-        logger.info(f"  POST /v1/cancel/{{id}} | WS /v1/ws/completions | GET /docs")
+        logger.info("vllm-i64 :: %s", self.model_name)
+        logger.info("  http://%s:%d", self.host, self.port)
+        logger.info("  POST /v1/completions | POST /v1/chat/completions | GET /health")
+        logger.info("  POST /v1/batch | GET /v1/models/{id} | GET /v1/metrics | GET /v1/logs")
+        logger.info("  POST /v1/cancel/{id} | WS /v1/ws/completions | GET /docs")
         if self.rag_enabled:
-            logger.info(f"  POST /v1/rag/index | POST /v1/rag/search | GET /v1/rag/stats")
-        logger.info(f"  mode: async continuous batching")
+            logger.info("  POST /v1/rag/index | POST /v1/rag/search | GET /v1/rag/stats")
+        logger.info("  mode: async continuous batching")
         app = self.create_app()
 
         # Graceful shutdown: drain requests before stopping

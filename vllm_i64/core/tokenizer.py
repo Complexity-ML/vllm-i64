@@ -7,8 +7,11 @@ Wraps HuggingFace tokenizers for i64 ↔ text conversion.
 INL - 2025
 """
 
+import logging
 import os
 from typing import Optional, List
+
+logger = logging.getLogger("vllm_i64.tokenizer")
 
 from vllm_i64.core.registry import get_model_entry
 
@@ -87,14 +90,14 @@ def load_tokenizer(model_name: str) -> Optional[I64Tokenizer]:
     tokenizer_path = os.path.join(config_dir, "tokenizer.json")
 
     if os.path.exists(tokenizer_path):
-        print(f"  tokenizer: {tokenizer_path}")
+        logger.info("Tokenizer: %s", tokenizer_path)
         return I64Tokenizer(tokenizer_path)
 
     # Try parent directory
     parent_tokenizer = os.path.join(os.path.dirname(config_dir), "tokenizer.json")
     if os.path.exists(parent_tokenizer):
-        print(f"  tokenizer: {parent_tokenizer}")
+        logger.info("Tokenizer: %s", parent_tokenizer)
         return I64Tokenizer(parent_tokenizer)
 
-    print("  tokenizer: not found (using byte fallback)")
+    logger.warning("Tokenizer not found (using byte fallback)")
     return None

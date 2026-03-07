@@ -29,7 +29,7 @@ class MixtralConfig(_HFMixtralConfig):
 
     @classmethod
     def from_json(cls, path: str) -> "MixtralConfig":
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         config = cls(**data)
         return config

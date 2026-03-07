@@ -204,7 +204,7 @@ class AsyncCPUEngine(AsyncI64Engine):
                         if rid in self._pending_futures:
                             target = self._pending_futures.pop(rid)
                             if isinstance(target, asyncio.Future) and not target.done():
-                                target.set_exception(RuntimeError(f"Engine error: {e}"))
+                                target.set_exception(RuntimeError("Engine step failed — check server logs"))
                                 self.active_requests -= 1
                             elif isinstance(target, asyncio.Queue):
                                 await target.put(None)

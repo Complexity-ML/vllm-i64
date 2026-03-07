@@ -18,6 +18,7 @@ Tensor-only: no .item() calls in the draft loop for GPU efficiency.
 INL - 2025
 """
 
+import random
 import torch
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
@@ -123,7 +124,6 @@ class SpeculativeDecoder:
                 p_target = target_probs[draft_token].item()
                 # Draft was greedy, so p_draft ~ 1 for draft token
                 # Accept with min(1, p_target) as conservative approximation
-                import random
                 if random.random() < p_target:
                     accepted.append(draft_token)
                 else:

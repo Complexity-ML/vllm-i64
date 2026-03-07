@@ -71,9 +71,9 @@ def detect_quant_config(checkpoint_path: str) -> Optional[Tuple[str, object]]:
         return None
 
     try:
-        with open(config_file, "r") as f:
+        with open(config_file, "r", encoding="utf-8") as f:
             data = _json.load(f)
-    except Exception:
+    except (OSError, ValueError, _json.JSONDecodeError):
         return None
 
     qconfig = data.get("quantization_config")

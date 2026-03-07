@@ -146,7 +146,7 @@ class Agent:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
-            except ConnectionError as e:
+            except (ConnectionError, OSError, TimeoutError) as e:
                 self._print("[Error]", str(e), "red")
                 return f"Error: {e}"
 
@@ -240,7 +240,7 @@ class Agent:
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                 )
-            except ConnectionError as e:
+            except (ConnectionError, OSError, TimeoutError) as e:
                 self._print("[Error]", str(e), "red")
                 continue
 

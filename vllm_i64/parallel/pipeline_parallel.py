@@ -14,10 +14,13 @@ Usage:
 INL - 2025
 """
 
+import logging
 import torch
 import torch.distributed as dist
 from typing import Optional
 from dataclasses import dataclass
+
+logger = logging.getLogger("vllm_i64.parallel.pipeline_parallel")
 
 
 @dataclass
@@ -56,7 +59,7 @@ def init_pp(pp_size: int = 1):
     pp_group = dist.new_group(pp_group_ranks)
 
     _PP = PPState(pp_size=pp_size, pp_rank=pp_rank, pp_group=pp_group)
-    print(f"[PP] rank={pp_rank}/{pp_size}")
+    logger.info("[PP] rank=%d/%d", pp_rank, pp_size)
 
 
 def get_pp() -> PPState:

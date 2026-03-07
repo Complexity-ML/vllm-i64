@@ -32,7 +32,7 @@ from typing import List, Dict, Optional, Callable, Set, Tuple
 from dataclasses import dataclass
 from collections import deque
 
-from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request
+from vllm_i64.engine.i64_scheduler import I64Scheduler, I64Batch, I64Request, RequestStatus
 from vllm_i64.core.sampling import (
     SamplingParams, sample_batch, sample_batch_with_logprobs,
     apply_repetition_penalty_batch, TokenLogprob,
@@ -216,7 +216,11 @@ class I64Engine:
 
         config = self.model.config
         tp = get_tp()
-        num_kv_heads = config.num_key_value_heads // tp.tp_size
+        # GQA: replicate KV heads when fewer than TP ranks
+        if config.num_key_value_heads >= tp.tp_size:
+            num_kv_heads = config.num_key_value_heads // tp.tp_size
+        else:
+            num_kv_heads = config.num_key_value_heads
         dtype = next(self.model.parameters()).dtype
 
         block_size = 16
@@ -304,9 +308,9 @@ class I64Engine:
                 self.kv_cache._graph_mode = False
                 # Capture warmup wrote garbage to block 0 — mark dirty
                 self.kv_cache._dirty_blocks.add(0)
-            logger.info(f"CUDA graphs captured for sizes: {sorted(self.cuda_graph_runner._captured_sizes)}")
+            logger.info("CUDA graphs captured for sizes: %s", sorted(self.cuda_graph_runner._captured_sizes))
         except Exception as e:
-            logger.warning(f"CUDA graph capture failed: {e}")
+            logger.warning("CUDA graph capture failed: %s", e)
             # Free all partially-captured graphs and release private pool memory
             if self.cuda_graph_runner is not None:
                 self.cuda_graph_runner.graphs.clear()
@@ -371,7 +375,7 @@ class I64Engine:
         from vllm_i64.layers.lora import LoRAManager
         self._lora_manager = LoRAManager(self.model)
         self._lora_manager.auto_wrap(target_names)
-        logger.info(f"LoRA enabled: {len(self._lora_manager._lora_modules)} modules wrapped")
+        logger.info("LoRA enabled: %d modules wrapped", len(self._lora_manager._lora_modules))
 
     def load_lora_adapter(
         self,
@@ -399,7 +403,7 @@ class I64Engine:
         if not weights:
             return False
         self._lora_manager.load_adapter(adapter_id, adapter_name, weights, scaling=scaling)
-        logger.info(f"LoRA adapter loaded: {adapter_name} (id={adapter_id})")
+        logger.info("LoRA adapter loaded: %s (id=%d)", adapter_name, adapter_id)
         return True
 
     def unload_lora_adapter(self, adapter_id: int):
@@ -528,7 +532,7 @@ class I64Engine:
                                 req.prefill_progress = reused
                                 req.seq_pos = reused
                                 break
-                        logger.info(f"Prefix cache hit: reused {reused} tokens for request {request_id}")
+                        logger.info("Prefix cache hit: reused %d tokens for request %d", reused, request_id)
 
         # Store pixel_values for VLM prefill (consumed and freed after first forward)
         if pixel_values is not None:
@@ -563,10 +567,10 @@ class I64Engine:
                 is_timed_out = deadline is not None and now > deadline
 
             if is_cancelled or is_timed_out:
-                req.status = 3  # FINISHED
+                req.status = RequestStatus.FINISHED
                 req._finish_reason = "cancelled" if is_cancelled else "timeout"
                 if is_timed_out:
-                    logger.warning(f"Request {rid} timed out")
+                    logger.warning("Request %d timed out", rid)
                 self._free_kv_blocks_for(req)
                 self.scheduler.finished.append(req)
                 self._free_slot(rid)
@@ -601,7 +605,7 @@ class I64Engine:
             still_pending = []
             for req in self.scheduler.pending:
                 if req.request_id in self._cancelled_requests:
-                    req.status = 3
+                    req.status = RequestStatus.FINISHED
                     req._finish_reason = "cancelled"
                     self.scheduler.finished.append(req)
                     removed.add(req.request_id)
@@ -903,7 +907,7 @@ class I64Engine:
                     for proc in self._request_processors[rid]:
                         if hasattr(proc, 'should_stop') and proc.should_stop:
                             if req is not None:
-                                req.status = 3  # FINISHED
+                                req.status = RequestStatus.FINISHED
                                 req._finish_reason = "stop"
                             break
 
@@ -1283,7 +1287,7 @@ class AsyncI64Engine:
         Args:
             drain_timeout: max seconds to wait for in-flight requests
         """
-        logger.info(f"Engine shutdown requested, draining {self.active_requests} requests...")
+        logger.info("Engine shutdown requested, draining %d requests...", self.active_requests)
         self._draining = True
 
         # Wait for in-flight requests to finish
@@ -1292,7 +1296,7 @@ class AsyncI64Engine:
             await asyncio.sleep(0.05)
 
         if self.active_requests > 0:
-            logger.warning(f"Drain timeout: {self.active_requests} requests still active, cancelling")
+            logger.warning("Drain timeout: %d requests still active, cancelling", self.active_requests)
             # Cancel remaining futures
             for rid, target in list(self._pending_futures.items()):
                 if isinstance(target, asyncio.Future) and not target.done():
@@ -1413,7 +1417,7 @@ class AsyncI64Engine:
                     _consecutive_errors = 0  # Reset on success
                 except Exception as e:
                     _consecutive_errors += 1
-                    logger.error(f"Engine step failed ({_consecutive_errors}/{_MAX_CONSECUTIVE_ERRORS}): {e}")
+                    logger.error("Engine step failed (%d/%d): %s", _consecutive_errors, _MAX_CONSECUTIVE_ERRORS, e)
 
                     # Fail stuck requests so clients get an error response
                     for req in list(self.engine.scheduler.running):
@@ -1421,7 +1425,7 @@ class AsyncI64Engine:
                         if rid in self._pending_futures:
                             target = self._pending_futures.pop(rid)
                             if isinstance(target, asyncio.Future) and not target.done():
-                                target.set_exception(RuntimeError(f"Engine error: {e}"))
+                                target.set_exception(RuntimeError("Engine step failed — check server logs"))
                                 self.active_requests -= 1
                             elif isinstance(target, asyncio.Queue):
                                 await target.put(None)

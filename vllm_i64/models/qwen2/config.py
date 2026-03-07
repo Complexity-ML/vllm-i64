@@ -27,7 +27,7 @@ class Qwen2Config(_HFQwen2Config):
 
     @classmethod
     def from_json(cls, path: str) -> "Qwen2Config":
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         config = cls(**data)
         config.num_experts = 1

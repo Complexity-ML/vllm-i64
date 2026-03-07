@@ -67,7 +67,7 @@ def _try_compile_i64() -> Optional[object]:
         # Check all sources exist
         for src in sources:
             if not os.path.exists(src):
-                logger.warning(f"I64 CUDA source not found: {src}")
+                logger.warning("I64 CUDA source not found: %s", src)
                 return None
 
         logger.info("Compiling I64 CUDA kernels (first time may take a minute)...")
@@ -90,7 +90,7 @@ def _try_compile_i64() -> Optional[object]:
         return _I64_OPS
 
     except Exception as e:
-        logger.warning(f"I64 CUDA kernel compilation failed: {e}")
+        logger.warning("I64 CUDA kernel compilation failed: %s", e)
         logger.info("Falling back to Triton/PyTorch kernels")
         return None
 

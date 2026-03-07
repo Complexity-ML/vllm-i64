@@ -62,7 +62,8 @@ def _detect_backend() -> Optional[str]:
             _BEST_BACKEND = backend
             _logger.info("torch.compile backend: %s", backend)
             return backend
-        except Exception:
+        except Exception as e:
+            _logger.debug("torch.compile backend '%s' failed: %s", backend, e)
             continue
 
     _logger.warning("torch.compile: no working backend found")

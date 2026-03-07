@@ -11,9 +11,12 @@ and PP via send/recv.
 INL - 2025
 """
 
+import logging
 import os
 import sys
 import torch
+
+logger = logging.getLogger("vllm_i64.worker")
 
 
 def main():
@@ -34,7 +37,7 @@ def main():
     args = sys.argv[1:]
     if not args:
         if tp.tp_rank == 0 and pp.pp_rank == 0:
-            print("Usage: worker <serve|bench> [args...]")
+            logger.error("Usage: worker <serve|bench> [args...]")
         return
 
     command = args[0]
@@ -45,7 +48,7 @@ def main():
         _run_bench(args[1:], tp, pp)
     else:
         if tp.tp_rank == 0 and pp.pp_rank == 0:
-            print(f"Unknown command: {command}")
+            logger.error("Unknown command: %s", command)
 
 
 def _run_serve(args: list, tp, pp):
@@ -69,7 +72,7 @@ def _run_serve(args: list, tp, pp):
     dtype = dtype_map[parsed.dtype]
 
     if tp.tp_rank == 0 and pp.pp_rank == 0:
-        print(f"vllm-i64 :: serving {parsed.model} (TP={tp.tp_size}, PP={pp.pp_size})")
+        logger.info("vllm-i64 :: serving %s (TP=%d, PP=%d)", parsed.model, tp.tp_size, pp.pp_size)
 
     # Each rank loads its shard (TP shards weights, PP shards layers)
     model = load_model_by_name(
@@ -93,7 +96,7 @@ def _run_serve(args: list, tp, pp):
         tokenizer = load_tokenizer(parsed.model)
         chat_template = None
         if parsed.chat_template:
-            with open(parsed.chat_template) as f:
+            with open(parsed.chat_template, encoding="utf-8") as f:
                 chat_template = f.read()
 
         server = I64Server(
@@ -133,7 +136,7 @@ def _worker_loop(engine, tp, pp):
     if global_rank == 0:
         return
 
-    print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] ready, waiting for compute")
+    logger.info("[Worker TP=%d PP=%d] ready, waiting for compute", tp.tp_rank, pp.pp_rank)
 
     device = tp.device
 
@@ -146,7 +149,7 @@ def _worker_loop(engine, tp, pp):
             opcode = control[0].item()
             if opcode == 0:
                 # Shutdown
-                print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] shutdown signal received")
+                logger.info("[Worker TP=%d PP=%d] shutdown signal received", tp.tp_rank, pp.pp_rank)
                 break
 
             batch_tokens = control[1].item()
@@ -162,10 +165,10 @@ def _worker_loop(engine, tp, pp):
                 engine.model(token_ids=token_ids, positions=positions)
 
         except Exception as e:
-            print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] error: {e}")
+            logger.error("[Worker TP=%d PP=%d] error: %s", tp.tp_rank, pp.pp_rank, e)
             break
 
-    print(f"[Worker TP={tp.tp_rank} PP={pp.pp_rank}] exiting")
+    logger.info("[Worker TP=%d PP=%d] exiting", tp.tp_rank, pp.pp_rank)
 
 
 def _run_bench(args: list, tp, pp):

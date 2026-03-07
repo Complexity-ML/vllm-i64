@@ -6,3 +6,9 @@ Model-agnostic — any token-routed architecture can use these.
 from vllm_i64.layers.token_routed_mlp import TokenRoutedMLP
 from vllm_i64.layers.rmsnorm import RMSNorm
 from vllm_i64.layers.rotary import RotaryEmbedding, apply_rotary
+
+__all__ = [
+    "TokenRoutedMLP",
+    "RMSNorm",
+    "RotaryEmbedding", "apply_rotary",
+]

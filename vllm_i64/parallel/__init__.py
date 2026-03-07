@@ -45,3 +45,14 @@ from vllm_i64.parallel.disaggregated import (
     setup_disaggregated,
     launch_disaggregated,
 )
+
+__all__ = [
+    "TPState", "ColumnParallelLinear", "RowParallelLinear",
+    "init_distributed", "get_tp", "get_tp_rank", "get_tp_world_size",
+    "shard_expert_weights", "all_reduce",
+    "PPState", "init_pp", "get_pp", "get_pp_rank", "get_pp_world_size",
+    "is_first_pp_rank", "is_last_pp_rank", "get_pp_indices",
+    "PPMissingLayer", "IntermediateTensors", "make_layers",
+    "DisaggRole", "KVTransfer", "PrefillWorker", "DecodeWorker",
+    "DisaggregatedCoordinator", "setup_disaggregated", "launch_disaggregated",
+]

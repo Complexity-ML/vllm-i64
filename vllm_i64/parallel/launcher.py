@@ -18,9 +18,12 @@ Usage (Python):
 INL - 2025
 """
 
+import logging
 import subprocess
 import sys
 import os
+
+logger = logging.getLogger("vllm_i64.parallel.launcher")
 
 
 def launch_distributed(tp_size: int, args: list, pp_size: int = 1) -> int:
@@ -49,8 +52,8 @@ def launch_distributed(tp_size: int, args: list, pp_size: int = 1) -> int:
     env["VLLM_I64_TP_SIZE"] = str(tp_size)
     env["VLLM_I64_PP_SIZE"] = str(pp_size)
 
-    print(f"vllm-i64 :: launching {nproc} workers (TP={tp_size}, PP={pp_size})")
-    print(f"  cmd: {' '.join(cmd)}")
+    logger.info("vllm-i64 :: launching %d workers (TP=%d, PP=%d)", nproc, tp_size, pp_size)
+    logger.info("  cmd: %s", ' '.join(cmd))
 
     proc = subprocess.run(cmd, env=env)
     return proc.returncode

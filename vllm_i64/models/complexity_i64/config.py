@@ -79,7 +79,7 @@ class ComplexityI64Config:
     @staticmethod
     def from_json(path: str) -> "ComplexityI64Config":
         """Load from a checkpoint config.json."""
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         config = ComplexityI64Config()
         for key, val in data.items():

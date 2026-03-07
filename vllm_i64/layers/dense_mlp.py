@@ -117,7 +117,7 @@ class DenseMLP(nn.Module):
                     if inter is not None:
                         out = int8_linear_native(inter, self.down_int8, self.down_scale)
                         return all_reduce(out)
-            except (ImportError, AttributeError, Exception):
+            except (ImportError, AttributeError, RuntimeError):
                 pass
 
         # Fallback: separate matmuls

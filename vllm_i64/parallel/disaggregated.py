@@ -71,6 +71,15 @@ class KVTransferMetadata:
     sampling_temperature: float = 0.0  # Only float: passed through for decode
 
 
+class DisaggStatus(IntEnum):
+    """Disaggregated request lifecycle."""
+    PENDING = 0
+    PREFILLING = 1
+    TRANSFERRING = 2
+    DECODING = 3
+    FINISHED = 4
+
+
 @dataclass
 class DisaggRequest:
     """
@@ -80,7 +89,7 @@ class DisaggRequest:
     request_id: int
     prompt_token_ids: List[int]
     max_new_tokens: int
-    status: int = 0               # 0=pending, 1=prefilling, 2=transferring, 3=decoding, 4=finished
+    status: int = DisaggStatus.PENDING
     output_tokens: List[int] = field(default_factory=list)
     first_token_id: int = 0
     sampling_temperature: float = 0.0
@@ -801,7 +810,7 @@ class DisaggregatedCoordinator:
             request_id = req.request_id
             try:
                 with self._lock:
-                    req.status = 1  # prefilling
+                    req.status = DisaggStatus.PREFILLING
 
                 first_token = self.prefill_worker.run_prefill(
                     request_id=request_id,
@@ -813,13 +822,13 @@ class DisaggregatedCoordinator:
 
                 with self._lock:
                     req.first_token_id = first_token
-                    req.status = 2  # transferring -> decoding
+                    req.status = DisaggStatus.TRANSFERRING
                     # Decode worker receives on its own recv thread
 
             except Exception as e:
                 logger.error("Prefill failed for request %d: %s", request_id, e)
                 with self._lock:
-                    req.status = 4  # finished (error)
+                    req.status = DisaggStatus.FINISHED
                     req.output_tokens = []
 
         logger.info("Prefill thread exiting")
@@ -901,7 +910,7 @@ class DisaggregatedCoordinator:
                 dreq = self._requests.get(rid)
                 if dreq is not None:
                     dreq.output_tokens = output_tokens
-                    dreq.status = 4  # finished
+                    dreq.status = DisaggStatus.FINISHED
                     dreq.finish_time = time.perf_counter()
 
                 cb = self._result_callbacks.pop(rid, None)

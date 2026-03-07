@@ -28,6 +28,8 @@ from vllm_i64.parallel.tensor_parallel import (
     get_tp, ColumnParallelLinear, RowParallelLinear,
 )
 
+logger = logging.getLogger("vllm_i64.loader")
+
 
 # =========================================================================
 # Multi-format state_dict loading (safetensors + PyTorch)
@@ -53,7 +55,7 @@ def _load_pytorch_file(filepath: str) -> Dict[str, torch.Tensor]:
 def _load_sharded_safetensors(directory: Path) -> Dict[str, torch.Tensor]:
     """Load sharded safetensors from a HuggingFace model directory."""
     index_path = directory / "model.safetensors.index.json"
-    with open(index_path, "r") as f:
+    with open(index_path, "r", encoding="utf-8") as f:
         index = _json.load(f)
 
     weight_map = index.get("weight_map", {})
@@ -120,7 +122,7 @@ def _load_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
     else:
         try:
             return _load_pytorch_file(str(path))
-        except Exception:
+        except (OSError, RuntimeError, KeyError):
             return _load_safetensors_file(str(path))
 
 
@@ -173,7 +175,7 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     if tp.tp_rank == 0:
-        print(f"Loading checkpoint: {checkpoint_path}")
+        logger.info("Loading checkpoint: %s", checkpoint_path)
 
     state_dict = _load_state_dict(checkpoint_path)
 
@@ -284,9 +286,9 @@ def load_checkpoint(
     if unpaired_gu or unpaired_dn:
         _logger = logging.getLogger("vllm_i64.loader")
         for p in unpaired_gu:
-            _logger.warning(f"Expert gate_up_proj without matching down_proj: {p}")
+            _logger.warning("Expert gate_up_proj without matching down_proj: %s", p)
         for p in unpaired_dn:
-            _logger.warning(f"Expert down_proj without matching gate_up_proj: {p}")
+            _logger.warning("Expert down_proj without matching gate_up_proj: %s", p)
 
     for prefix in expert_gate_up:
         if prefix in expert_down:
@@ -321,13 +323,13 @@ def load_checkpoint(
     }
 
     if tp.tp_rank == 0:
-        print(f"  Loaded: {stats['loaded']} tensors (TP={tp.tp_size})")
+        logger.info("Loaded: %d tensors (TP=%d)", stats['loaded'], tp.tp_size)
         if stats['skipped']:
-            print(f"  Skipped: {stats['skipped']} (rotary inv_freq, etc.)")
+            logger.info("Skipped: %d (rotary inv_freq, etc.)", stats['skipped'])
         if stats['missing_in_model']:
-            print(f"  Not in model: {stats['missing_in_model']}")
+            logger.warning("Not in model: %d", stats['missing_in_model'])
         if stats['unloaded_params']:
-            print(f"  Unloaded params: {stats['unloaded_params']}")
+            logger.warning("Unloaded params: %d", stats['unloaded_params'])
             if strict:
                 raise RuntimeError(f"Missing weights: {unloaded}")
 
@@ -415,7 +417,7 @@ def load_model_by_name(
         if detected is not None:
             effective_quant = detected
             if tp.tp_rank == 0:
-                print(f"  Auto-detected quantization: {detected}")
+                logger.info("Auto-detected quantization: %s", detected)
 
     # Load weights — dispatch by quantization format
     if ckpt_path and effective_quant in ("awq", "gptq"):
@@ -428,9 +430,8 @@ def load_model_by_name(
             stats = load_gptq_checkpoint(model, ckpt_path, device=device, dtype=dtype)
 
         if tp.tp_rank == 0:
-            print(f"  Loaded {effective_quant.upper()} checkpoint: "
-                  f"{stats['quant_layers']} quantized layers, "
-                  f"{stats['non_quant_loaded']} non-quantized weights")
+            logger.info("Loaded %s checkpoint: %d quantized layers, %d non-quantized weights",
+                        effective_quant.upper(), stats['quant_layers'], stats['non_quant_loaded'])
     elif ckpt_path:
         # Standard float checkpoint
         load_checkpoint(model, ckpt_path, dtype=dtype, device=device)
@@ -448,7 +449,7 @@ def load_model_by_name(
             _quantize_lm_head(model, effective_quant)
             _quantize_rmsnorm(model, effective_quant)
         if tp.tp_rank == 0:
-            print(f"  Quantized weights: {effective_quant}")
+            logger.info("Quantized weights: %s", effective_quant)
 
     # Disable grad tracking — inference only, avoids autograd view conflicts
     # with quantized buffers that are views of original parameters.

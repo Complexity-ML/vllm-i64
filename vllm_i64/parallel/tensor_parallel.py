@@ -15,12 +15,15 @@ Usage:
 INL - 2025
 """
 
+import logging
 import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from typing import Optional
 from dataclasses import dataclass
+
+logger = logging.getLogger("vllm_i64.parallel.tensor_parallel")
 
 
 # =========================================================================
@@ -66,7 +69,7 @@ def init_distributed(tp_size: int = 1, backend: str = "nccl"):
     tp_group = dist.new_group(tp_group_ranks)
 
     _TP = TPState(tp_size=tp_size, tp_rank=tp_rank_local, tp_group=tp_group, device=device)
-    print(f"[TP] rank={rank} tp_rank={tp_rank_local}/{tp_size} pp_stage={pp_stage} device={device}")
+    logger.info("[TP] rank=%d tp_rank=%d/%d pp_stage=%d device=%s", rank, tp_rank_local, tp_size, pp_stage, device)
 
 
 def get_tp() -> TPState:

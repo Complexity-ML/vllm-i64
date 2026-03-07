@@ -180,21 +180,21 @@ def resolve_architecture(checkpoint_path: str) -> Optional[Tuple[str, str, str]]
         return None
 
     try:
-        with open(config_path, "r") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             data = _json.load(f)
-    except Exception:
+    except (OSError, ValueError, _json.JSONDecodeError):
         return None
 
     architectures = data.get("architectures", [])
     for arch in architectures:
         if arch in _ARCHITECTURE_MAP:
             model_class, config_loader = _ARCHITECTURE_MAP[arch]
-            _logger.info(f"Auto-detected architecture: {arch} → {model_class.rsplit('.', 1)[-1]}")
+            _logger.info("Auto-detected architecture: %s → %s", arch, model_class.rsplit('.', 1)[-1])
             return model_class, config_loader, str(config_path)
 
     _logger.warning(
-        f"Unknown architecture(s): {architectures}. "
-        f"Supported: {sorted(_ARCHITECTURE_MAP.keys())}"
+        "Unknown architecture(s): %s. Supported: %s",
+        architectures, sorted(_ARCHITECTURE_MAP.keys()),
     )
     return None
 

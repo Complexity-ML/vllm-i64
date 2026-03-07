@@ -131,7 +131,7 @@ def cmd_serve(args):
     # Load chat template (explicit path or auto-detect from checkpoint dir)
     chat_template = None
     if args.chat_template:
-        with open(args.chat_template) as f:
+        with open(args.chat_template, encoding="utf-8") as f:
             chat_template = f.read()
     else:
         import os
@@ -142,7 +142,7 @@ def cmd_serve(args):
                 for name in ("chat_template.jinja", "chat_template.j2"):
                     tmpl_path = os.path.join(search_dir, name)
                     if os.path.exists(tmpl_path):
-                        with open(tmpl_path) as f:
+                        with open(tmpl_path, encoding="utf-8") as f:
                             chat_template = f.read()
                         _logger.info("chat_template: %s", tmpl_path)
                         break

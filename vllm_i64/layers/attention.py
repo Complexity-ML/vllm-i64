@@ -24,12 +24,13 @@ try:
 except ImportError:
     pass
 
+# Cache the env var check at import time (avoids per-call os.environ lookup)
+import os as _os
+_FLASH_ATTN_DISABLED = _os.environ.get("VLLM_NO_FLASH_ATTN", "").strip() == "1"
+
 
 def is_flash_attn_available() -> bool:
-    import os
-    if os.environ.get("VLLM_NO_FLASH_ATTN", "").strip() == "1":
-        return False
-    return _FLASH_ATTN_AVAILABLE
+    return _FLASH_ATTN_AVAILABLE and not _FLASH_ATTN_DISABLED
 
 
 def compute_cu_seqlens(tokens_per_seq: List[int], device: torch.device) -> Tuple[torch.Tensor, int]:

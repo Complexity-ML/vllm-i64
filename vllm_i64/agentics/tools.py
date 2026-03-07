@@ -33,8 +33,6 @@ class Tool:
 def tool_read_file(args: str) -> str:
     """Read a file. Args: file path."""
     path = args.strip()
-    if not os.path.exists(path):
-        return f"Error: file not found: {path}"
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(100_000)  # cap at 100KB
@@ -42,7 +40,9 @@ def tool_read_file(args: str) -> str:
         if len(lines) > 200:
             content = "\n".join(lines[:200]) + f"\n... ({len(lines) - 200} more lines)"
         return content
-    except Exception as e:
+    except FileNotFoundError:
+        return f"Error: file not found: {path}"
+    except OSError as e:
         return f"Error reading {path}: {e}"
 
 
@@ -64,8 +64,6 @@ def tool_write_file(args: str) -> str:
 def tool_list_dir(args: str) -> str:
     """List directory contents. Args: directory path."""
     path = args.strip() or "."
-    if not os.path.isdir(path):
-        return f"Error: not a directory: {path}"
     try:
         entries = sorted(os.listdir(path))
         result = []
@@ -76,7 +74,11 @@ def tool_list_dir(args: str) -> str:
         if len(entries) > 100:
             result.append(f"... ({len(entries) - 100} more)")
         return "\n".join(result)
-    except Exception as e:
+    except NotADirectoryError:
+        return f"Error: not a directory: {path}"
+    except FileNotFoundError:
+        return f"Error: directory not found: {path}"
+    except OSError as e:
         return f"Error listing {path}: {e}"
 
 

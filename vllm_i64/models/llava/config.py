@@ -46,6 +46,6 @@ class LlavaConfig(LlamaConfig):
     @classmethod
     def from_json(cls, path: str) -> "LlavaConfig":
         """Load config from a JSON file."""
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return cls(**data)

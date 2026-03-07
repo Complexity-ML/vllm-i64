@@ -90,7 +90,7 @@ def _try_compile() -> Optional[object]:
         binding_path = os.path.join(csrc_dir, "i64_ops_binding.cu")
 
         if not os.path.exists(binding_path):
-            logger.warning(f"CUDA source not found: {binding_path}")
+            logger.warning("CUDA source not found: %s", binding_path)
             return None
 
         logger.info("Compiling CUDA kernels (first time may take a minute)...")
@@ -106,7 +106,7 @@ def _try_compile() -> Optional[object]:
         return _COMPILED_OPS
 
     except Exception as e:
-        logger.warning(f"CUDA kernel compilation failed: {e}")
+        logger.warning("CUDA kernel compilation failed: %s", e)
         logger.info("Using PyTorch fallback kernels")
         return None
 

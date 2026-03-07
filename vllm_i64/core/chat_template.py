@@ -7,8 +7,11 @@ Loads Jinja2 templates from checkpoint directories.
 INL - 2025
 """
 
+import logging
 import os
 from typing import List, Dict, Optional
+
+logger = logging.getLogger("vllm_i64.chat_template")
 
 
 class ChatTemplate:
@@ -68,7 +71,7 @@ def load_chat_template(model_name: str) -> Optional[ChatTemplate]:
     for name in ["chat_template.jinja", "chat_template.j2", "template.jinja"]:
         path = os.path.join(config_dir, name)
         if os.path.exists(path):
-            print(f"  chat_template: {path}")
+            logger.info("chat_template: %s", path)
             return ChatTemplate.from_file(path)
 
     # Try parent directory
@@ -76,7 +79,7 @@ def load_chat_template(model_name: str) -> Optional[ChatTemplate]:
     for name in ["chat_template.jinja", "chat_template.j2"]:
         path = os.path.join(parent_dir, name)
         if os.path.exists(path):
-            print(f"  chat_template: {path}")
+            logger.info("chat_template: %s", path)
             return ChatTemplate.from_file(path)
 
     return None

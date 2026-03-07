@@ -58,7 +58,7 @@ def fp8_available() -> bool:
     try:
         cap = torch.cuda.get_device_capability()
         return cap[0] >= 9 or (cap[0] == 8 and cap[1] >= 9)  # SM89+ (Ada/Hopper)
-    except Exception:
+    except (RuntimeError, AssertionError):
         return False
 
 

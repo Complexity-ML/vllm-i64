@@ -10,3 +10,5 @@ Uses ComplexityDeepModel for inference — the INT8 quantization
 """
 
 from vllm_i64.models.complexity_i64.config import ComplexityI64Config
+
+__all__ = ["ComplexityI64Config"]

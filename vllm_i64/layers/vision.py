@@ -84,7 +84,7 @@ class VisionEncoder(nn.Module):
             vis_hidden = tower.config.hidden_size
             logger.info("Loaded SigLIP vision tower: %s (dim=%d)", name, vis_hidden)
             return tower, processor, vis_hidden
-        except Exception:
+        except (ImportError, ValueError, OSError):
             pass
 
         try:

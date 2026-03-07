@@ -58,7 +58,8 @@ class CUDAGraphRunner:
 
         Must be called with representative inputs (correct shapes).
         """
-        assert token_ids.device.type == "cuda", "CUDA graph requires CUDA tensors"
+        if token_ids.device.type != "cuda":
+            raise ValueError("CUDA graph requires CUDA tensors")
         bs = token_ids.shape[0]
 
         # Static input buffers (graph replays with these)

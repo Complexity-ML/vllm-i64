@@ -10,3 +10,9 @@ from vllm_i64.models.complexity_deep.model import (
     MuGuidedTokenRoutedMLP,
     INLDynamics,
 )
+
+__all__ = [
+    "ComplexityDeepConfig",
+    "ComplexityDeepModel", "ComplexityDecoderLayer",
+    "MuGuidedAttention", "MuGuidedTokenRoutedMLP", "INLDynamics",
+]

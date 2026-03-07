@@ -498,10 +498,10 @@ class I64Scheduler:
                                 req.kv_block_ids.extend(new_blocks)
                             else:
                                 _logger.warning("KV block allocation failed for request %d after preemption", req.request_id)
-                                req.is_finished = True
+                                req.status = RequestStatus.FINISHED
                         else:
                             _logger.warning("KV block allocation failed for request %d (no blocks free)", req.request_id)
-                            req.is_finished = True
+                            req.status = RequestStatus.FINISHED
 
     def get_stats(self) -> Dict[str, int]:
         """Stats — all integer values."""
