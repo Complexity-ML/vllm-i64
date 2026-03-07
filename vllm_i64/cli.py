@@ -26,6 +26,26 @@ def cmd_serve(args):
 
     # If TP > 1 or PP > 1, launch via torchrun
     if args.tp > 1 or args.pp > 1:
+        # Disaggregated prefill/decode: split GPUs into prefill and decode groups
+        if getattr(args, 'disaggregated', False) and args.tp >= 2:
+            from vllm_i64.parallel.disaggregated import launch_disaggregated
+
+            forward_args = ["serve", args.model]
+            forward_args += ["--host", args.host]
+            forward_args += ["--port", str(args.port)]
+            forward_args += ["--dtype", args.dtype]
+            forward_args += ["--disaggregated"]
+            if args.checkpoint:
+                forward_args += ["--checkpoint", args.checkpoint]
+            if args.chat_template:
+                forward_args += ["--chat-template", args.chat_template]
+            if args.quantization and args.quantization != "none":
+                forward_args += ["--quantization", args.quantization]
+
+            _logger.info("Disaggregated mode: GPU 0 = prefill, GPU 1 = decode")
+            rc = launch_disaggregated(tp_size=args.tp, args=forward_args)
+            sys.exit(rc)
+
         from vllm_i64.parallel.launcher import launch_distributed
 
         # Forward all args to the worker
@@ -325,8 +345,10 @@ def main():
     p_serve.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
     p_serve.add_argument("--tp", type=int, default=1, help="Tensor parallel size (num GPUs)")
     p_serve.add_argument("--pp", type=int, default=1, help="Pipeline parallel size (num stages)")
-    p_serve.add_argument("--quantization", default="int8", choices=["int8", "int4", "none"],
-                         help="Weight quantization (default: int8 — native integer compute)")
+    p_serve.add_argument("--quantization", default="int8",
+                         choices=["int8", "int4", "awq", "gptq", "none"],
+                         help="Weight quantization (default: int8 — native integer compute; "
+                              "awq/gptq for pre-quantized HF checkpoints)")
     p_serve.add_argument("--checkpoint", default=None, help="Override checkpoint path")
     p_serve.add_argument("--chat-template", default=None, help="Path to chat template")
     p_serve.add_argument("--enable-prefix-caching", action="store_true",
@@ -357,6 +379,9 @@ def main():
                          help="Max pending requests before rejecting (0 = unlimited)")
     p_serve.add_argument("--rag-index", default=None,
                          help="Path to RAG index directory (enables /v1/rag/* endpoints)")
+    p_serve.add_argument("--disaggregated", action="store_true",
+                         help="Enable disaggregated prefill/decode (requires TP >= 2). "
+                              "GPU 0 handles prefill (compute-bound), GPU 1 handles decode (memory-bound)")
     p_serve.set_defaults(func=cmd_serve)
 
     # list

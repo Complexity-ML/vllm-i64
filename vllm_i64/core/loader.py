@@ -334,6 +334,20 @@ def load_checkpoint(
     return stats
 
 
+def _detect_checkpoint_quantization(checkpoint_path: str) -> Optional[str]:
+    """
+    Auto-detect AWQ/GPTQ quantization from checkpoint config.json.
+
+    Returns "awq", "gptq", or None.
+    """
+    from vllm_i64.core.awq_gptq import detect_quant_config
+
+    result = detect_quant_config(checkpoint_path)
+    if result is not None:
+        return result[0]  # "awq" or "gptq"
+    return None
+
+
 def load_model_by_name(
     model_name: str,
     dtype: torch.dtype = torch.float16,
@@ -347,12 +361,18 @@ def load_model_by_name(
     Each rank creates the model (with TP-aware layers), then
     load_checkpoint takes the appropriate shard from the full checkpoint.
 
+    Supports pre-quantized checkpoints:
+      - "awq": load AWQ-quantized checkpoint (auto-detected or explicit)
+      - "gptq": load GPTQ-quantized checkpoint (auto-detected or explicit)
+      - "int8"/"int4": post-load quantization of float checkpoints
+      - "fp8": FP8 quantization for Hopper GPUs
+
     Args:
         model_name: registered name (e.g. "pacific-prime-chat")
         dtype: weight dtype
         device: target device
         checkpoint_override: override checkpoint path
-        quantization: optional quantization method ("int8", "int4", or None)
+        quantization: optional quantization method ("int8", "int4", "awq", "gptq", or None)
 
     Returns:
         loaded model on the correct device
@@ -385,25 +405,50 @@ def load_model_by_name(
     model = model_cls(config)
     model = model.to(dtype)
 
-    # Load weights — TP-aware sharding
+    # Resolve checkpoint path
     ckpt_path = checkpoint_override or entry.checkpoint
-    if ckpt_path:
+
+    # Auto-detect AWQ/GPTQ from checkpoint if quantization not explicitly set
+    effective_quant = quantization
+    if ckpt_path and effective_quant in (None, "none"):
+        detected = _detect_checkpoint_quantization(ckpt_path)
+        if detected is not None:
+            effective_quant = detected
+            if tp.tp_rank == 0:
+                print(f"  Auto-detected quantization: {detected}")
+
+    # Load weights — dispatch by quantization format
+    if ckpt_path and effective_quant in ("awq", "gptq"):
+        # Pre-quantized checkpoint: use AWQ/GPTQ loader
+        from vllm_i64.core.awq_gptq import load_awq_checkpoint, load_gptq_checkpoint
+
+        if effective_quant == "awq":
+            stats = load_awq_checkpoint(model, ckpt_path, device=device, dtype=dtype)
+        else:
+            stats = load_gptq_checkpoint(model, ckpt_path, device=device, dtype=dtype)
+
+        if tp.tp_rank == 0:
+            print(f"  Loaded {effective_quant.upper()} checkpoint: "
+                  f"{stats['quant_layers']} quantized layers, "
+                  f"{stats['non_quant_loaded']} non-quantized weights")
+    elif ckpt_path:
+        # Standard float checkpoint
         load_checkpoint(model, ckpt_path, dtype=dtype, device=device)
 
-    # Post-load quantization
-    if quantization and quantization != "none":
-        if quantization == "fp8":
+    # Post-load quantization (only for float checkpoints, not pre-quantized)
+    if effective_quant and effective_quant not in ("none", "awq", "gptq"):
+        if effective_quant == "fp8":
             _quantize_dense_mlp_fp8(model)
         else:
-            _quantize_experts(model, quantization)
-            _quantize_dense_mlp(model, quantization)
-            _quantize_attention(model, quantization)
-            _quantize_mu_attention(model, quantization)
-            _quantize_i64_dynamics(model, quantization)
-            _quantize_lm_head(model, quantization)
-            _quantize_rmsnorm(model, quantization)
+            _quantize_experts(model, effective_quant)
+            _quantize_dense_mlp(model, effective_quant)
+            _quantize_attention(model, effective_quant)
+            _quantize_mu_attention(model, effective_quant)
+            _quantize_i64_dynamics(model, effective_quant)
+            _quantize_lm_head(model, effective_quant)
+            _quantize_rmsnorm(model, effective_quant)
         if tp.tp_rank == 0:
-            print(f"  Quantized weights: {quantization}")
+            print(f"  Quantized weights: {effective_quant}")
 
     # Disable grad tracking — inference only, avoids autograd view conflicts
     # with quantized buffers that are views of original parameters.
