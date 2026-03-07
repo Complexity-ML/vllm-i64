@@ -122,27 +122,29 @@ def int8_linear_native(
 
     if use_int_mm:
         # Native INT8 matmul path — CPU (VNNI/AMX) or GPU (tensor cores)
-        # x_preq: pre-quantized (int8, scale) from fused RMSNorm+quant kernel
-        if x_preq is not None:
-            x_int8, x_scale = x_preq[0], x_preq[1]
-        else:
-            x_int8, x_scale = quantize_activations_int8(x_2d)
-        wt = weight_int8.t().contiguous()
-        # torch._int_mm requires size(0) > 16 on CUDA — pad if needed
-        m = x_int8.shape[0]
-        if x_int8.is_cuda and m <= 16:
-            pad = 17 - m
-            x_int8 = torch.nn.functional.pad(x_int8, (0, 0, 0, pad))
-            x_scale = torch.nn.functional.pad(x_scale, (0, pad))
-            result_i32 = torch._int_mm(x_int8, wt)
-            result_i32 = result_i32[:m]
-            x_scale = x_scale[:m]
-        else:
-            result_i32 = torch._int_mm(x_int8, wt)
-        out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
-        if bias is not None:
-            out = out + bias
-        return out.reshape(*orig_shape[:-1], out_features)
+        try:
+            if x_preq is not None:
+                x_int8, x_scale = x_preq[0], x_preq[1]
+            else:
+                x_int8, x_scale = quantize_activations_int8(x_2d)
+            wt = weight_int8.t().contiguous()
+            # torch._int_mm requires size(0) > 16 on CUDA — pad if needed
+            m = x_int8.shape[0]
+            if x_int8.is_cuda and m <= 16:
+                pad = 17 - m
+                x_int8 = torch.nn.functional.pad(x_int8, (0, 0, 0, pad))
+                x_scale = torch.nn.functional.pad(x_scale, (0, pad))
+                result_i32 = torch._int_mm(x_int8, wt)
+                result_i32 = result_i32[:m]
+                x_scale = x_scale[:m]
+            else:
+                result_i32 = torch._int_mm(x_int8, wt)
+            out = result_i32.float() * (x_scale.unsqueeze(1) * weight_scale.unsqueeze(0))
+            if bias is not None:
+                out = out + bias
+            return out.reshape(*orig_shape[:-1], out_features)
+        except RuntimeError:
+            pass  # cuBLAS INT8 not supported — fall through to fallbacks
 
     # GPU-only accelerated fallbacks
     if x.is_cuda:
