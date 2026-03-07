@@ -126,6 +126,8 @@ class KVTransfer:
         #          head_dim, block_size, first_token_id, max_new_tokens, eos_token_id]
         self._meta_size = 10
         self._meta_buf = torch.zeros(self._meta_size, dtype=torch.int64, device=device)
+        import threading
+        self._send_lock = threading.Lock()
 
         # Transfer stats (integer counters)
         self.transfers_completed: int = 0
@@ -143,6 +145,10 @@ class KVTransfer:
         Sends metadata header, then layer-by-layer KV block data.
         Uses non-blocking sends where possible for pipelining.
         """
+        with self._send_lock:
+            self._send_kv_locked(metadata, kv_cache)
+
+    def _send_kv_locked(self, metadata, kv_cache):
         t_start = time.perf_counter()
 
         # 1. Pack and send metadata
@@ -237,8 +243,11 @@ class KVTransfer:
         prompt_token_ids = prompt_tensor.cpu().tolist()
 
         # 4. Allocate blocks in decode-side KV cache
-        #    Use a sequential seq_id (request_id mod max_seqs is safe for 2-GPU case)
-        seq_id = request_id % kv_cache.max_seqs
+        #    Use incrementing counter to avoid modulo collisions
+        if not hasattr(self, '_next_seq_id'):
+            self._next_seq_id = 0
+        seq_id = self._next_seq_id % kv_cache.max_seqs
+        self._next_seq_id += 1
         decode_block_ids = kv_cache.allocate_blocks(seq_id, num_blocks)
 
         # 5. Receive and write KV data
@@ -651,7 +660,11 @@ class DecodeWorker:
             last_indices = []
             offset = 0
             for tpr in tpr_list:
-                last_indices.append(offset + tpr - 1)
+                idx = offset + tpr - 1
+                if idx >= logits.shape[0]:
+                    logger.error("Batch logits index %d >= shape %d, clamping", idx, logits.shape[0])
+                    idx = logits.shape[0] - 1
+                last_indices.append(idx)
                 offset += tpr
             logits = logits[last_indices]
 

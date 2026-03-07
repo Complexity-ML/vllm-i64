@@ -81,11 +81,11 @@ class PagedKVCache:
         # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
         # Layout matches flash_attn_with_kv_cache expectations
         self.k_caches = [
-            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=device)
+            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=self.device)
             for _ in range(num_layers)
         ]
         self.v_caches = [
-            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=device)
+            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=self.device)
             for _ in range(num_layers)
         ]
 

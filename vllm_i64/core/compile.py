@@ -35,7 +35,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch._dynamo")
 if _COMPILE_AVAILABLE:
     try:
         import torch._dynamo
-        torch._dynamo.config.suppress_errors = True
+        torch._dynamo.config.suppress_errors = False
     except (ImportError, AttributeError):
         pass
 

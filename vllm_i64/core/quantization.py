@@ -64,7 +64,7 @@ def _probe_int_mm_gpu() -> bool:
         torch._int_mm(a, b)
         _INT_MM_GPU_OK = True
         _logger.info("GPU INT8 _int_mm: supported")
-    except (RuntimeError, Exception):
+    except RuntimeError:
         _INT_MM_GPU_OK = False
         _logger.info("GPU INT8 _int_mm: not supported, using dequant fallback")
     return _INT_MM_GPU_OK
@@ -189,8 +189,10 @@ def int8_linear_native(
             if out is not None:
                 _log_int8_backend("Triton INT8x8→INT32 (native)")
                 return out.reshape(*orig_shape[:-1], out_features)
-        except (ImportError, Exception):
+        except ImportError:
             pass
+        except RuntimeError as e:
+            _logger.debug("Triton INT8 GEMM failed: %s", e)
         # Priority 2: CUDA I64_gemm_dequant_int8
         try:
             from vllm_i64.kernels.cuda import get_i64_cuda_ops
@@ -201,8 +203,10 @@ def int8_linear_native(
                     out = out + bias
                 _log_int8_backend("CUDA gemm_dequant_int8")
                 return out.reshape(*orig_shape[:-1], out_features)
-        except (ImportError, Exception):
+        except ImportError:
             pass
+        except RuntimeError as e:
+            _logger.debug("CUDA gemm_dequant_int8 failed: %s", e)
         # Priority 3: Triton fused dequant+GEMM
         try:
             from vllm_i64.kernels.triton.I64_fused_dequant_gemm import triton_dequant_gemm_int8
@@ -249,7 +253,9 @@ def int8_fused_gate_up_native(
     """
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
-    use_int_mm = _INT_MM_AVAILABLE and (x.is_cuda or _INT_MM_CPU_OK)
+    use_int_mm = _INT_MM_AVAILABLE and (
+        (x.is_cuda and _probe_int_mm_gpu()) or (not x.is_cuda and _INT_MM_CPU_OK)
+    )
 
     if use_int_mm:
         if x_preq is not None:

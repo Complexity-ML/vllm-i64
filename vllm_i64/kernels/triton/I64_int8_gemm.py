@@ -113,6 +113,12 @@ def triton_int8_gemm(
     if not (_TRITON and x_int8.is_cuda):
         return None
 
+    # tl.dot with INT8 inputs requires SM80+ (Ampere) for native INT8 tensor cores.
+    # On SM70/SM75, Triton may silently cast to FP16, giving incorrect results.
+    cap = torch.cuda.get_device_capability()
+    if cap[0] < 8:
+        return None
+
     M, K = x_int8.shape
     N = weight_int8_t.shape[1]
 

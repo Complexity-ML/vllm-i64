@@ -55,8 +55,11 @@ class JSONLogitsProcessor(LogitsProcessor):
     JSON_WHITESPACE = {ord(" "), ord("\n"), ord("\t"), ord("\r")}
     JSON_SPECIAL = {ord(":"), ord(","), ord('"')}
 
-    def __init__(self, tokenizer=None):
+    def __init__(self, tokenizer=None, eos_token_id: int = 2):
         self.tokenizer = tokenizer
+        self.eos_token_id = eos_token_id
+        if tokenizer and hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+            self.eos_token_id = tokenizer.eos_token_id
         self._depth: int = 0
         self._state: int = self.STATE_START
         self._in_string: bool = False
@@ -71,11 +74,11 @@ class JSONLogitsProcessor(LogitsProcessor):
 
         # If JSON is complete (depth back to 0 after opening), boost EOS
         if self._state == self.STATE_COMPLETE:
-            # Mask everything except EOS (token 0) and whitespace
+            eos_id = self.eos_token_id
             logits = logits.clone()
-            eos_logit = logits[..., 0].clone()
+            eos_logit = logits[..., eos_id].clone()
             logits.fill_(float("-inf"))
-            logits[..., 0] = eos_logit + 10.0  # Strongly prefer EOS
+            logits[..., eos_id] = eos_logit + 10.0  # Strongly prefer EOS
 
         return logits
 
@@ -131,9 +134,12 @@ class RegexLogitsProcessor(LogitsProcessor):
     can still lead to a full match. Mask tokens that make matching impossible.
     """
 
-    def __init__(self, pattern: str, tokenizer=None):
+    def __init__(self, pattern: str, tokenizer=None, eos_token_id: int = 2):
         self.pattern = re.compile(pattern)
         self.tokenizer = tokenizer
+        self.eos_token_id = eos_token_id
+        if tokenizer and hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+            self.eos_token_id = tokenizer.eos_token_id
         self._generated_text: str = ""
 
     def __call__(self, logits: torch.Tensor, generated_ids: List[int]) -> torch.Tensor:
@@ -141,21 +147,26 @@ class RegexLogitsProcessor(LogitsProcessor):
         if self.tokenizer and generated_ids:
             self._generated_text = self.tokenizer.decode(generated_ids)
 
+        eos_id = self.eos_token_id
+
         # If full match already achieved, boost EOS
         if self._generated_text and self.pattern.fullmatch(self._generated_text):
             logits = logits.clone()
-            eos_logit = logits[..., 0].clone()
+            eos_logit = logits[..., eos_id].clone()
             logits.fill_(float("-inf"))
-            logits[..., 0] = eos_logit + 10.0
+            logits[..., eos_id] = eos_logit + 10.0
         elif self.tokenizer and self._generated_text:
-            # Filter tokens whose addition breaks partial match possibility
-            # Use re.match on prefix to check if generation can still succeed
-            if not re.match(self.pattern.pattern[:len(self._generated_text) + 10],
-                            self._generated_text, re.DOTALL):
-                # Prefix already broken — force EOS to stop garbage
+            # Check if generated prefix can still lead to a full match
+            # Use re.match on the full pattern against the prefix
+            partial = re.match(self.pattern.pattern, self._generated_text, re.DOTALL)
+            if partial is None and not any(
+                re.fullmatch(self.pattern.pattern, self._generated_text + c, re.DOTALL)
+                for c in "abcdefghijklmnopqrstuvwxyz0123456789 {}[]\",:.\n"
+            ):
+                # Prefix is broken beyond repair — force EOS to stop garbage
                 logits = logits.clone()
                 logits.fill_(float("-inf"))
-                logits[..., 0] = 0.0
+                logits[..., eos_id] = 0.0
 
         return logits
 

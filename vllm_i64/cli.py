@@ -428,6 +428,12 @@ def main():
         parser.print_help()
         sys.exit(1)
 
+    # Validate --tp and --pp
+    if hasattr(args, 'tp') and args.tp < 1:
+        parser.error("--tp must be >= 1")
+    if hasattr(args, 'pp') and args.pp < 1:
+        parser.error("--pp must be >= 1")
+
     args.func(args)
 
 

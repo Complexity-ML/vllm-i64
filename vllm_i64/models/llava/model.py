@@ -179,14 +179,30 @@ class LlavaForConditionalGeneration(nn.Module):
 
             if new_len != orig_len:
                 # Rebuild positions for the expanded sequence
-                positions = torch.arange(new_len, device=positions.device, dtype=positions.dtype)
-
-                # Adjust tokens_per_seq if provided
-                if tokens_per_seq is not None:
-                    expansion = new_len - orig_len
-                    # Distribute expansion to the first sequence (simplification)
-                    tokens_per_seq = list(tokens_per_seq)
-                    tokens_per_seq[0] += expansion
+                if tokens_per_seq is not None and len(tokens_per_seq) > 1:
+                    # Multi-sequence batch: rebuild per-sequence positions
+                    # Count <image> tokens per sequence to distribute expansion correctly
+                    new_tokens_per_seq = list(tokens_per_seq)
+                    offset = 0
+                    for seq_idx, tps in enumerate(tokens_per_seq):
+                        seq_token_ids = token_ids[offset:offset + tps]
+                        n_img = (seq_token_ids == self.image_token_index).sum().item()
+                        expansion = n_img * (num_patches - 1) if n_img > 0 else 0
+                        new_tokens_per_seq[seq_idx] = tps + expansion
+                        offset += tps
+                    tokens_per_seq = new_tokens_per_seq
+                    # Rebuild positions per-sequence (each starts from 0)
+                    pos_parts = [
+                        torch.arange(tps, device=positions.device, dtype=positions.dtype)
+                        for tps in tokens_per_seq
+                    ]
+                    positions = torch.cat(pos_parts)
+                else:
+                    positions = torch.arange(new_len, device=positions.device, dtype=positions.dtype)
+                    if tokens_per_seq is not None:
+                        expansion = new_len - orig_len
+                        tokens_per_seq = list(tokens_per_seq)
+                        tokens_per_seq[0] += expansion
 
             # Run through decoder layers directly (skip embed_tokens)
             for layer_idx in range(self.language_model.start_layer, self.language_model.end_layer):

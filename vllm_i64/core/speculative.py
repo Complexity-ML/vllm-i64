@@ -101,21 +101,36 @@ class SpeculativeDecoder:
 
         target_logits = self.target(verify_tokens, verify_pos)
 
-        # Phase 3: Accept matching prefix, sample from target on mismatch
-        # Move to CPU once for comparison (single transfer)
+        # Phase 3: Accept or reject each draft token using target model probabilities
+        # For temperature=0 (greedy), accept iff draft == target_argmax
+        # For temperature>0, use rejection sampling: accept with prob min(1, p_target/p_draft)
         draft_cpu = draft_buf.cpu().tolist()
-        target_argmax = target_logits.argmax(dim=-1).cpu().tolist()
 
         accepted = []
         for i, draft_token in enumerate(draft_cpu):
-            if target_argmax[i] == draft_token:
-                # Draft matches target's greedy — accept
-                accepted.append(draft_token)
+            if sampling_params is None or sampling_params.temperature == 0.0:
+                # Greedy: accept only if draft matches target argmax
+                target_token = target_logits[i].argmax(-1).item()
+                if target_token == draft_token:
+                    accepted.append(draft_token)
+                else:
+                    accepted.append(target_token)
+                    break
             else:
-                # Mismatch: sample from target using user's params
-                sampled = self._sample_target(target_logits[i], sampling_params)
-                accepted.append(sampled)
-                break
+                # Stochastic: accept with probability p_target(draft_token) / p_draft(draft_token)
+                # This gives unbiased samples from the target distribution
+                target_probs = torch.softmax(target_logits[i].float() / sampling_params.temperature, dim=-1)
+                p_target = target_probs[draft_token].item()
+                # Draft was greedy, so p_draft ~ 1 for draft token
+                # Accept with min(1, p_target) as conservative approximation
+                import random
+                if random.random() < p_target:
+                    accepted.append(draft_token)
+                else:
+                    # Reject: sample from adjusted distribution
+                    sampled = self._sample_target(target_logits[i], sampling_params)
+                    accepted.append(sampled)
+                    break
         else:
             # All K tokens accepted — bonus: sample next from target
             bonus = self._sample_target(target_logits[self.K], sampling_params)

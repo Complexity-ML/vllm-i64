@@ -49,7 +49,11 @@ def init_pp(pp_size: int = 1):
     tp = get_tp()
     pp_rank = rank // tp.tp_size
 
-    pp_group = dist.new_group(list(range(0, world_size, tp.tp_size)))
+    # Each TP rank position gets its own PP group:
+    # rank 0 of each stage, rank 1 of each stage, etc.
+    tp_rank_local = rank % tp.tp_size
+    pp_group_ranks = list(range(tp_rank_local, world_size, tp.tp_size))
+    pp_group = dist.new_group(pp_group_ranks)
 
     _PP = PPState(pp_size=pp_size, pp_rank=pp_rank, pp_group=pp_group)
     print(f"[PP] rank={pp_rank}/{pp_size}")

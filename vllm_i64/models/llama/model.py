@@ -56,7 +56,12 @@ class LlamaAttention(nn.Module):
         self.tp_size = tp.tp_size
 
         self.num_heads_per_tp = self.num_heads // tp.tp_size
-        self.num_kv_heads_per_tp = self.num_kv_heads // tp.tp_size
+        # GQA: when num_kv_heads < tp_size, replicate KV heads across TP ranks
+        if self.num_kv_heads >= tp.tp_size:
+            self.num_kv_heads_per_tp = self.num_kv_heads // tp.tp_size
+        else:
+            # Each TP rank gets all KV heads (replicated, not sharded)
+            self.num_kv_heads_per_tp = self.num_kv_heads
         self.num_kv_groups = self.num_heads_per_tp // max(self.num_kv_heads_per_tp, 1)
 
         has_bias = getattr(config, 'attention_bias', False)
@@ -565,9 +570,17 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         kv_cache,
         seq_ids_tensor: torch.Tensor,
+        intermediate_tensors=None,
     ) -> torch.Tensor:
-        """CUDA-graph compatible decode path."""
-        hidden = self.embed_tokens(token_ids.long())
+        """CUDA-graph compatible decode path with PP support."""
+        from vllm_i64.parallel.pipeline_parallel import is_first_pp_rank, is_last_pp_rank
+        from vllm_i64.parallel.pp_utils import IntermediateTensors
+
+        if is_first_pp_rank():
+            hidden = self.embed_tokens(token_ids.long())
+        else:
+            assert intermediate_tensors is not None
+            hidden = intermediate_tensors["hidden_states"]
 
         for layer_idx in range(self.start_layer, self.end_layer):
             hidden = self.layers[layer_idx].decode_step(
@@ -576,6 +589,9 @@ class LlamaForCausalLM(nn.Module):
                 layer_idx=layer_idx,
                 seq_ids_tensor=seq_ids_tensor,
             )
+
+        if not is_last_pp_rank():
+            return IntermediateTensors({"hidden_states": hidden})
 
         hidden = self.norm(hidden)
 

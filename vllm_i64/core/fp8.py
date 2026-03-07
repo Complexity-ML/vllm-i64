@@ -36,8 +36,16 @@ _SCALED_MM_AVAILABLE = False
 try:
     _FP8_DTYPE = torch.float8_e4m3fn
     if hasattr(torch, '_scaled_mm'):
-        _SCALED_MM_AVAILABLE = True
-except AttributeError:
+        # _scaled_mm per-row/per-col scales require PyTorch >= 2.4
+        _pt_version = tuple(int(x) for x in torch.__version__.split('.')[:2])
+        if _pt_version >= (2, 4):
+            _SCALED_MM_AVAILABLE = True
+        else:
+            logging.getLogger("vllm_i64.fp8").info(
+                "torch._scaled_mm found but PyTorch %s < 2.4 — per-row scales not supported, disabling",
+                torch.__version__,
+            )
+except (AttributeError, ValueError):
     pass
 
 

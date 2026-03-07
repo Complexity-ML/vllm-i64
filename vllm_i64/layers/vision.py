@@ -54,7 +54,8 @@ class VisionEncoder(nn.Module):
 
         if freeze_vision:
             self.vision_tower.requires_grad_(False)
-            logger.info("Vision tower frozen: %s", vision_tower_name)
+            self.vision_tower.eval()
+            logger.info("Vision tower frozen + eval mode: %s", vision_tower_name)
 
         # Build projector: vision_hidden_size → hidden_size
         self.mm_projector = self._build_projector(

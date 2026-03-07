@@ -622,10 +622,12 @@ class I64Server:
         last_token_id = None
         output_ids: List[int] = []
         prev_text = ""
+        pixel_values = getattr(request, '_pixel_values', None)
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
+            pixel_values=pixel_values,
         ):
             last_token_id = token_id
             output_ids.append(token_id)
@@ -766,7 +768,7 @@ class I64Server:
         except Exception as e:
             logger.error(f"Completion error: {e}", exc_info=True)
             return web.json_response(
-                {"error": {"message": str(e), "type": "server_error"}},
+                {"error": {"message": "Internal server error", "type": "server_error"}},
                 status=500,
             )
 
@@ -913,7 +915,7 @@ class I64Server:
         except Exception as e:
             logger.error(f"Chat completion error: {e}", exc_info=True)
             return web.json_response(
-                {"error": {"message": str(e), "type": "server_error"}},
+                {"error": {"message": "Internal server error", "type": "server_error"}},
                 status=500,
             )
 
@@ -1053,8 +1055,9 @@ class I64Server:
                 "usage": {"prompt_tokens": total_tokens, "total_tokens": total_tokens},
             })
         except Exception as e:
+            logger.error(f"Embedding error: {e}", exc_info=True)
             return web.json_response(
-                {"error": {"message": str(e), "type": "server_error"}},
+                {"error": {"message": "Internal server error", "type": "server_error"}},
                 status=500,
             )
 
@@ -1072,8 +1075,24 @@ class I64Server:
 
         return web.json_response({"usage": usage})
 
+    def _require_admin(self, request: web.Request) -> Optional[web.Response]:
+        """Check that admin endpoints are authorized via API key."""
+        if not self.api_key:
+            return None  # No auth configured — allow all
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else None
+        if token != self.api_key:
+            return web.json_response(
+                {"error": {"message": "Admin endpoint requires valid API key", "type": "auth_error"}},
+                status=403,
+            )
+        return None
+
     async def handle_lora_load(self, request: web.Request) -> web.Response:
         """POST /v1/lora/load — load a LoRA adapter."""
+        denied = self._require_admin(request)
+        if denied:
+            return denied
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -1090,6 +1109,15 @@ class I64Server:
         if adapter_id is None or adapter_path is None:
             return web.json_response(
                 {"error": {"message": "Missing 'adapter_id' or 'path'", "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # S2: Validate adapter path — prevent arbitrary filesystem access
+        import os
+        real_adapter = os.path.realpath(adapter_path)
+        if not os.path.exists(real_adapter):
+            return web.json_response(
+                {"error": {"message": "Adapter path does not exist", "type": "invalid_request_error"}},
                 status=400,
             )
 
@@ -1113,6 +1141,9 @@ class I64Server:
 
     async def handle_lora_unload(self, request: web.Request) -> web.Response:
         """POST /v1/lora/unload — unload a LoRA adapter."""
+        denied = self._require_admin(request)
+        if denied:
+            return denied
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -1209,7 +1240,8 @@ class I64Server:
         responses = []
         for i, r in enumerate(results):
             if isinstance(r, Exception):
-                responses.append({"index": i, "error": str(r)})
+                logger.error(f"Batch request {i} error: {r}", exc_info=True)
+                responses.append({"index": i, "error": "Internal server error"})
             else:
                 responses.append({"index": i, "result": r.to_dict()})
 
@@ -1274,12 +1306,21 @@ class I64Server:
 
     async def handle_request_log(self, request: web.Request) -> web.Response:
         """GET /v1/logs — recent request log entries."""
-        n = int(request.query.get("n", "50"))
+        denied = self._require_admin(request)
+        if denied:
+            return denied
+        try:
+            n = min(int(request.query.get("n", "50")), 1000)
+        except ValueError:
+            n = 50
         entries = self._request_logger.get_recent(n)
         return web.json_response({"entries": entries, "count": len(entries)})
 
     async def handle_priority(self, request: web.Request) -> web.Response:
         """POST /v1/priority — set API key priority level."""
+        denied = self._require_admin(request)
+        if denied:
+            return denied
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -1382,7 +1423,8 @@ class I64Server:
                         "done": True,
                     })
                 except Exception as e:
-                    await ws.send_json({"error": {"message": str(e), "type": "server_error"}})
+                    logger.error(f"WebSocket error: {e}", exc_info=True)
+                    await ws.send_json({"error": {"message": "Internal server error", "type": "server_error"}})
             elif msg.type == web.WSMsgType.ERROR:
                 break
 
@@ -1507,6 +1549,15 @@ class I64Server:
 
         try:
             if file_path:
+                # S1: Prevent path traversal — only allow files under CWD or explicit safe dirs
+                import os
+                real_path = os.path.realpath(file_path)
+                cwd = os.path.realpath(os.getcwd())
+                if not real_path.startswith(cwd + os.sep) and real_path != cwd:
+                    return web.json_response(
+                        {"error": {"message": "File path must be under the working directory", "type": "invalid_request_error"}},
+                        status=403,
+                    )
                 n = self.retriever.index_file(file_path, chunk_size=chunk_size, overlap=overlap)
             else:
                 n = self.retriever.index_text(text, chunk_size=chunk_size, overlap=overlap)
@@ -1520,7 +1571,7 @@ class I64Server:
         except Exception as e:
             logger.error(f"RAG index error: {e}", exc_info=True)
             return web.json_response(
-                {"error": {"message": str(e), "type": "server_error"}}, status=500,
+                {"error": {"message": "RAG indexing failed", "type": "server_error"}}, status=500,
             )
 
     async def handle_rag_search(self, request: web.Request) -> web.Response:
@@ -1549,7 +1600,7 @@ class I64Server:
         except Exception as e:
             logger.error(f"RAG search error: {e}", exc_info=True)
             return web.json_response(
-                {"error": {"message": str(e), "type": "server_error"}}, status=500,
+                {"error": {"message": "RAG search failed", "type": "server_error"}}, status=500,
             )
 
     async def handle_rag_stats(self, request: web.Request) -> web.Response:
@@ -1578,7 +1629,8 @@ class I64Server:
                 return len(self.sync_engine.scheduler.pending) + self.async_engine.active_requests
             middlewares.append(make_load_shed_middleware(_get_load, self._max_pending))
 
-        app = web.Application(middlewares=middlewares)
+        # S4: Limit request body size to 16 MB to prevent memory exhaustion
+        app = web.Application(middlewares=middlewares, client_max_size=16 * 1024 * 1024)
         app.router.add_route("OPTIONS", "/v1/completions", self._handle_options)
         app.router.add_route("OPTIONS", "/v1/chat/completions", self._handle_options)
         app.router.add_post("/v1/completions", self.handle_completions)

@@ -79,6 +79,7 @@ class CUDAGraphRunner:
                     static_in["expert_ids"],
                 )
         torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
 
         # Capture
         graph = torch.cuda.CUDAGraph()
@@ -143,7 +144,8 @@ class CUDAGraphRunner:
         # Replay captured graph
         self.graphs[graph_size].replay()
 
-        return self.static_outputs[graph_size][:batch_size]
+        # Clone to prevent next replay from overwriting this output
+        return self.static_outputs[graph_size][:batch_size].clone()
 
     @property
     def is_captured(self) -> bool:

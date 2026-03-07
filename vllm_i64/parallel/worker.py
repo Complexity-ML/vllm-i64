@@ -81,7 +81,7 @@ def _run_serve(args: list, tp, pp):
 
     engine = I64Engine(
         model=model,
-        num_experts=model.config.num_experts,
+        num_experts=getattr(model.config, 'num_experts', 1),
         vocab_size=model.config.vocab_size,
         device=tp.device,
     )

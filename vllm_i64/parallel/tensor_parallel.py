@@ -55,7 +55,8 @@ def init_distributed(tp_size: int = 1, backend: str = "nccl"):
     rank = dist.get_rank()
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device = f"cuda:{local_rank}"
-    torch.cuda.set_device(device)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
 
     # Each PP stage gets its own TP group: ranks [stage*tp, (stage+1)*tp)
     world_size = dist.get_world_size()
@@ -95,6 +96,8 @@ class ColumnParallelLinear(nn.Module):
         super().__init__()
         tp = get_tp()
         self.tp_size = tp.tp_size
+        if out_features % tp.tp_size != 0:
+            raise ValueError(f"out_features ({out_features}) not divisible by tp_size ({tp.tp_size})")
         self.out_per_rank = out_features // tp.tp_size
         self.linear = nn.Linear(in_features, self.out_per_rank, bias=bias)
 
@@ -122,13 +125,19 @@ class RowParallelLinear(nn.Module):
         super().__init__()
         tp = get_tp()
         self.tp_size = tp.tp_size
+        if in_features % tp.tp_size != 0:
+            raise ValueError(f"in_features ({in_features}) not divisible by tp_size ({tp.tp_size})")
         self.in_per_rank = in_features // tp.tp_size
-        self.linear = nn.Linear(self.in_per_rank, out_features, bias=bias)
+        # Bias is applied after all-reduce to avoid double-counting
+        self.linear = nn.Linear(self.in_per_rank, out_features, bias=False)
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.linear(x)
         if self.tp_size > 1:
             dist.all_reduce(out, group=get_tp().tp_group)
+        if self.bias is not None:
+            out = out + self.bias
         return out
 
     def load_full_weight(self, full_weight: torch.Tensor, full_bias: Optional[torch.Tensor] = None):
@@ -137,11 +146,12 @@ class RowParallelLinear(nn.Module):
         start = tp.tp_rank * self.in_per_rank
         end = start + self.in_per_rank
         self.linear.weight.data.copy_(full_weight[:, start:end])
-        if full_bias is not None and self.linear.bias is not None:
+        # Bias is applied after all-reduce, so only load on rank 0
+        if full_bias is not None and self.bias is not None:
             if tp.tp_rank == 0:
-                self.linear.bias.data.copy_(full_bias)
+                self.bias.data.copy_(full_bias)
             else:
-                self.linear.bias.data.zero_()
+                self.bias.data.zero_()
 
 
 # =========================================================================
@@ -162,6 +172,11 @@ def shard_expert_weights(
         return gate_up, down
 
     full_inter = gate_up.shape[2] // 2
+    if full_inter % tp.tp_size != 0:
+        raise ValueError(
+            f"Expert intermediate_size ({full_inter}) not divisible by tp_size ({tp.tp_size}). "
+            f"Choose a tp_size that evenly divides {full_inter}."
+        )
     per_tp = full_inter // tp.tp_size
     offset = tp.tp_rank * per_tp
 

@@ -22,11 +22,14 @@ INL - 2025
 """
 
 import heapq
+import logging
 import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from enum import IntEnum
+
+_logger = logging.getLogger("vllm_i64.scheduler")
 
 
 class RequestStatus(IntEnum):
@@ -487,6 +490,18 @@ class I64Scheduler:
                     new_blocks = self._allocate_kv_blocks(deficit)
                     if new_blocks:
                         req.kv_block_ids.extend(new_blocks)
+                    else:
+                        # Cannot allocate KV blocks — try preemption, then stop generation
+                        if self._try_preempt(deficit):
+                            new_blocks = self._allocate_kv_blocks(deficit)
+                            if new_blocks:
+                                req.kv_block_ids.extend(new_blocks)
+                            else:
+                                _logger.warning("KV block allocation failed for request %d after preemption", req.request_id)
+                                req.is_finished = True
+                        else:
+                            _logger.warning("KV block allocation failed for request %d (no blocks free)", req.request_id)
+                            req.is_finished = True
 
     def get_stats(self) -> Dict[str, int]:
         """Stats — all integer values."""

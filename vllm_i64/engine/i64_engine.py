@@ -1353,6 +1353,7 @@ class AsyncI64Engine:
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
         sampling_params: Optional[SamplingParams] = None,
+        pixel_values=None,
     ):
         """
         Submit a request and yield tokens as they are generated.
@@ -1360,6 +1361,7 @@ class AsyncI64Engine:
         request_id = self.engine.add_request(
             prompt_token_ids, max_new_tokens,
             sampling_params=sampling_params,
+            pixel_values=pixel_values,
         )
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1

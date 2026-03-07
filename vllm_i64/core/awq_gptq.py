@@ -368,6 +368,9 @@ def load_awq_checkpoint(
         unpacked_w = _unpack_awq_qweight(qweight)
         if qzeros is not None:
             unpacked_z = _unpack_awq_qzeros(qzeros)
+            # AWQ convention: stored zeros need +1 offset correction
+            # AutoAWQ subtracts 1 during packing, so we add it back
+            unpacked_z = (unpacked_z + 1).clamp(0, 15).to(torch.uint8)
         else:
             # No zero points — use 8 (midpoint for unsigned 4-bit)
             num_groups = scales.shape[0]
@@ -381,13 +384,14 @@ def load_awq_checkpoint(
         # AWQ uses names like "model.layers.0.self_attn.q_proj.qweight"
         # We need to find the corresponding module and register INT4 buffers
         layer_name = prefix.rstrip(".")
-        _assign_int4_to_module(model, layer_name, packed, s, z, group_size, device)
+        # Load bias if present
+        bias_key = prefix + "bias"
+        bias_tensor = state_dict.get(bias_key)
+        _assign_int4_to_module(model, layer_name, packed, s, z, group_size, device, bias=bias_tensor)
 
         loaded_keys.update([qweight_key, scales_key])
         if qzeros_key in state_dict:
             loaded_keys.add(qzeros_key)
-        # Mark bias as loaded too if present
-        bias_key = prefix + "bias"
         if bias_key in state_dict:
             loaded_keys.add(bias_key)
         quant_layers += 1
@@ -529,8 +533,9 @@ def load_gptq_checkpoint(
 
         if qzeros is not None:
             unpacked_z = _unpack_gptq_qzeros(qzeros)
-            # GPTQ symmetric: stored zeros are offset by 1 in some implementations
-            # The actual zero point is stored as (zero + 1) in some GPTQ versions
+            # GPTQ convention: stored zeros are offset by 1 in most implementations
+            # The actual zero point = stored_value + 1
+            unpacked_z = (unpacked_z + 1).clamp(0, 15).to(torch.uint8)
         else:
             # Symmetric quantization — zero point at midpoint
             unpacked_z = torch.full(
@@ -547,14 +552,15 @@ def load_gptq_checkpoint(
 
         # Assign to model
         layer_name = prefix.rstrip(".")
-        _assign_int4_to_module(model, layer_name, packed, s, z, group_size, device)
+        bias_key = prefix + "bias"
+        bias_tensor = state_dict.get(bias_key)
+        _assign_int4_to_module(model, layer_name, packed, s, z, group_size, device, bias=bias_tensor)
 
         loaded_keys.update([qweight_key, scales_key])
         if qzeros_key in state_dict:
             loaded_keys.add(qzeros_key)
         if g_idx_key in state_dict:
             loaded_keys.add(g_idx_key)
-        bias_key = prefix + "bias"
         if bias_key in state_dict:
             loaded_keys.add(bias_key)
         quant_layers += 1
@@ -646,6 +652,7 @@ def _assign_int4_to_module(
     zeros: torch.Tensor,
     group_size: int,
     device: str,
+    bias: Optional[torch.Tensor] = None,
 ):
     """
     Register INT4 quantized buffers on the appropriate model module.
@@ -654,8 +661,7 @@ def _assign_int4_to_module(
       - {leaf}_int4: packed uint8 weights
       - {leaf}_scale_int4: per-group scales
       - {leaf}_zero: per-group zero points
-
-    Also loads bias if present in the state dict.
+      - {leaf}_bias: bias tensor (if provided)
 
     Args:
         model: the model
@@ -665,6 +671,7 @@ def _assign_int4_to_module(
         zeros:  (out, groups) float
         group_size: group size
         device: target device
+        bias: optional bias tensor
     """
     module, resolved_name = _resolve_module_name(model, layer_name)
 
@@ -687,6 +694,10 @@ def _assign_int4_to_module(
     parent.register_buffer(f"{leaf}_int4", packed.to(device))
     parent.register_buffer(f"{leaf}_scale_int4", scales.to(device))
     parent.register_buffer(f"{leaf}_zero", zeros.to(device))
+
+    # Load bias if provided
+    if bias is not None:
+        parent.register_buffer(f"{leaf}_bias", bias.to(device).float())
 
     # Store group_size as attribute for int4_linear() calls
     if not hasattr(parent, "_int4_group_size"):
