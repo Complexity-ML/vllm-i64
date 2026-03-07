@@ -130,6 +130,10 @@ _COMPLEXITY_I64 = (
     "vllm_i64.models.complexity_deep.model.ComplexityDeepModel",
     "vllm_i64.models.complexity_i64.config.ComplexityI64Config",
 )
+_LLAVA = (
+    "vllm_i64.models.llava.model.LlavaForConditionalGeneration",
+    "vllm_i64.models.llava.config.LlavaConfig",
+)
 
 # Map: HF architectures string → (model_class, config_loader)
 # Each model imported one by one.
@@ -155,6 +159,9 @@ _ARCHITECTURE_MAP: Dict[str, Tuple[str, str]] = {
     "DeepForCausalLM": _COMPLEXITY_DEEP,
     # --- i64 integer-native ---
     "I64ForCausalLM": _COMPLEXITY_I64,
+    # --- Vision-Language Models ---
+    "LlavaForConditionalGeneration": _LLAVA,
+    "LlavaNextForConditionalGeneration": _LLAVA,
 }
 
 
@@ -288,4 +295,13 @@ register_model(
     model_class=_COMPLEXITY_I64[0],
     config_loader=_COMPLEXITY_I64[1],
     description="Complexity-I64 integer-native model — use --checkpoint to specify model",
+)
+
+# --- Vision-Language Models ---
+
+register_model(
+    name="llava",
+    model_class=_LLAVA[0],
+    config_loader=_LLAVA[1],
+    description="LLaVA vision-language model — use --checkpoint for HF dir",
 )

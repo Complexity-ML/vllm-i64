@@ -206,6 +206,9 @@ class I64Engine:
         # === LoRA Manager ===
         self._lora_manager = None
 
+        # === VLM pixel_values (per-request, consumed on prefill) ===
+        self._request_pixel_values: Dict[int, object] = {}
+
     def _init_kv_cache(self, max_seqs: int):
         """Initialize paged KV cache from model config."""
         from vllm_i64.core.kv_cache import PagedKVCache
@@ -446,6 +449,7 @@ class I64Engine:
         max_new_tokens: int = 256,
         timeout_s: Optional[float] = None,
         sampling_params: Optional[SamplingParams] = None,
+        pixel_values: Optional[object] = None,
     ) -> int:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
@@ -525,6 +529,10 @@ class I64Engine:
                                 req.seq_pos = reused
                                 break
                         logger.info(f"Prefix cache hit: reused {reused} tokens for request {request_id}")
+
+        # Store pixel_values for VLM prefill (consumed and freed after first forward)
+        if pixel_values is not None:
+            self._request_pixel_values[request_id] = pixel_values
 
         return request_id
 
@@ -664,6 +672,7 @@ class I64Engine:
             self._request_processors.pop(rid, None)
             self._request_deadlines.pop(rid, None)
             self._request_logprobs.pop(rid, None)
+            self._request_pixel_values.pop(rid, None)
             self.scheduler._tokens_generated_per_req.pop(rid, None)
             # Clean up merge group
             if self._merge_enabled:
@@ -1052,13 +1061,31 @@ class I64Engine:
                 for sid in seq_ids:
                     self.kv_cache._touch(sid)
             else:
-                logits = self.model(
+                # Collect pixel_values for VLM prefill requests
+                pixel_values = None
+                if batch.is_prefill.any() and self._request_pixel_values:
+                    import torch as _torch
+                    pv_list = []
+                    for rid in batch.request_ids:
+                        rid_int = int(rid)
+                        if rid_int in self._request_pixel_values:
+                            pv = self._request_pixel_values.pop(rid_int)
+                            pv_list.append(pv)
+                    if pv_list:
+                        pixel_values = _torch.cat(pv_list, dim=0).to(self.device)
+
+                # Pass pixel_values if model supports it (VLM)
+                fwd_kwargs = dict(
                     token_ids=token_ids,
                     positions=positions,
                     kv_cache=self.kv_cache,
                     seq_ids=seq_ids,
                     tokens_per_seq=tokens_per_seq,
                 )
+                if pixel_values is not None and hasattr(self.model, 'vision_encoder'):
+                    fwd_kwargs["pixel_values"] = pixel_values
+
+                logits = self.model(**fwd_kwargs)
 
         return logits
 
@@ -1067,11 +1094,13 @@ class I64Engine:
         prompt_token_ids: List[int],
         max_new_tokens: int = 256,
         sampling_params: Optional[SamplingParams] = None,
+        pixel_values: Optional[object] = None,
     ) -> GenerationResult:
         """Synchronous generation for a single request."""
         request_id = self.add_request(
             prompt_token_ids, max_new_tokens,
             sampling_params=sampling_params,
+            pixel_values=pixel_values,
         )
 
         metrics_start = None
@@ -1290,6 +1319,7 @@ class AsyncI64Engine:
         max_new_tokens: int = 256,
         sampling_params: Optional[SamplingParams] = None,
         timeout_s: Optional[float] = None,
+        pixel_values: Optional[object] = None,
     ) -> GenerationResult:
         """
         Submit a request and wait for completion.
@@ -1308,6 +1338,7 @@ class AsyncI64Engine:
         request_id = self.engine.add_request(
             prompt_token_ids, max_new_tokens, timeout_s=timeout_s,
             sampling_params=sampling_params,
+            pixel_values=pixel_values,
         )
         self._pending_futures[request_id] = future
         self._request_times[request_id] = time.perf_counter()

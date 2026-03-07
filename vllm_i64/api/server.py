@@ -320,12 +320,79 @@ class I64Server:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._tokenize_pool, self._detokenize, token_ids)
 
+    @staticmethod
+    def _extract_content_text(content) -> str:
+        """
+        Extract text from a message content field.
+
+        Supports both string content and multimodal array content:
+          - "hello" → "hello"
+          - [{"type": "text", "text": "hello"}, {"type": "image_url", ...}]
+            → "<image>\nhello"
+        """
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "image_url":
+                    parts.append("<image>")
+            return "\n".join(parts) if parts else ""
+        return str(content) if content else ""
+
+    @staticmethod
+    def _extract_images_from_messages(messages: List[Dict]) -> list:
+        """
+        Extract base64-encoded images from multimodal message content.
+
+        Returns a list of PIL.Image.Image objects decoded from
+        data:image/...;base64,... URLs.
+        """
+        images = []
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if item.get("type") != "image_url":
+                    continue
+                image_url = item.get("image_url", {})
+                url = image_url.get("url", "") if isinstance(image_url, dict) else ""
+                if not url:
+                    continue
+                try:
+                    if url.startswith("data:"):
+                        # Parse data URI: data:image/png;base64,iVBOR...
+                        import base64
+                        import io
+                        from PIL import Image
+                        # Split off the header
+                        header, b64_data = url.split(",", 1)
+                        image_bytes = base64.b64decode(b64_data)
+                        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                        images.append(image)
+                    else:
+                        logger.warning("Non-base64 image URLs not supported: %s...", url[:60])
+                except Exception as e:
+                    logger.error("Failed to decode image: %s", e)
+        return images
+
     def _apply_chat_template(self, messages: List[Dict]) -> str:
         """Apply chat template to messages → prompt string."""
+        # Normalize multimodal content to text (with <image> placeholders)
+        normalized = []
+        for msg in messages:
+            normalized.append({
+                "role": msg.get("role", "user"),
+                "content": self._extract_content_text(msg.get("content", "")),
+            })
+
         if self.chat_template:
             from jinja2 import Template
             tmpl = Template(self.chat_template)
-            prompt = tmpl.render(messages=messages, add_generation_prompt=True)
+            prompt = tmpl.render(messages=normalized, add_generation_prompt=True)
             # Ensure the generation prompt is present (template may not handle add_generation_prompt)
             if not prompt.rstrip().endswith("Assistant:"):
                 prompt = prompt.rstrip("\n") + "\n\nAssistant:"
@@ -333,12 +400,49 @@ class I64Server:
             return prompt
         parts = []
         role_map = {"system": "System", "user": "User", "assistant": "Assistant"}
-        for msg in messages:
+        for msg in normalized:
             role = role_map.get(msg.get("role", "user"), "User")
             content = msg.get("content", "")
             parts.append(f"{role}: {content}")
         parts.append("Assistant:")
         return "\n\n".join(parts)
+
+    def _preprocess_images(self, images: list) -> "torch.Tensor":
+        """
+        Preprocess PIL images for the vision encoder.
+
+        If the model has a vision encoder, uses its image processor.
+        Otherwise falls back to a basic CLIP-compatible transform.
+
+        Args:
+            images: list of PIL.Image.Image objects.
+
+        Returns:
+            pixel_values: tensor of shape (N, C, H, W).
+        """
+        import torch
+
+        # Try to use the model's vision encoder processor
+        model = getattr(self.sync_engine, 'model', None)
+        if model is not None and hasattr(model, 'vision_encoder') and model.vision_encoder is not None:
+            pixel_values_list = []
+            for img in images:
+                pv = model.vision_encoder.preprocess_image(img)
+                pixel_values_list.append(pv)
+            return torch.cat(pixel_values_list, dim=0)
+
+        # Fallback: basic resize + normalize (CLIP-compatible)
+        from torchvision import transforms
+        transform = transforms.Compose([
+            transforms.Resize((336, 336)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711],
+            ),
+        ])
+        pixel_values_list = [transform(img).unsqueeze(0) for img in images]
+        return torch.cat(pixel_values_list, dim=0)
 
     @staticmethod
     def _chat_stop_sequences(user_stop: Optional[List[str]] = None) -> List[str]:
@@ -396,10 +500,14 @@ class I64Server:
         t0 = time.monotonic()
         prompt_ids = await self._tokenize_async(request.prompt)
 
+        # Pass pixel_values for VLM requests
+        pixel_values = getattr(request, '_pixel_values', None)
+
         result = await self.async_engine.generate(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
+            pixel_values=pixel_values,
         )
 
         # Debug: log prompt and output tokens for short generations (helps diagnose early-EOS)
@@ -680,9 +788,21 @@ class I64Server:
             )
         prompt = self._apply_chat_template(messages)
 
+        # Extract images from multimodal content (if any)
+        images = self._extract_images_from_messages(messages)
+        pixel_values = None
+        if images:
+            pixel_values = self._preprocess_images(images)
+            logger.info(
+                "[VLM] Extracted %d image(s), pixel_values shape: %s",
+                len(images), pixel_values.shape if pixel_values is not None else "none",
+            )
+
         # RAG context injection (opt-in via "rag": true in request body)
         if body.get("rag") and self.rag_enabled and self.retriever is not None:
             user_query = messages[-1].get("content", "") if messages else ""
+            if isinstance(user_query, list):
+                user_query = self._extract_content_text(user_query)
             if user_query:
                 rag_k = body.get("rag_k", 3)
                 context = self.retriever.get_context(user_query, k=rag_k)
@@ -712,6 +832,8 @@ class I64Server:
             priority=body.get("priority", 0),
             suppress_first_tokens=self._space_suppress_ids,
         )
+        # Attach pixel_values for VLM — will be passed to engine
+        req._pixel_values = pixel_values
 
         # Validate
         error = req.validate(max_seq_len=self.sync_engine.scheduler.max_seq_len)
