@@ -1,65 +1,53 @@
 """
 vllm-i64 :: Agentics — ReAct Agent
 
-ReAct loop: Thought → Action → Observation → repeat.
-Connects to a local vllm-i64 server via OpenAI-compatible API.
+ReAct loop with native OpenAI tool_calls format.
+Supports parallel tool execution within a single step.
 
-Usage:
-    agent = Agent(base_url="http://localhost:8000")
-    agent.run("Create a Python script that ...")
+Modes:
+  - agent.run("task")          — autonomous task completion
+  - agent.chat("message")     — single-turn chat
+  - agent.interactive()       — REPL with tool use
+  - await agent.arun("task")  — async version of run()
 
 INL - 2025
 """
 
-import re
+import asyncio
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
-from .client import I64Client
-from .tools import Tool, get_tools, tools_description, execute_tool
+from .client import I64Client, ChatMessage
+from .tools import (
+    Tool, get_tools, tools_to_openai,
+    execute_tool_call, execute_tools_parallel,
+)
 
 _logger = logging.getLogger("vllm_i64.agentics.agent")
 
 SYSTEM_PROMPT = """\
 You are an autonomous AI agent powered by pacific-prime. You solve tasks step by step.
 
-You have access to these tools:
-{tools}
+You have access to tools. When you need information or want to take action, call one or more tools.
+You can call multiple tools in parallel when they are independent.
 
-To use a tool, output EXACTLY this format (one tool per step):
-```tool
-{{"tool": "tool_name", "args": "arguments"}}
-```
-
-After a tool executes, you'll see its output as an Observation.
-Then continue reasoning with another Thought, or give your final Answer.
-
-Format:
-Thought: <your reasoning>
-Action:
-```tool
-{{"tool": "...", "args": "..."}}
-```
-
-When done, output:
-Answer: <your final response to the user>
+When the task is complete, respond with your final answer as plain text (no tool calls).
 
 Rules:
-- One tool call per step
-- Always think before acting
+- Think before acting
+- Call multiple independent tools at once for efficiency
 - If a tool fails, try a different approach
-- Give a clear Answer when the task is complete"""
-
-# Regex to extract tool calls
-_TOOL_PATTERN = re.compile(
-    r"```tool\s*\n?\s*(\{.*?\})\s*\n?\s*```",
-    re.DOTALL,
-)
+- Give a clear final answer when the task is complete"""
 
 
 class Agent:
-    """ReAct agent that uses vllm-i64 as LLM backend."""
+    """
+    ReAct agent with native OpenAI tool_calls and parallel execution.
+
+    Uses the vllm-i64 server's tool_calls support for structured output,
+    and executes independent tool calls concurrently.
+    """
 
     def __init__(
         self,
@@ -70,20 +58,16 @@ class Agent:
         temperature: float = 0.6,
         max_tokens: int = 1024,
         verbose: bool = True,
+        tools: Optional[Dict[str, Tool]] = None,
     ):
         self.client = I64Client(base_url=base_url, api_key=api_key)
-        self.tools = get_tools(allow_shell=allow_shell)
+        self.tools = tools or get_tools(allow_shell=allow_shell)
+        self.openai_tools = tools_to_openai(self.tools)
         self.max_steps = max_steps
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.verbose = verbose
-        self.history: List[Dict[str, str]] = []
-
-    def _system_message(self) -> Dict[str, str]:
-        return {
-            "role": "system",
-            "content": SYSTEM_PROMPT.format(tools=tools_description(self.tools)),
-        }
+        self.history: List[Dict[str, Any]] = []
 
     def _print(self, prefix: str, text: str, color: str = ""):
         if not self.verbose:
@@ -99,103 +83,172 @@ class Agent:
         c = colors.get(color, "")
         print(f"{c}{prefix}{reset} {text}")
 
-    def _parse_tool_call(self, text: str) -> Optional[tuple]:
-        """Extract tool name and args from assistant response."""
-        match = _TOOL_PATTERN.search(text)
-        if not match:
-            return None
-        try:
-            data = json.loads(match.group(1))
-            name = data.get("tool", "")
-            args = data.get("args", "")
-            if isinstance(args, list):
-                args = " ".join(str(a) for a in args)
-            return name, str(args)
-        except (json.JSONDecodeError, KeyError):
-            return None
+    def _call_llm(self) -> ChatMessage:
+        """Send current history to the LLM with tools."""
+        return self.client.chat(
+            messages=self.history,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            tools=self.openai_tools,
+            tool_choice="auto",
+        )
 
-    def _extract_answer(self, text: str) -> Optional[str]:
-        """Extract final answer from assistant response."""
-        # Look for "Answer:" at start of line
-        match = re.search(r"^Answer:\s*(.+)", text, re.MULTILINE | re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return None
+    # -----------------------------------------------------------------
+    # Synchronous run (uses asyncio.run internally for parallel tools)
+    # -----------------------------------------------------------------
 
     def run(self, task: str) -> str:
         """
         Run the agent on a task. Returns the final answer.
 
-        The agent loops: send messages → parse response → execute tool → observe.
-        Stops when it outputs an Answer or hits max_steps.
+        Tool calls within a step are executed in parallel.
         """
         self._print("[Agent]", f"Task: {task}", "cyan")
 
         self.history = [
-            self._system_message(),
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": task},
         ]
 
         for step in range(1, self.max_steps + 1):
             self._print(f"\n[Step {step}/{self.max_steps}]", "", "dim")
 
-            # Call LLM
             try:
-                response = self.client.chat(
-                    messages=self.history,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
+                response = self._call_llm()
             except (ConnectionError, OSError, TimeoutError) as e:
                 self._print("[Error]", str(e), "red")
                 return f"Error: {e}"
 
-            self._print("[Assistant]", response, "green")
+            # No tool calls → final answer
+            if not response.has_tool_calls:
+                self._print("[Answer]", response.content or "", "green")
+                self.history.append({"role": "assistant", "content": response.content})
+                return response.content or ""
 
-            # Check for final answer
-            answer = self._extract_answer(response)
-            if answer:
-                self._print("\n[Answer]", answer, "cyan")
-                self.history.append({"role": "assistant", "content": response})
-                return answer
+            # Tool calls — execute in parallel
+            tool_calls = response.tool_calls
+            n = len(tool_calls)
+            names = [tc["function"]["name"] for tc in tool_calls]
+            self._print(f"[Tools x{n}]", ", ".join(names), "yellow")
 
-            # Check for tool call
-            tool_call = self._parse_tool_call(response)
-            if tool_call:
-                name, args = tool_call
-                self._print(f"[Tool: {name}]", args, "yellow")
+            # Add assistant message with tool_calls to history
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content or ""}
+            assistant_msg["tool_calls"] = tool_calls
+            self.history.append(assistant_msg)
 
-                # Execute tool
-                result = execute_tool(self.tools, name, args)
-                self._print("[Observation]", result[:500], "dim")
-
-                # Add to history
-                self.history.append({"role": "assistant", "content": response})
-                self.history.append({
-                    "role": "user",
-                    "content": f"Observation: {result}",
-                })
+            # Execute tools in parallel
+            if n == 1:
+                # Single tool — no need for asyncio
+                result = execute_tool_call(self.tools, tool_calls[0])
+                tool_results = [{
+                    "role": "tool",
+                    "tool_call_id": tool_calls[0]["id"],
+                    "content": result,
+                }]
             else:
-                # No tool call and no answer — treat as answer
-                self.history.append({"role": "assistant", "content": response})
-                self._print("\n[Done]", "(no explicit Answer, using response)", "dim")
-                return response
+                # Multiple tools — parallel execution
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+
+                if loop and loop.is_running():
+                    # Already in async context — run sequentially
+                    tool_results = []
+                    for tc in tool_calls:
+                        result = execute_tool_call(self.tools, tc)
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result,
+                        })
+                else:
+                    tool_results = asyncio.run(
+                        execute_tools_parallel(self.tools, tool_calls)
+                    )
+
+            # Log results and add to history
+            for tr in tool_results:
+                self._print(f"  [{tr['tool_call_id']}]", tr["content"][:300], "dim")
+                self.history.append(tr)
 
         self._print("[Agent]", "Max steps reached", "red")
         return "Error: agent reached maximum steps without completing the task."
 
+    # -----------------------------------------------------------------
+    # Async run — native async for use in async contexts
+    # -----------------------------------------------------------------
+
+    async def arun(self, task: str) -> str:
+        """
+        Async version of run(). Executes tool calls in parallel natively.
+        """
+        self._print("[Agent]", f"Task: {task}", "cyan")
+
+        self.history = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ]
+
+        for step in range(1, self.max_steps + 1):
+            self._print(f"\n[Step {step}/{self.max_steps}]", "", "dim")
+
+            try:
+                # Run sync HTTP call in executor to not block event loop
+                loop = asyncio.get_running_loop()
+                response = await loop.run_in_executor(None, self._call_llm)
+            except (ConnectionError, OSError, TimeoutError) as e:
+                self._print("[Error]", str(e), "red")
+                return f"Error: {e}"
+
+            if not response.has_tool_calls:
+                self._print("[Answer]", response.content or "", "green")
+                self.history.append({"role": "assistant", "content": response.content})
+                return response.content or ""
+
+            tool_calls = response.tool_calls
+            names = [tc["function"]["name"] for tc in tool_calls]
+            self._print(f"[Tools x{len(tool_calls)}]", ", ".join(names), "yellow")
+
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content or ""}
+            assistant_msg["tool_calls"] = tool_calls
+            self.history.append(assistant_msg)
+
+            # Parallel tool execution
+            tool_results = await execute_tools_parallel(self.tools, tool_calls)
+
+            for tr in tool_results:
+                self._print(f"  [{tr['tool_call_id']}]", tr["content"][:300], "dim")
+                self.history.append(tr)
+
+        self._print("[Agent]", "Max steps reached", "red")
+        return "Error: agent reached maximum steps without completing the task."
+
+    # -----------------------------------------------------------------
+    # Simple chat (no tools)
+    # -----------------------------------------------------------------
+
     def chat(self, message: str) -> str:
         """Single-turn chat (no tool use, just LLM response)."""
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant powered by pacific-prime."},
-            {"role": "user", "content": message},
-        ]
-        return self.client.chat(messages, temperature=self.temperature, max_tokens=self.max_tokens)
+        return self.client.chat_text(
+            [
+                {"role": "system", "content": "You are a helpful assistant powered by pacific-prime."},
+                {"role": "user", "content": message},
+            ],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
+
+    # -----------------------------------------------------------------
+    # Interactive REPL
+    # -----------------------------------------------------------------
 
     def interactive(self):
-        """Interactive REPL mode."""
+        """Interactive REPL mode with tool use."""
         self._print("[Agent]", "Interactive mode. Type /help for commands.", "cyan")
-        self.history = [self._system_message()]
+        self.history = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+        ]
 
         while True:
             try:
@@ -207,7 +260,6 @@ class Agent:
             if not user_input:
                 continue
 
-            # Slash commands
             if user_input == "/help":
                 print("Commands:")
                 print("  /help     Show this help")
@@ -221,7 +273,7 @@ class Agent:
                     print(f"  {name}: {tool.description}")
                 continue
             elif user_input == "/clear":
-                self.history = [self._system_message()]
+                self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
                 print("History cleared.")
                 continue
             elif user_input.startswith("/task "):
@@ -231,41 +283,57 @@ class Agent:
             elif user_input == "/exit":
                 break
 
-            # Normal message — add to history and get response
             self.history.append({"role": "user", "content": user_input})
 
             try:
-                response = self.client.chat(
-                    messages=self.history,
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
+                response = self._call_llm()
             except (ConnectionError, OSError, TimeoutError) as e:
                 self._print("[Error]", str(e), "red")
                 continue
 
-            # Check for tool call in interactive mode
-            tool_call = self._parse_tool_call(response)
-            if tool_call:
-                name, args = tool_call
-                self._print(f"[Tool: {name}]", args, "yellow")
-                result = execute_tool(self.tools, name, args)
-                self._print("[Observation]", result[:500], "dim")
+            if response.has_tool_calls:
+                tool_calls = response.tool_calls
+                names = [tc["function"]["name"] for tc in tool_calls]
+                self._print(f"[Tools x{len(tool_calls)}]", ", ".join(names), "yellow")
 
-                self.history.append({"role": "assistant", "content": response})
-                self.history.append({"role": "user", "content": f"Observation: {result}"})
+                assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content or ""}
+                assistant_msg["tool_calls"] = tool_calls
+                self.history.append(assistant_msg)
 
-                # Get follow-up response
+                # Execute tools (parallel if multiple)
+                if len(tool_calls) == 1:
+                    result = execute_tool_call(self.tools, tool_calls[0])
+                    tool_results = [{
+                        "role": "tool",
+                        "tool_call_id": tool_calls[0]["id"],
+                        "content": result,
+                    }]
+                else:
+                    try:
+                        tool_results = asyncio.run(
+                            execute_tools_parallel(self.tools, tool_calls)
+                        )
+                    except RuntimeError:
+                        tool_results = []
+                        for tc in tool_calls:
+                            result = execute_tool_call(self.tools, tc)
+                            tool_results.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            })
+
+                for tr in tool_results:
+                    self._print(f"  [{tr['tool_call_id']}]", tr["content"][:300], "dim")
+                    self.history.append(tr)
+
+                # Follow-up response after tool results
                 try:
-                    follow_up = self.client.chat(
-                        messages=self.history,
-                        temperature=self.temperature,
-                        max_tokens=self.max_tokens,
-                    )
-                    self._print("[Assistant]", follow_up, "green")
-                    self.history.append({"role": "assistant", "content": follow_up})
-                except ConnectionError:
+                    follow_up = self._call_llm()
+                    self._print("[Assistant]", follow_up.content or "", "green")
+                    self.history.append({"role": "assistant", "content": follow_up.content})
+                except (ConnectionError, OSError, TimeoutError):
                     pass
             else:
-                self._print("[Assistant]", response, "green")
-                self.history.append({"role": "assistant", "content": response})
+                self._print("[Assistant]", response.content or "", "green")
+                self.history.append({"role": "assistant", "content": response.content})

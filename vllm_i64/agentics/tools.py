@@ -2,21 +2,31 @@
 vllm-i64 :: Agentics — Tools
 
 Built-in tools for the agent loop.
-Each tool: name, description, function(args_str) -> str.
+Each tool: name, description, function(args) -> str.
+
+Supports:
+  - Sync and async execution
+  - Parallel execution via execute_tools_parallel()
+  - OpenAI-compatible tool definitions for the API
 
 Security: tools are sandboxed by default (read-only).
-Pass --allow-shell to enable shell execution.
+Pass allow_shell=True to enable shell execution.
 
 INL - 2025
 """
 
 import os
+import asyncio
 import subprocess
 import logging
-from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Any
 
 _logger = logging.getLogger("vllm_i64.agentics.tools")
+
+# Shared thread pool for blocking tool calls
+_tool_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tool")
 
 
 @dataclass
@@ -24,6 +34,7 @@ class Tool:
     name: str
     description: str
     func: Callable[[str], str]
+    parameters: Dict[str, Any] = field(default_factory=dict)
 
 
 # =========================================================================
@@ -93,7 +104,6 @@ def tool_shell(args: str) -> str:
             output += f"\n[stderr] {result.stderr}"
         if result.returncode != 0:
             output += f"\n[exit code: {result.returncode}]"
-        # Cap output
         if len(output) > 10_000:
             output = output[:10_000] + "\n... (truncated)"
         return output or "(no output)"
@@ -132,7 +142,6 @@ def tool_search_files(args: str) -> str:
     matches = []
     try:
         for root, dirs, files in os.walk(directory):
-            # Skip hidden dirs and common noise
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__", ".git")]
             for f in files:
                 if fnmatch.fnmatch(f, pattern):
@@ -179,16 +188,44 @@ def tool_grep(args: str) -> str:
 # =========================================================================
 
 SAFE_TOOLS: Dict[str, Tool] = {
-    "read_file": Tool("read_file", "Read a file (path)", tool_read_file),
-    "write_file": Tool("write_file", "Write a file (path\\ncontent)", tool_write_file),
-    "list_dir": Tool("list_dir", "List directory contents (path)", tool_list_dir),
-    "search_files": Tool("search_files", "Find files (directory pattern)", tool_search_files),
-    "grep": Tool("grep", "Search file contents (pattern [directory])", tool_grep),
-    "python": Tool("python", "Execute Python code", tool_python),
+    "read_file": Tool(
+        "read_file", "Read a file and return its contents",
+        tool_read_file,
+        {"type": "object", "properties": {"path": {"type": "string", "description": "File path to read"}}, "required": ["path"]},
+    ),
+    "write_file": Tool(
+        "write_file", "Write content to a file (creates directories if needed)",
+        tool_write_file,
+        {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]},
+    ),
+    "list_dir": Tool(
+        "list_dir", "List directory contents",
+        tool_list_dir,
+        {"type": "object", "properties": {"path": {"type": "string", "description": "Directory path (default: current)"}}, "required": []},
+    ),
+    "search_files": Tool(
+        "search_files", "Find files matching a glob pattern",
+        tool_search_files,
+        {"type": "object", "properties": {"directory": {"type": "string"}, "pattern": {"type": "string"}}, "required": ["pattern"]},
+    ),
+    "grep": Tool(
+        "grep", "Search file contents for a pattern",
+        tool_grep,
+        {"type": "object", "properties": {"pattern": {"type": "string"}, "directory": {"type": "string"}}, "required": ["pattern"]},
+    ),
+    "python": Tool(
+        "python", "Execute Python code and return output",
+        tool_python,
+        {"type": "object", "properties": {"code": {"type": "string", "description": "Python code to execute"}}, "required": ["code"]},
+    ),
 }
 
 DANGEROUS_TOOLS: Dict[str, Tool] = {
-    "shell": Tool("shell", "Execute shell command (requires --allow-shell)", tool_shell),
+    "shell": Tool(
+        "shell", "Execute a shell command (requires --allow-shell)",
+        tool_shell,
+        {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    ),
 }
 
 
@@ -200,8 +237,23 @@ def get_tools(allow_shell: bool = False) -> Dict[str, Tool]:
     return tools
 
 
+def tools_to_openai(tools: Dict[str, Tool]) -> List[Dict]:
+    """Convert tools to OpenAI API format for the tools parameter."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+            },
+        }
+        for tool in tools.values()
+    ]
+
+
 def tools_description(tools: Dict[str, Tool]) -> str:
-    """Format tool descriptions for the system prompt."""
+    """Format tool descriptions for system prompt (legacy format)."""
     lines = []
     for name, tool in tools.items():
         lines.append(f"- {name}: {tool.description}")
@@ -214,3 +266,78 @@ def execute_tool(tools: Dict[str, Tool], name: str, args: str) -> str:
         return f"Error: unknown tool '{name}'. Available: {', '.join(tools.keys())}"
     _logger.info("Executing tool: %s", name)
     return tools[name].func(args)
+
+
+def _format_args(name: str, args_json: str) -> str:
+    """Convert OpenAI JSON arguments to the flat string format tools expect."""
+    try:
+        parsed = __import__("json").loads(args_json) if isinstance(args_json, str) else args_json
+    except (__import__("json").JSONDecodeError, TypeError):
+        return args_json if isinstance(args_json, str) else str(args_json)
+
+    if not isinstance(parsed, dict):
+        return str(parsed)
+
+    # Map structured args to the flat string each tool expects
+    if name == "read_file":
+        return parsed.get("path", "")
+    elif name == "write_file":
+        return parsed.get("path", "") + "\n" + parsed.get("content", "")
+    elif name == "list_dir":
+        return parsed.get("path", ".")
+    elif name == "search_files":
+        d = parsed.get("directory", ".")
+        p = parsed.get("pattern", "*")
+        return f"{d} {p}"
+    elif name == "grep":
+        p = parsed.get("pattern", "")
+        d = parsed.get("directory", ".")
+        return f"{p} {d}"
+    elif name == "python":
+        return parsed.get("code", "")
+    elif name == "shell":
+        return parsed.get("command", "")
+    else:
+        # Fallback: join values
+        return " ".join(str(v) for v in parsed.values())
+
+
+def execute_tool_call(tools: Dict[str, Tool], tool_call: Dict) -> str:
+    """
+    Execute an OpenAI-format tool_call dict.
+
+    Expected format:
+        {"id": "call_xxx", "function": {"name": "...", "arguments": "{...}"}}
+    """
+    func = tool_call.get("function", {})
+    name = func.get("name", "")
+    args_json = func.get("arguments", "{}")
+    args_str = _format_args(name, args_json)
+    return execute_tool(tools, name, args_str)
+
+
+async def execute_tools_parallel(
+    tools: Dict[str, Tool],
+    tool_calls: List[Dict],
+) -> List[Dict[str, str]]:
+    """
+    Execute multiple tool calls in parallel.
+
+    Returns list of {"tool_call_id": ..., "role": "tool", "content": ...}
+    messages ready to append to the conversation.
+    """
+    loop = asyncio.get_running_loop()
+
+    async def _run_one(tc: Dict) -> Dict[str, str]:
+        result = await loop.run_in_executor(
+            _tool_executor,
+            execute_tool_call, tools, tc,
+        )
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": result,
+        }
+
+    results = await asyncio.gather(*[_run_one(tc) for tc in tool_calls])
+    return list(results)
