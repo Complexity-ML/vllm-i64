@@ -25,6 +25,36 @@ _logger = logging.getLogger("vllm_i64.cli")
 def cmd_serve(args):
     """Start inference server (single-GPU or multi-GPU via torchrun)."""
 
+    # --no-model mode: sandbox-only / RAG-only server (no GPU needed)
+    if getattr(args, 'no_model', False):
+        from vllm_i64.core.logging import setup_logging
+        setup_logging(level="INFO", json_output=getattr(args, 'log_json', False))
+        from vllm_i64.api.server import I64Server
+
+        _logger.info("vllm-i64 :: sandbox-only mode (no model loaded)")
+        server = I64Server(
+            engine=None,
+            tokenizer=None,
+            chat_template=None,
+            model_name="none",
+            host=args.host,
+            port=args.port,
+            api_key=getattr(args, 'api_key', None),
+            rate_limit=getattr(args, 'rate_limit', 0),
+            max_pending=getattr(args, 'max_pending', 0),
+            rag_index_path=getattr(args, 'rag_index', None),
+            sandbox_enabled=getattr(args, 'sandbox', False),
+            sandbox_timeout=getattr(args, 'sandbox_timeout', 30),
+            sandbox_max_memory_mb=getattr(args, 'sandbox_memory', 256),
+            sandbox_user=getattr(args, 'sandbox_user', None),
+        )
+        server.run()
+        return
+
+    if not args.model:
+        _logger.error("Model name required (or use --no-model for sandbox-only mode)")
+        sys.exit(1)
+
     # If TP > 1 or PP > 1, launch via torchrun
     if args.tp > 1 or args.pp > 1:
         # Disaggregated prefill/decode: split GPUs into prefill and decode groups
@@ -203,6 +233,7 @@ def cmd_serve(args):
         sandbox_enabled=getattr(args, 'sandbox', False),
         sandbox_timeout=getattr(args, 'sandbox_timeout', 30),
         sandbox_max_memory_mb=getattr(args, 'sandbox_memory', 256),
+        sandbox_user=getattr(args, 'sandbox_user', None),
     )
     server.run()
 
@@ -437,7 +468,9 @@ def main():
 
     # serve
     p_serve = sub.add_parser("serve", help="Start inference server")
-    p_serve.add_argument("model", help="Model name (e.g. pacific-prime-chat)")
+    p_serve.add_argument("model", nargs="?", default=None,
+                         help="Model name (e.g. pacific-prime-chat). "
+                              "Optional if --no-model is used for sandbox-only mode")
     p_serve.add_argument("--host", default="0.0.0.0")
     p_serve.add_argument("--port", type=int, default=8000)
     p_serve.add_argument("--dtype", default="float16", choices=["float16", "bfloat16", "float32"])
@@ -494,6 +527,11 @@ def main():
                          help="Sandbox execution timeout in seconds (default: 30)")
     p_serve.add_argument("--sandbox-memory", type=int, default=256,
                          help="Sandbox max memory in MB (default: 256)")
+    p_serve.add_argument("--sandbox-user", default=None,
+                         help="Linux user for sandbox isolation (Level 2 security). "
+                              "Requires root. Example: --sandbox-user sandbox")
+    p_serve.add_argument("--no-model", action="store_true",
+                         help="Run without loading a model (sandbox-only / RAG-only mode)")
     p_serve.set_defaults(func=cmd_serve)
 
     # list

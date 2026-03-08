@@ -224,15 +224,20 @@ class I64Server:
         sandbox_enabled: bool = False,
         sandbox_timeout: int = 30,
         sandbox_max_memory_mb: int = 256,
+        sandbox_user: Optional[str] = None,
     ):
         # Create async engine — use dedicated CPU engine when on CPU
-        from vllm_i64.cpu.engine import CPUEngine, AsyncCPUEngine
-        if isinstance(engine, CPUEngine):
-            self.async_engine = AsyncCPUEngine.from_cpu_engine(engine)
+        # engine=None means sandbox-only / RAG-only mode (no model)
+        if engine is None:
+            self.async_engine = None
+            self.sync_engine = None
         else:
-            self.async_engine = AsyncI64Engine.from_sync_engine(engine)
-
-        self.sync_engine = engine
+            from vllm_i64.cpu.engine import CPUEngine, AsyncCPUEngine
+            if isinstance(engine, CPUEngine):
+                self.async_engine = AsyncCPUEngine.from_cpu_engine(engine)
+            else:
+                self.async_engine = AsyncI64Engine.from_sync_engine(engine)
+            self.sync_engine = engine
         self.tokenizer = tokenizer
         self.chat_template = chat_template
 
@@ -329,8 +334,10 @@ class I64Server:
             self.sandbox = Sandbox(
                 timeout=sandbox_timeout,
                 max_memory_mb=sandbox_max_memory_mb,
+                sandbox_user=sandbox_user,
             )
-            logger.info("Sandbox enabled: timeout=%ds memory=%dMB", sandbox_timeout, sandbox_max_memory_mb)
+            level = "L2 (user: %s)" % sandbox_user if sandbox_user else "L1"
+            logger.info("Sandbox enabled: %s, timeout=%ds memory=%dMB", level, sandbox_timeout, sandbox_max_memory_mb)
 
     def _next_request_id(self) -> str:
         """Generate a unique request ID (OpenAI-compatible format)."""
@@ -720,6 +727,11 @@ class I64Server:
 
     async def handle_completions(self, request: web.Request) -> web.Response:
         """POST /v1/completions — async continuous batching."""
+        if self.async_engine is None:
+            return web.json_response(
+                {"error": {"message": "No model loaded (server running in sandbox-only mode)", "type": "server_error"}},
+                status=503,
+            )
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -819,6 +831,11 @@ class I64Server:
 
     async def handle_chat_completions(self, request: web.Request) -> web.Response:
         """POST /v1/chat/completions — async continuous batching."""
+        if self.async_engine is None:
+            return web.json_response(
+                {"error": {"message": "No model loaded (server running in sandbox-only mode)", "type": "server_error"}},
+                status=503,
+            )
         try:
             body = await request.json()
         except (json.JSONDecodeError, Exception):
@@ -967,8 +984,19 @@ class I64Server:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health — detailed health check with KV cache, GPU memory, queue depth."""
-        stats = self.async_engine.get_stats()
         uptime_s = int(time.monotonic() - self._start_time)
+
+        # No-model mode: minimal health response
+        if self.async_engine is None:
+            return web.json_response({
+                "status": "ok",
+                "mode": "sandbox-only",
+                "uptime_seconds": uptime_s,
+                "sandbox_enabled": self.sandbox_enabled,
+                "rag_enabled": self.rag_enabled,
+            })
+
+        stats = self.async_engine.get_stats()
 
         # Determine overall status
         status = "ok"
@@ -2052,7 +2080,7 @@ class I64Server:
             middlewares.append(make_auth_middleware(self.api_key))
         if self._rate_limiter:
             middlewares.append(make_rate_limit_middleware(self._rate_limiter))
-        if self._max_pending > 0:
+        if self._max_pending > 0 and self.sync_engine is not None:
             def _get_load():
                 return len(self.sync_engine.scheduler.pending) + self.async_engine.active_requests
             middlewares.append(make_load_shed_middleware(_get_load, self._max_pending))
@@ -2118,14 +2146,18 @@ class I64Server:
 
     async def _on_startup(self, app):
         """Start the async engine loop when server starts."""
-        await self.async_engine.start()
-        logger.info("Engine started: continuous batching active")
+        if self.async_engine is not None:
+            await self.async_engine.start()
+            logger.info("Engine started: continuous batching active")
+        else:
+            logger.info("Sandbox-only mode: no engine to start")
 
     async def _on_cleanup(self, app):
         """Graceful shutdown: drain active requests, then stop engine."""
         logger.info("Server cleanup: draining requests...")
         self._shutting_down = True
-        await self.async_engine.stop(drain_timeout=30.0)
+        if self.async_engine is not None:
+            await self.async_engine.stop(drain_timeout=30.0)
         logger.info("Server cleanup complete")
 
     def run(self):

@@ -106,6 +106,7 @@ class Sandbox:
         max_output_bytes: int = 65536,
         max_file_size_mb: int = 10,
         allowed_languages: Optional[List[str]] = None,
+        sandbox_user: Optional[str] = None,
     ):
         self.timeout = timeout
         self.max_memory_mb = max_memory_mb
@@ -113,6 +114,18 @@ class Sandbox:
         self.max_file_size_mb = max_file_size_mb
         self.allowed_languages = allowed_languages or list(_RUNTIMES.keys())
         self._is_linux = sys.platform.startswith("linux")
+        # Resolve sandbox user UID/GID for process isolation
+        self._sandbox_uid: Optional[int] = None
+        self._sandbox_gid: Optional[int] = None
+        if sandbox_user and self._is_linux:
+            try:
+                import pwd
+                pw = pwd.getpwnam(sandbox_user)
+                self._sandbox_uid = pw.pw_uid
+                self._sandbox_gid = pw.pw_gid
+                _logger.info("sandbox: running as user '%s' (uid=%d gid=%d)", sandbox_user, pw.pw_uid, pw.pw_gid)
+            except KeyError:
+                _logger.warning("sandbox: user '%s' not found, running as current user", sandbox_user)
 
     def execute(self, code: str, language: str = "python") -> ExecutionResult:
         """
@@ -186,7 +199,12 @@ class Sandbox:
             "PYTHONDONTWRITEBYTECODE": "1",
         }
 
-        # Pre-exec function for Linux resource limits
+        # Chown tmpdir to sandbox user so subprocess can write
+        if self._sandbox_uid is not None:
+            os.chown(tmpdir, self._sandbox_uid, self._sandbox_gid)
+            os.chown(src_path, self._sandbox_uid, self._sandbox_gid)
+
+        # Pre-exec function for Linux resource limits + user switch
         preexec = self._make_preexec() if self._is_linux else None
 
         t0 = time.monotonic()
@@ -258,13 +276,20 @@ class Sandbox:
         )
 
     def _make_preexec(self):
-        """Create a preexec_fn that sets resource limits (Linux only)."""
+        """Create a preexec_fn that sets resource limits and switches user (Linux only)."""
         max_mem = self.max_memory_mb * 1024 * 1024
         max_cpu = self.timeout
         max_fsize = self.max_file_size_mb * 1024 * 1024
+        uid = self._sandbox_uid
+        gid = self._sandbox_gid
 
         def _set_limits():
             import resource
+            # Switch to sandbox user (must be done before dropping privileges)
+            if gid is not None:
+                os.setgid(gid)
+            if uid is not None:
+                os.setuid(uid)
             # CPU time (seconds)
             resource.setrlimit(resource.RLIMIT_CPU, (max_cpu, max_cpu))
             # Virtual memory
