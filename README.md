@@ -22,7 +22,7 @@ All control flow is integer (`i64`/`i32`). Float exists only inside `model.forwa
 - **Sampling** — temperature, top-k, top-p, min-p, typical-p, repetition/frequency/presence penalties
 - **Speculative decoding** — draft+verify (opt-in via `engine.enable_speculative()`)
 - **LoRA** — load/unload adapters at runtime (opt-in via `engine.enable_lora()`)
-- **Web search** — Perplexity-style `/v1/search/completions` with Brave Search API + numbered citations
+
 - **RAG** — native retrieval pipeline (chunk → embed → FAISS → retrieve → generate)
 - **Agentic tool use** — ReAct agent loop with parallel tool execution
 - **Observability** — JSON metrics, latency percentiles, usage tracking, request logs
@@ -74,9 +74,7 @@ curl -X POST http://localhost:8000/v1/chat/completions \
 | GET | `/v1/models/{id}` | Model details |
 | GET | `/health` | Health check + diagnostics |
 | GET | `/v1/metrics` | Latency & usage metrics |
-| POST | `/v1/search/completions` | Web search + generation (Perplexity-style) |
-| GET | `/v1/search/history` | User's search history (partitioned) |
-| DELETE | `/v1/search/history` | Clear user's search history |
+
 | POST | `/v1/rag/index` | Index documents for RAG |
 | POST | `/v1/rag/search` | Search indexed documents |
 | GET | `/docs` | OpenAPI 3.0 spec |
@@ -93,7 +91,7 @@ The same deterministic routing that drives MoE inference is applied to user data
 - **No session tokens** — auth is stateless (API key + user_id per request), eliminating session hijacking
 - **Team key safe** — shared API keys are split by `user_id`, so Alice never sees Bob's history
 - **Blast radius = 1** — a compromised key only accesses its own partition
-- **User-controlled deletion** — `DELETE /v1/search/history` clears your data from memory and disk
+
 - **No data leak possible** — if you can't address a partition, you can't read it
 
 ## Architecture
