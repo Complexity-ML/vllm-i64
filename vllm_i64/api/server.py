@@ -22,6 +22,7 @@ Endpoints:
     POST /v1/lora/load        → load LoRA adapter (admin)
     POST /v1/lora/unload      → unload LoRA adapter (admin)
     GET  /v1/lora/list        → list loaded adapters
+    POST /v1/execute          → sandboxed code execution (--sandbox)
 
 INL - 2025
 """
@@ -220,6 +221,9 @@ class I64Server:
         rate_limit: int = 0,
         max_pending: int = 0,
         rag_index_path: Optional[str] = None,
+        sandbox_enabled: bool = False,
+        sandbox_timeout: int = 30,
+        sandbox_max_memory_mb: int = 256,
     ):
         # Create async engine — use dedicated CPU engine when on CPU
         from vllm_i64.cpu.engine import CPUEngine, AsyncCPUEngine
@@ -316,6 +320,17 @@ class I64Server:
                 self._rag_index_path = None
             except ImportError:
                 pass
+
+        # Sandbox — isolated code execution
+        self.sandbox = None
+        self.sandbox_enabled = sandbox_enabled
+        if sandbox_enabled:
+            from vllm_i64.sandbox import Sandbox
+            self.sandbox = Sandbox(
+                timeout=sandbox_timeout,
+                max_memory_mb=sandbox_max_memory_mb,
+            )
+            logger.info("Sandbox enabled: timeout=%ds memory=%dMB", sandbox_timeout, sandbox_max_memory_mb)
 
     def _next_request_id(self) -> str:
         """Generate a unique request ID (OpenAI-compatible format)."""
@@ -1993,6 +2008,43 @@ class I64Server:
             "counts": expert_counts,
         })
 
+    async def handle_execute(self, request: web.Request) -> web.Response:
+        """POST /v1/execute — execute code in the sandbox."""
+        if not self.sandbox_enabled or self.sandbox is None:
+            return web.json_response(
+                {"error": {"message": "Sandbox not enabled. Start server with --sandbox", "type": "server_error"}},
+                status=503,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": {"message": "Invalid JSON", "type": "invalid_request_error"}}, status=400,
+            )
+
+        code = body.get("code")
+        if not code or not isinstance(code, str):
+            return web.json_response(
+                {"error": {"message": "'code' field is required", "type": "invalid_request_error"}}, status=400,
+            )
+
+        language = body.get("language", "python")
+        if language not in self.sandbox.supported_languages:
+            return web.json_response(
+                {"error": {"message": f"Unsupported language: {language}. Available: {', '.join(self.sandbox.supported_languages)}",
+                           "type": "invalid_request_error"}},
+                status=400,
+            )
+
+        # Run in thread pool to avoid blocking the event loop
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, self.sandbox.execute, code, language,
+        )
+
+        return web.json_response(result.to_dict())
+
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
         middlewares = [make_cors_middleware()]
@@ -2046,6 +2098,9 @@ class I64Server:
         app.router.add_get("/v1/rag/stats", self.handle_rag_stats)
         app.router.add_route("OPTIONS", "/v1/rag/index", self._handle_options)
         app.router.add_route("OPTIONS", "/v1/rag/search", self._handle_options)
+        # Sandbox endpoint
+        app.router.add_post("/v1/execute", self.handle_execute)
+        app.router.add_route("OPTIONS", "/v1/execute", self._handle_options)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app
@@ -2084,6 +2139,9 @@ class I64Server:
             logger.info("  POST /v1/search/completions | GET /v1/search/history | GET /v1/search/stats")
         if self.rag_enabled:
             logger.info("  POST /v1/rag/index | POST /v1/rag/search | GET /v1/rag/stats")
+        if self.sandbox_enabled:
+            logger.info("  POST /v1/execute (sandbox: %ds timeout, %dMB memory)",
+                        self.sandbox.timeout, self.sandbox.max_memory_mb)
         logger.info("  mode: async continuous batching")
         app = self.create_app()
 

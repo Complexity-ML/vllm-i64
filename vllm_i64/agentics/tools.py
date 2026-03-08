@@ -113,23 +113,24 @@ def tool_shell(args: str) -> str:
         return f"Error: {e}"
 
 
-def tool_python(args: str) -> str:
-    """Execute Python code in a subprocess. Args: python code."""
-    try:
-        result = subprocess.run(
-            ["python", "-c", args],
-            capture_output=True, text=True, timeout=30,
-        )
-        output = result.stdout
-        if result.stderr:
-            output += f"\n[stderr] {result.stderr}"
-        if len(output) > 10_000:
-            output = output[:10_000] + "\n... (truncated)"
-        return output or "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: timed out (30s limit)"
-    except Exception as e:
-        return f"Error: {e}"
+def tool_execute_code(args: str) -> str:
+    """Execute code in an isolated sandbox. Args: code (Python by default).
+    For other languages, first line can be '---language: node' or '---language: bash'.
+    """
+    from vllm_i64.sandbox import Sandbox
+
+    code = args
+    language = "python"
+
+    # Check for language directive on first line
+    first_line = code.split("\n", 1)[0].strip()
+    if first_line.startswith("---language:"):
+        language = first_line.split(":", 1)[1].strip()
+        code = code.split("\n", 1)[1] if "\n" in code else ""
+
+    sandbox = Sandbox(timeout=30, max_memory_mb=256)
+    result = sandbox.execute(code, language=language)
+    return result.to_tool_output()
 
 
 def tool_search_files(args: str) -> str:
@@ -213,10 +214,13 @@ SAFE_TOOLS: Dict[str, Tool] = {
         tool_grep,
         {"type": "object", "properties": {"pattern": {"type": "string"}, "directory": {"type": "string"}}, "required": ["pattern"]},
     ),
-    "python": Tool(
-        "python", "Execute Python code and return output",
-        tool_python,
-        {"type": "object", "properties": {"code": {"type": "string", "description": "Python code to execute"}}, "required": ["code"]},
+    "execute_code": Tool(
+        "execute_code", "Execute code in an isolated sandbox and return stdout/stderr. Supports python, node, bash.",
+        tool_execute_code,
+        {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Source code to execute"},
+            "language": {"type": "string", "enum": ["python", "node", "bash"], "description": "Language runtime (default: python)"},
+        }, "required": ["code"]},
     ),
 }
 
@@ -293,8 +297,12 @@ def _format_args(name: str, args_json: str) -> str:
         p = parsed.get("pattern", "")
         d = parsed.get("directory", ".")
         return f"{p} {d}"
-    elif name == "python":
-        return parsed.get("code", "")
+    elif name == "execute_code":
+        lang = parsed.get("language", "python")
+        code = parsed.get("code", "")
+        if lang != "python":
+            return f"---language: {lang}\n{code}"
+        return code
     elif name == "shell":
         return parsed.get("command", "")
     else:

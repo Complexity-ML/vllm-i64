@@ -200,6 +200,9 @@ def cmd_serve(args):
         rate_limit=getattr(args, 'rate_limit', 0),
         max_pending=getattr(args, 'max_pending', 0),
         rag_index_path=getattr(args, 'rag_index', None),
+        sandbox_enabled=getattr(args, 'sandbox', False),
+        sandbox_timeout=getattr(args, 'sandbox_timeout', 30),
+        sandbox_max_memory_mb=getattr(args, 'sandbox_memory', 256),
     )
     server.run()
 
@@ -485,6 +488,12 @@ def main():
     p_serve.add_argument("--disaggregated", action="store_true",
                          help="Enable disaggregated prefill/decode (requires TP >= 2). "
                               "GPU 0 handles prefill (compute-bound), GPU 1 handles decode (memory-bound)")
+    p_serve.add_argument("--sandbox", action="store_true",
+                         help="Enable sandboxed code execution (POST /v1/execute + agent tool)")
+    p_serve.add_argument("--sandbox-timeout", type=int, default=30,
+                         help="Sandbox execution timeout in seconds (default: 30)")
+    p_serve.add_argument("--sandbox-memory", type=int, default=256,
+                         help="Sandbox max memory in MB (default: 256)")
     p_serve.set_defaults(func=cmd_serve)
 
     # list
