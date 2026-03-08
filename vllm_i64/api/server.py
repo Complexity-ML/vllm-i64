@@ -48,6 +48,7 @@ from vllm_i64.api.middleware import (
     make_rate_limit_middleware,
     make_load_shed_middleware,
 )
+from vllm_i64.api.events import EventBus, AgentEvent
 from vllm_i64.api.tracking import (
     UsageTracker,
     RequestCache,
@@ -338,6 +339,9 @@ class I64Server:
             )
             level = "L2 (user: %s)" % sandbox_user if sandbox_user else "L1"
             logger.info("Sandbox enabled: %s, timeout=%ds memory=%dMB", level, sandbox_timeout, sandbox_max_memory_mb)
+
+        # Event bus — agent observability (sandbox/RAG/completion events)
+        self.event_bus = EventBus()
 
     def _next_request_id(self) -> str:
         """Generate a unique request ID (OpenAI-compatible format)."""
@@ -1835,6 +1839,8 @@ class I64Server:
                 {"error": {"message": "Provide 'text' or 'file'", "type": "invalid_request_error"}}, status=400,
             )
 
+        session_id = request.headers.get("X-Session-Id", "default")
+
         try:
             if file_path:
                 # S1: Prevent path traversal — only allow files under CWD or explicit safe dirs
@@ -1855,6 +1861,13 @@ class I64Server:
                 self.retriever.save(self._rag_index_path)
 
             total = len(self.retriever.vector_index.chunks) if self.retriever.vector_index else n
+
+            self.event_bus.emit(AgentEvent(
+                type="rag_index",
+                session_id=session_id,
+                data={"chunks_added": n, "total_chunks": total},
+            ))
+
             return web.json_response({"status": "ok", "chunks_added": n, "total_chunks": total})
         except Exception as e:
             logger.error("RAG index error: %s", e, exc_info=True)
@@ -1882,8 +1895,23 @@ class I64Server:
                 {"error": {"message": "Missing 'query'", "type": "invalid_request_error"}}, status=400,
             )
 
+        session_id = request.headers.get("X-Session-Id", "default")
+
         try:
+            self.event_bus.emit(AgentEvent(
+                type="rag_search",
+                session_id=session_id,
+                data={"status": "running", "query": query, "k": k},
+            ))
+
             results = self.retriever.retrieve(query, k=k)
+
+            self.event_bus.emit(AgentEvent(
+                type="rag_search",
+                session_id=session_id,
+                data={"status": "done", "query": query, "count": len(results)},
+            ))
+
             return web.json_response({"query": query, "results": results, "count": len(results)})
         except Exception as e:
             logger.error("RAG search error: %s", e, exc_info=True)
@@ -2065,13 +2093,90 @@ class I64Server:
                 status=400,
             )
 
+        session_id = request.headers.get("X-Session-Id", "default")
+
+        self.event_bus.emit(AgentEvent(
+            type="sandbox",
+            session_id=session_id,
+            data={"status": "running", "language": language, "code": code},
+        ))
+
         # Run in thread pool to avoid blocking the event loop
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, self.sandbox.execute, code, language,
         )
 
+        self.event_bus.emit(AgentEvent(
+            type="sandbox",
+            session_id=session_id,
+            data={"status": "done", "language": language, **result.to_dict()},
+        ))
+
         return web.json_response(result.to_dict())
+
+    # =================================================================
+    # Agent observability — live event stream
+    # =================================================================
+
+    async def handle_agent_events(self, request: web.Request) -> web.StreamResponse:
+        """GET /v1/agent/events — SSE stream of agent activity (sandbox, RAG, completions).
+
+        Query params:
+            session_id — filter events by session (optional)
+            history    — number of past events to replay on connect (default: 20)
+        """
+        session_filter = request.query.get("session_id")
+        history_count = int(request.query.get("history", "20"))
+
+        response = web.StreamResponse()
+        response.content_type = "text/event-stream"
+        response.headers["Cache-Control"] = "no-cache"
+        response.headers["Connection"] = "keep-alive"
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        await response.prepare(request)
+
+        # Replay recent history
+        history = self.event_bus.get_history(session_id=session_filter, limit=history_count)
+        for event in history:
+            await response.write(f"data: {json.dumps(event)}\n\n".encode())
+
+        # Subscribe to live events
+        sub_id, queue = self.event_bus.subscribe(session_filter=session_filter)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    # Send keepalive
+                    await response.write(b": keepalive\n\n")
+                    continue
+
+                if event is None:
+                    break
+
+                # Filter by session if requested
+                if session_filter and event.session_id != session_filter:
+                    continue
+
+                await response.write(f"data: {json.dumps(event.to_dict())}\n\n".encode())
+        except (ConnectionResetError, ConnectionError):
+            pass
+        finally:
+            self.event_bus.unsubscribe(sub_id)
+
+        return response
+
+    async def handle_agent_history(self, request: web.Request) -> web.Response:
+        """GET /v1/agent/history — recent events (JSON, not SSE)."""
+        session_id = request.query.get("session_id")
+        limit = int(request.query.get("limit", "50"))
+        events = self.event_bus.get_history(session_id=session_id, limit=limit)
+        return web.json_response({
+            "events": events,
+            "count": len(events),
+            "subscribers": self.event_bus.subscriber_count,
+        })
 
     def create_app(self) -> web.Application:
         """Create aiohttp application with routes and engine lifecycle."""
@@ -2129,6 +2234,10 @@ class I64Server:
         # Sandbox endpoint
         app.router.add_post("/v1/execute", self.handle_execute)
         app.router.add_route("OPTIONS", "/v1/execute", self._handle_options)
+        # Agent observability
+        app.router.add_get("/v1/agent/events", self.handle_agent_events)
+        app.router.add_get("/v1/agent/history", self.handle_agent_history)
+        app.router.add_route("OPTIONS", "/v1/agent/events", self._handle_options)
         app.router.add_get("/", self.handle_root)
 
         # Start/stop async engine with the app
