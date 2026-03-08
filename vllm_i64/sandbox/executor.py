@@ -184,16 +184,12 @@ class Sandbox:
         # Build command
         cmd = [part.replace("{file}", src_path) for part in runtime["cmd"]]
 
-        # Environment: minimal, no network hints
+        # Environment: minimal, network allowed (agents need internet)
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": tmpdir,
             "TMPDIR": tmpdir,
             "LANG": "en_US.UTF-8",
-            # Disable network for Python
-            "no_proxy": "*",
-            "http_proxy": "http://0.0.0.0:0",
-            "https_proxy": "http://0.0.0.0:0",
             # Prevent Python from importing user site-packages junk
             "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
