@@ -75,13 +75,28 @@ class ComplexityDeepConfig:
 
     @staticmethod
     def from_json(path: str) -> "ComplexityDeepConfig":
-        """Load from a checkpoint config.json."""
+        """Load from a checkpoint config.json (supports both deep and framework format)."""
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         config = ComplexityDeepConfig()
+
+        # Map framework config fields to deep config fields
+        field_map = {
+            "norm_eps": "rms_norm_eps",
+        }
+
         for key, val in data.items():
-            if key in ("parameters", "innovations"):
+            if key in ("parameters", "innovations", "extra_config"):
                 continue
-            if hasattr(config, key):
-                setattr(config, key, val)
+            mapped_key = field_map.get(key, key)
+            if hasattr(config, mapped_key):
+                setattr(config, mapped_key, val)
+
+        # Framework format: detect token-routed from mlp_type
+        if data.get("mlp_type") == "token_routed":
+            config.use_token_routed_mlp = True
+        elif data.get("mlp_type") == "swiglu":
+            config.use_token_routed_mlp = False
+            config.num_experts = 1
+
         return config

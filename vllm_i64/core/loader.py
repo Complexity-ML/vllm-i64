@@ -126,6 +126,110 @@ def _load_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
             return _load_safetensors_file(str(path))
 
 
+def _convert_framework_weights(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Convert complexity-framework checkpoint format to vllm-i64 format.
+
+    Handles:
+    1. Separate expert weights (experts.0.gate_proj + experts.0.up_proj → fused gate_up_proj)
+    2. Dense MLP (mlp.gate_proj + mlp.up_proj → fused gate_up_proj with 1 expert)
+    3. INL dynamics controller format (controller.0/2 → controller_in/out)
+    4. token_to_expert buffer
+    """
+    import re
+
+    # Detect framework format: look for "mlp.experts.0.gate_proj" or "mlp.gate_proj"
+    has_separate_experts = any("mlp.experts." in k and "gate_proj" in k for k in state_dict)
+    has_dense_mlp = any(re.match(r"layers\.\d+\.mlp\.gate_proj", k) for k in state_dict)
+
+    if not has_separate_experts and not has_dense_mlp:
+        return state_dict  # Already in vllm-i64 format or unknown
+
+    logger.info("Detected complexity-framework format, converting weights...")
+    converted = {}
+
+    # Collect expert weights per layer
+    expert_weights = {}  # (layer_idx, expert_id) → {gate_proj, up_proj, down_proj}
+
+    for name, tensor in state_dict.items():
+        # Expert format: layers.X.mlp.experts.E.{gate,up,down}_proj.weight
+        m = re.match(r"(layers\.\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", name)
+        if m:
+            layer_prefix, expert_id, proj_type = m.group(1), int(m.group(2)), m.group(3)
+            key = (layer_prefix, expert_id)
+            if key not in expert_weights:
+                expert_weights[key] = {}
+            expert_weights[key][proj_type] = tensor
+            continue
+
+        # Dense MLP: layers.X.mlp.{gate,up,down}_proj.weight
+        m = re.match(r"(layers\.\d+)\.mlp\.(gate_proj|up_proj|down_proj)\.weight", name)
+        if m:
+            layer_prefix, proj_type = m.group(1), m.group(2)
+            key = (layer_prefix, 0)  # Single expert = expert 0
+            if key not in expert_weights:
+                expert_weights[key] = {}
+            expert_weights[key][proj_type] = tensor
+            continue
+
+        # token_to_expert buffer
+        if "token_to_expert" in name:
+            converted[name] = tensor
+            continue
+
+        # INL dynamics: controller.0 → controller_in, controller.2 → controller_out
+        m = re.match(r"(layers\.\d+\.dynamics)\.controller\.0\.(weight|bias)", name)
+        if m:
+            converted[f"{m.group(1)}.controller_in.{m.group(2)}"] = tensor
+            continue
+        m = re.match(r"(layers\.\d+\.dynamics)\.controller\.2\.(weight|bias)", name)
+        if m:
+            converted[f"{m.group(1)}.controller_out.{m.group(2)}"] = tensor
+            continue
+
+        # Everything else passes through as-is
+        converted[name] = tensor
+
+    # Fuse expert gate+up into gate_up_proj [num_experts, hidden, 2*inter]
+    # and stack down_proj [num_experts, inter, hidden]
+    from collections import defaultdict
+    layers_experts = defaultdict(dict)
+    for (layer_prefix, expert_id), weights in expert_weights.items():
+        layers_experts[layer_prefix][expert_id] = weights
+
+    for layer_prefix, experts in layers_experts.items():
+        num_experts = max(experts.keys()) + 1
+
+        gate_up_list = []
+        down_list = []
+        for eid in range(num_experts):
+            w = experts[eid]
+            gate = w["gate_proj"]  # [inter, hidden]
+            up = w["up_proj"]      # [inter, hidden]
+            down = w["down_proj"]  # [hidden, inter]
+
+            # Fuse gate+up: [hidden, 2*inter] (transposed for bmm format)
+            gate_up = torch.cat([gate, up], dim=0).t()  # [hidden, 2*inter]
+            gate_up_list.append(gate_up)
+            down_list.append(down.t())  # [inter, hidden]
+
+        # Stack: [num_experts, hidden, 2*inter]
+        gate_up_stacked = torch.stack(gate_up_list, dim=0)
+        down_stacked = torch.stack(down_list, dim=0)
+
+        converted[f"{layer_prefix}.mlp.gate_up_proj"] = gate_up_stacked
+        converted[f"{layer_prefix}.mlp.down_proj"] = down_stacked
+
+        # Create token_to_expert buffer if not present
+        tok_expert_key = f"{layer_prefix}.mlp.token_to_expert"
+        if tok_expert_key not in converted:
+            vocab_size = state_dict.get("embed_tokens.weight", torch.zeros(32000, 1)).shape[0]
+            converted[tok_expert_key] = torch.arange(vocab_size, dtype=torch.long) % num_experts
+
+    logger.info("Converted %d layers (%d expert groups)", len(layers_experts), len(expert_weights))
+    return converted
+
+
 def _get_module_for_param(model: nn.Module, param_name: str) -> Optional[nn.Module]:
     """Walk the module tree to find the module owning a parameter."""
     parts = param_name.split(".")
@@ -178,6 +282,9 @@ def load_checkpoint(
         logger.info("Loading checkpoint: %s", checkpoint_path)
 
     state_dict = _load_state_dict(checkpoint_path)
+
+    # Auto-detect complexity-framework format and convert to vllm-i64 format
+    state_dict = _convert_framework_weights(state_dict)
 
     # Build lookup of model parameters and their parent modules
     params = dict(model.named_parameters())

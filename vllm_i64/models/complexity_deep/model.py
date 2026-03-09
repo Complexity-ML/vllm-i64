@@ -568,13 +568,17 @@ class ComplexityDecoderLayer(nn.Module):
 
     def __init__(self, config: ComplexityDeepConfig):
         super().__init__()
+        self.use_dynamics = getattr(config, 'use_inl_dynamics', True) and config.num_experts > 1
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = MuGuidedAttention(config)
-        self.dynamics = INLDynamics(
-            hidden_size=config.hidden_size,
-            controller_hidden=config.dynamics_controller_hidden,
-            dt=config.dynamics_dt,
-        )
+
+        if self.use_dynamics:
+            self.dynamics = INLDynamics(
+                hidden_size=config.hidden_size,
+                controller_hidden=config.dynamics_controller_hidden,
+                dt=config.dynamics_dt,
+            )
+
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mlp = MuGuidedTokenRoutedMLP(config)
 
@@ -592,7 +596,6 @@ class ComplexityDecoderLayer(nn.Module):
         """Decode-only layer forward. CUDA-graph compatible (all tensor ops)."""
         residual = hidden
 
-        # Fused RMSNorm+Quant: norm (float) + INT8 quantize in 1 kernel
         norm_out = self.input_layernorm(hidden)
         x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
         hidden = self.self_attn.decode_step(
@@ -602,7 +605,10 @@ class ComplexityDecoderLayer(nn.Module):
             x_preq=x_preq,
         )
 
-        hidden, velocity, mu_current = self.dynamics(hidden, velocity)
+        if self.use_dynamics:
+            hidden, velocity, mu_current = self.dynamics(hidden, velocity)
+        else:
+            mu_current = None
         hidden = residual + hidden
 
         residual = hidden
@@ -636,7 +642,10 @@ class ComplexityDecoderLayer(nn.Module):
             x_preq=x_preq,
         )
 
-        hidden, velocity, mu_current = self.dynamics(hidden, velocity)
+        if self.use_dynamics:
+            hidden, velocity, mu_current = self.dynamics(hidden, velocity)
+        else:
+            mu_current = None
         hidden = residual + hidden
 
         residual = hidden
@@ -744,11 +753,12 @@ class ComplexityDeepModel(nn.Module):
                 seq_ids_tensor=seq_ids_tensor,
             )
 
-            if mu_residual is None:
-                mu_residual = mu_current.clone()
-            else:
-                mu_residual = mu_residual + mu_current
-            mu_prev = mu_current + 0.1 * mu_residual
+            if mu_current is not None:
+                if mu_residual is None:
+                    mu_residual = mu_current.clone()
+                else:
+                    mu_residual = mu_residual + mu_current
+                mu_prev = mu_current + 0.1 * mu_residual
 
         if not is_last_pp_rank():
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
@@ -796,12 +806,13 @@ class ComplexityDeepModel(nn.Module):
                 tokens_per_seq=tokens_per_seq,
             )
 
-            # Mu Residual Highway
-            if mu_residual is None:
-                mu_residual = mu_current.clone()
-            else:
-                mu_residual = mu_residual + mu_current
-            mu_prev = mu_current + 0.1 * mu_residual
+            # Mu Residual Highway (skip for dense models without dynamics)
+            if mu_current is not None:
+                if mu_residual is None:
+                    mu_residual = mu_current.clone()
+                else:
+                    mu_residual = mu_residual + mu_current
+                mu_prev = mu_current + 0.1 * mu_residual
 
         # Not last stage: pass tensors to next stage
         if not is_last_pp_rank():
