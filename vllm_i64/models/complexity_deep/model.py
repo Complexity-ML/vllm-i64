@@ -767,7 +767,7 @@ class ComplexityDeepModel(nn.Module):
                     mu_residual = mu_current.clone()
                 else:
                     mu_residual = mu_residual + mu_current
-                mu_prev = mu_current + 0.1 * mu_residual
+                mu_prev = torch.clamp(mu_current + 0.1 * mu_residual, -2.0, 2.0)
 
         if not is_last_pp_rank():
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
@@ -821,7 +821,7 @@ class ComplexityDeepModel(nn.Module):
                     mu_residual = mu_current.clone()
                 else:
                     mu_residual = mu_residual + mu_current
-                mu_prev = mu_current + 0.1 * mu_residual
+                mu_prev = torch.clamp(mu_current + 0.1 * mu_residual, -2.0, 2.0)
 
         # Not last stage: pass tensors to next stage
         if not is_last_pp_rank():
