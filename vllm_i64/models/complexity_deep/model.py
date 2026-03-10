@@ -620,7 +620,7 @@ class ComplexityDecoderLayer(nn.Module):
         residual = hidden
         norm_out = self.post_attention_layernorm(hidden)
         x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
-        mlp_mu = None if self.disable_mu_guidance else mu_current
+        mlp_mu = None  # MLP never receives mu during training (block.py:147)
         hidden = self.mlp(norm_out, token_ids=token_ids, mu=mlp_mu, x_preq=x_preq)
         hidden = residual + hidden
 
@@ -659,7 +659,7 @@ class ComplexityDecoderLayer(nn.Module):
         residual = hidden
         norm_out = self.post_attention_layernorm(hidden)
         x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
-        mlp_mu = None if self.disable_mu_guidance else mu_current
+        mlp_mu = None  # MLP never receives mu during training (block.py:147)
         hidden = self.mlp(norm_out, token_ids=token_ids, mu=mlp_mu, x_preq=x_preq)
         hidden = residual + hidden
 
@@ -676,7 +676,7 @@ class ComplexityDeepModel(nn.Module):
 
     Complexity Deep specific:
       - INL Dynamics per layer
-      - Mu Residual Highway: mu_prev = mu_current + 0.1 * mu_residual
+      - Mu pass-through: mu_prev = mu_current (match training, no clamp, no residual)
       - Mu-guided attention and routing
       - Tied embeddings
 
@@ -747,7 +747,6 @@ class ComplexityDeepModel(nn.Module):
             hidden = self.embed_tokens(token_ids.long())
             velocity = torch.zeros_like(hidden)
             mu_prev = None
-            mu_residual = None
         else:
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
 
@@ -762,12 +761,9 @@ class ComplexityDeepModel(nn.Module):
                 seq_ids_tensor=seq_ids_tensor,
             )
 
+            # Match original training exactly: mu_prev = mu_contextual, no clamp, no residual
             if mu_current is not None:
-                if mu_residual is None:
-                    mu_residual = mu_current.clone()
-                else:
-                    mu_residual = mu_residual + mu_current
-                mu_prev = torch.clamp(mu_current + 0.1 * mu_residual, -2.0, 2.0)
+                mu_prev = mu_current
 
         if not is_last_pp_rank():
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
@@ -793,14 +789,12 @@ class ComplexityDeepModel(nn.Module):
             hidden = self.embed_tokens(token_ids.long())
             velocity = torch.zeros_like(hidden)
             mu_prev = None
-            mu_residual = None
         else:
             # Receive from previous stage
             assert intermediate_tensors is not None
             hidden = intermediate_tensors["hidden_states"]
             velocity = intermediate_tensors["velocity_states"]
             mu_prev = intermediate_tensors.get("mu_prev")
-            mu_residual = intermediate_tensors.get("mu_residual")
 
         # Process only our assigned layers
         for layer_idx in range(self.start_layer, self.end_layer):
@@ -815,13 +809,9 @@ class ComplexityDeepModel(nn.Module):
                 tokens_per_seq=tokens_per_seq,
             )
 
-            # Mu Residual Highway (skip for dense models without dynamics)
+            # Match original training exactly: mu_prev = mu_contextual, no clamp, no residual
             if mu_current is not None:
-                if mu_residual is None:
-                    mu_residual = mu_current.clone()
-                else:
-                    mu_residual = mu_residual + mu_current
-                mu_prev = torch.clamp(mu_current + 0.1 * mu_residual, -2.0, 2.0)
+                mu_prev = mu_current
 
         # Not last stage: pass tensors to next stage
         if not is_last_pp_rank():
@@ -829,7 +819,6 @@ class ComplexityDeepModel(nn.Module):
                 "hidden_states": hidden,
                 "velocity_states": velocity,
                 "mu_prev": mu_prev,
-                "mu_residual": mu_residual,
             })
 
         # Last stage: norm + logits
