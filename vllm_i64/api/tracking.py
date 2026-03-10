@@ -150,6 +150,7 @@ class RequestLogger:
         api_key: Optional[str] = None,
         error: Optional[str] = None,
         request_id: Optional[str] = None,
+        partition: Optional[int] = None,
     ):
         if not self.enabled:
             return
@@ -162,6 +163,8 @@ class RequestLogger:
             "completion_tokens": completion_tokens,
             "api_key": api_key[:8] + "..." if api_key and len(api_key) > 8 else api_key,
         }
+        if partition is not None:
+            entry["partition"] = partition
         if request_id:
             entry["request_id"] = request_id
         if error:

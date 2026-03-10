@@ -51,12 +51,14 @@ class CompletionsMixin:
 
         resp = self._build_response(result, prompt_ids)
         latency_ms = (time.monotonic() - t0) * 1000
+        from vllm_i64.api.types import compute_partition
+        partition = compute_partition(api_key, getattr(request, "user", None))
         self._usage_tracker.record(api_key or "", len(prompt_ids), len(result.output_tokens))
         self._latency_tracker.record(endpoint, latency_ms)
         self._request_logger.log_request(
             endpoint=endpoint, status=200, latency_ms=latency_ms,
             prompt_tokens=len(prompt_ids), completion_tokens=len(result.output_tokens),
-            api_key=api_key, request_id=resp.id,
+            api_key=api_key, request_id=resp.id, partition=partition,
         )
         return resp
 

@@ -5,9 +5,20 @@ CompletionRequest and CompletionResponse dataclasses.
 INL - 2025
 """
 
+import hashlib
 import json
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
+
+
+def compute_partition(api_key: Optional[str], user_id: Optional[str], n: int = 64) -> int:
+    """Compute deterministic partition index for cache affinity and load balancing.
+
+    partition = sha256(f"{api_key}:{user_id}") % n
+    """
+    key = f"{api_key or ''}:{user_id or ''}"
+    digest = hashlib.sha256(key.encode()).digest()
+    return int.from_bytes(digest[:4], "big") % n
 
 from vllm_i64.core.sampling import SamplingParams
 from vllm_i64.core.logits_processor import OutputConstraints
@@ -36,6 +47,7 @@ class CompletionRequest:
     presence_penalty: float = 0.0
     priority: int = 0
     suppress_first_tokens: Optional[List[int]] = None
+    user: Optional[str] = None  # OpenAI-compat user ID for partition affinity
 
     def validate(self, max_seq_len: int = 2048) -> Optional[str]:
         if not self.prompt or not self.prompt.strip():
