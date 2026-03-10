@@ -297,6 +297,51 @@ register_model(
     description="Complexity-I64 integer-native model — use --checkpoint to specify model",
 )
 
+# --- Ablation runs (TMLR paper) ---
+# run1: dense baseline (no routing, no dynamics)
+register_model(
+    name="run1-dense",
+    model_class=_COMPLEXITY_DEEP[0],
+    config_loader=_COMPLEXITY_DEEP[1],
+    config_path="C:/INL/pacific-prime/run1-dense/final/config.json",
+    checkpoint="C:/INL/pacific-prime/run1-dense/final",
+    parameters="~150M",
+    description="Ablation: dense SwigLU baseline (no token routing, no dynamics)",
+)
+
+# run2: full architecture (token-routed + mu + pid)
+register_model(
+    name="run2-full",
+    model_class=_COMPLEXITY_DEEP[0],
+    config_loader=_COMPLEXITY_DEEP[1],
+    config_path="C:/INL/pacific-prime/run2-full/final/config.json",
+    checkpoint="C:/INL/pacific-prime/run2-full/final",
+    parameters="~150M",
+    description="Ablation: full Complexity Deep (token-routed + mu + pid)",
+)
+
+# run3: no mu guidance (token-routed + pid only)
+register_model(
+    name="run3-no-mu",
+    model_class=_COMPLEXITY_DEEP[0],
+    config_loader=_COMPLEXITY_DEEP[1],
+    config_path="C:/INL/pacific-prime/run3-no-mu/final/config.json",
+    checkpoint="C:/INL/pacific-prime/run3-no-mu/final",
+    parameters="~150M",
+    description="Ablation: no mu guidance (token-routed + pid, mu bypassed)",
+)
+
+# run4: no PID scaler (token-routed + mu only)
+register_model(
+    name="run4-no-pid",
+    model_class=_COMPLEXITY_DEEP[0],
+    config_loader=_COMPLEXITY_DEEP[1],
+    config_path="C:/INL/pacific-prime/run4-no-pid/final/config.json",
+    checkpoint="C:/INL/pacific-prime/run4-no-pid/final",
+    parameters="~150M",
+    description="Ablation: no PID scaler (token-routed + mu only)",
+)
+
 # --- Vision-Language Models ---
 
 register_model(

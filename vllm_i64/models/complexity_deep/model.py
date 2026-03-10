@@ -568,7 +568,12 @@ class ComplexityDecoderLayer(nn.Module):
 
     def __init__(self, config: ComplexityDeepConfig):
         super().__init__()
-        self.use_dynamics = getattr(config, 'use_inl_dynamics', True) and config.num_experts > 1
+        self.use_dynamics = (
+            getattr(config, 'use_inl_dynamics', True)
+            and config.num_experts > 1
+            and not getattr(config, 'disable_pid_scaler', False)
+        )
+        self.disable_mu_guidance = getattr(config, 'disable_mu_guidance', False)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = MuGuidedAttention(config)
 
@@ -598,8 +603,9 @@ class ComplexityDecoderLayer(nn.Module):
 
         norm_out = self.input_layernorm(hidden)
         x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
+        attn_mu = None if self.disable_mu_guidance else mu_prev
         hidden = self.self_attn.decode_step(
-            norm_out, positions, mu_prev=mu_prev,
+            norm_out, positions, mu_prev=attn_mu,
             kv_cache=kv_cache, layer_idx=layer_idx,
             seq_ids_tensor=seq_ids_tensor,
             x_preq=x_preq,
@@ -614,7 +620,8 @@ class ComplexityDecoderLayer(nn.Module):
         residual = hidden
         norm_out = self.post_attention_layernorm(hidden)
         x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
-        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mu_current, x_preq=x_preq)
+        mlp_mu = None if self.disable_mu_guidance else mu_current
+        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mlp_mu, x_preq=x_preq)
         hidden = residual + hidden
 
         return hidden, velocity, mu_current
@@ -635,8 +642,9 @@ class ComplexityDecoderLayer(nn.Module):
 
         norm_out = self.input_layernorm(hidden)
         x_preq = self.input_layernorm._try_fused_quant(hidden) if hasattr(self.self_attn, 'qkv_int8') else None
+        attn_mu = None if self.disable_mu_guidance else mu_prev
         hidden = self.self_attn(
-            norm_out, positions, mu_prev=mu_prev,
+            norm_out, positions, mu_prev=attn_mu,
             kv_cache=kv_cache, layer_idx=layer_idx,
             seq_ids=seq_ids, tokens_per_seq=tokens_per_seq,
             x_preq=x_preq,
@@ -651,7 +659,8 @@ class ComplexityDecoderLayer(nn.Module):
         residual = hidden
         norm_out = self.post_attention_layernorm(hidden)
         x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
-        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mu_current, x_preq=x_preq)
+        mlp_mu = None if self.disable_mu_guidance else mu_current
+        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mlp_mu, x_preq=x_preq)
         hidden = residual + hidden
 
         return hidden, velocity, mu_current

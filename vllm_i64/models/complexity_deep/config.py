@@ -65,6 +65,10 @@ class ComplexityDeepConfig:
     dynamics_dt: float = 0.1
     dynamics_controller_hidden: int = 64
 
+    # Ablation flags (from training config)
+    disable_mu_guidance: bool = False   # run3-no-mu: skip mu→Q/K/V and mu routing
+    disable_pid_scaler: bool = False    # run4-no-pid: skip INL dynamics entirely
+
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
