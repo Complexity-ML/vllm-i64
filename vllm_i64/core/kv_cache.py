@@ -1,41 +1,44 @@
 """
 vllm-i64 :: Paged KV Cache
 
-Block-based KV cache with integer indexing.
+Block-based KV cache — physical tensors + vLLM-style BlockPool allocator.
 
-All metadata is integer:
-  - Block table: i32 (block_id per slot)
-  - Free list: i32 (available block IDs)
-  - Sequence lengths: i32
+Architecture (mirroring vLLM v1):
+  BlockPool   → allocation / LRU eviction / prefix caching  (block_pool.py)
+  KV tensors  → k_cache / v_cache per layer  (this file)
+  block_table → seq_id × block_idx → physical_block_id  (this file)
 
-Only the K/V tensors themselves are float (they store attention states).
+Same public API as before; swap-to-CPU and CUDA graph support preserved.
 
 INL - 2025
 """
 
-import torch
 import heapq
-import hashlib
 import logging
-from typing import Optional, Tuple, List, Dict, Set
+from contextlib import contextmanager
+from typing import Dict, List, Optional, Set, Tuple
+
+import torch
+
+from vllm_i64.core.block_pool import BlockPool, KVCacheBlock
 
 logger = logging.getLogger(__name__)
 
 
 class PagedKVCache:
     """
-    Paged KV cache with integer block management.
+    Paged KV cache.
 
     Memory layout (flash_attn-compatible):
-        k_cache: (num_blocks, block_size, num_heads, head_dim) float
-        v_cache: (num_blocks, block_size, num_heads, head_dim) float
-        block_table: (max_seqs, max_blocks_per_seq) i32
+        k_cache / v_cache : (num_blocks, block_size, num_kv_heads, head_dim)
+        block_table       : (max_seqs, max_blocks_per_seq) int32
+        seq_lens          : (max_seqs,) int32
 
-    Block allocation/deallocation is pure integer.
+    Block allocation is handled by BlockPool (vLLM-style doubly-linked free
+    list + ref counting + prefix caching).
 
-    LRU eviction: when the cache is full, the least recently used
-    sequence is evicted to make room — no RuntimeError, no lost requests.
-    All LRU tracking is integer (monotonic counter).
+    Sequence-level LRU eviction: when the pool is full, the least recently
+    used sequence is freed to make room — no RuntimeError, no dropped requests.
     """
 
     def __init__(
@@ -59,227 +62,234 @@ class PagedKVCache:
         self.num_blocks = num_blocks
         self.max_seqs = max_seqs
         self.compute_dtype = dtype
+        self.enable_lru_eviction = enable_lru_eviction
 
-        # Device validation with CPU fallback
         self.device = self._resolve_device(device)
 
-        # FP8 quantization: store KV in FP8 for 2x memory savings
+        # KV storage dtype (FP8 for 2× memory savings when requested)
         if kv_cache_dtype == "fp8" and self.device != "cpu":
             self.kv_dtype = torch.float8_e4m3fn
         elif kv_cache_dtype == "fp8_e5m2" and self.device != "cpu":
             self.kv_dtype = torch.float8_e5m2
         else:
             self.kv_dtype = dtype
-        self.dtype = dtype  # backward compat (read_kv returns this dtype)
+        self.dtype = dtype  # backward compat — read_kv returns compute dtype
 
-        # Max blocks any single sequence can hold. Capped at the model's context
-        # window (max_position_embeddings // block_size) to avoid over-allocating
-        # static tensors during CUDA graph capture.
-        self.max_blocks_per_seq = max_blocks_per_seq if max_blocks_per_seq is not None else num_blocks
+        self.max_blocks_per_seq = (
+            max_blocks_per_seq if max_blocks_per_seq is not None else num_blocks
+        )
 
-        # KV tensors (stored in kv_dtype — may be FP8 for memory savings)
-        # Per layer: (num_blocks, block_size, num_kv_heads, head_dim)
-        # Layout matches flash_attn_with_kv_cache expectations
+        # ── Physical KV tensors ────────────────────────────────────────────
+        # (num_blocks, block_size, num_kv_heads, head_dim) — flash_attn layout
         self.k_caches = [
-            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=self.device)
+            torch.zeros(
+                num_blocks, block_size, num_kv_heads, head_dim,
+                dtype=self.kv_dtype, device=self.device,
+            )
             for _ in range(num_layers)
         ]
         self.v_caches = [
-            torch.zeros(num_blocks, block_size, num_kv_heads, head_dim, dtype=self.kv_dtype, device=self.device)
+            torch.zeros(
+                num_blocks, block_size, num_kv_heads, head_dim,
+                dtype=self.kv_dtype, device=self.device,
+            )
             for _ in range(num_layers)
         ]
 
-        # Block table: maps (seq_id, block_idx) → physical block_id (i32)
-        # On device (GPU when available) to avoid CPU→GPU transfer on decode hot path.
-        # Management code uses .item() for scalar reads (sync is fine, not on hot path).
+        # ── Block table ────────────────────────────────────────────────────
+        # (max_seqs, max_blocks_per_seq) int32  — on GPU for hot-path reads
         self.block_table = torch.full(
-            (max_seqs, self.max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
+            (max_seqs, self.max_blocks_per_seq), -1,
+            dtype=torch.int32, device=self.device,
         )
 
-        # Free block list (integer)
-        self.free_blocks: List[int] = list(range(num_blocks))
-
-        # Sequence lengths (integer) — on device for flash_attn cache_seqlens
+        # ── Sequence lengths ───────────────────────────────────────────────
         self.seq_lens = torch.zeros(max_seqs, dtype=torch.int32, device=self.device)
 
-        # ── LRU eviction tracking (all integer, heap-based O(log n)) ──
-        self.enable_lru_eviction = enable_lru_eviction
-        self._access_counter: int = 0          # monotonic i64 clock
-        self._last_access: Dict[int, int] = {} # seq_id → last access tick
-        self._eviction_count: int = 0          # total evictions performed
-        self._evicted_seq_ids: List[int] = []  # recently evicted (for scheduler)
-        self._active_seq_ids: set = set()      # O(1) tracking of allocated seqs
-        self._pinned_seq_ids: set = set()      # Sequences protected from eviction
-        # Min-heap of (tick, seq_id) for O(log n) eviction candidate selection
-        self._lru_heap: List[Tuple[int, int]] = []
+        # ── vLLM-style BlockPool ───────────────────────────────────────────
+        # Manages free list (O(1) doubly-linked LRU) + ref counting +
+        # prefix caching.  Prefix caching is opt-in via enable_prefix_caching().
+        self.pool = BlockPool(
+            num_gpu_blocks=num_blocks,
+            enable_caching=False,   # enabled via enable_prefix_caching()
+            block_size=block_size,
+        )
 
-        # ── Swap-to-CPU ──
+        # seq_id → list of KVCacheBlock objects (ordered by block_idx)
+        self._seq_blocks: Dict[int, List[KVCacheBlock]] = {}
+
+        # Pinned sequences (never evicted during active decode)
+        self._pinned_seq_ids: Set[int] = set()
+
+        # ── Sequence-level LRU ─────────────────────────────────────────────
+        # Pool evicts at block level; we additionally evict at sequence level
+        # so the scheduler gets clean per-seq eviction notifications.
+        self._access_counter: int = 0
+        self._last_access: Dict[int, int] = {}
+        self._lru_heap: List[Tuple[int, int]] = []  # (tick, seq_id) min-heap
+        self._eviction_count: int = 0
+        self._evicted_seq_ids: List[int] = []
+
+        # ── Lazy block zeroing ─────────────────────────────────────────────
+        # Zero GPU memory at allocation time (not at free time) so free_sequence
+        # is O(1).  Blocks that need zeroing before next use are tracked here.
+        self._dirty_blocks: Set[int] = set()
+
+        # ── Swap-to-CPU ────────────────────────────────────────────────────
         self._swap_enabled = False
         self._cpu_k_caches: Optional[List[torch.Tensor]] = None
         self._cpu_v_caches: Optional[List[torch.Tensor]] = None
         self._cpu_free_blocks: List[int] = []
         self._cpu_block_table: Optional[torch.Tensor] = None
-        self._swapped_seqs: Dict[int, dict] = {}  # seq_id → swap metadata
+        self._swapped_seqs: Dict[int, dict] = {}
         self._swap_count: int = 0
 
-        # ── O(1) block count per sequence ──
-        # Avoids scanning block_table[seq_id] >= 0 on every allocate/evict.
-        self._block_count: Dict[int, int] = {}
-
-        # ── Lazy block zeroing ──
-        # Blocks are zeroed on allocation, not on free. This makes
-        # free_sequence() O(1) per block and defers the GPU write to
-        # the next allocation — beneficial for bulk LRU evictions.
-        self._dirty_blocks: Set[int] = set()
-
-        # ── CUDA graph support ──
-        # Static buffers for block_table/seqlens used during graph replay.
-        # These keep the same tensor addresses across captures and replays.
+        # ── CUDA graph support ─────────────────────────────────────────────
         self._graph_mode: bool = False
         self._graph_block_table: Optional[torch.Tensor] = None
         self._graph_cache_seqlens: Optional[torch.Tensor] = None
 
+    # ======================================================================
+    # Device resolution
+    # ======================================================================
+
     @staticmethod
     def _resolve_device(device: str) -> str:
-        """Validate device and fall back to CPU if unavailable."""
         if device == "cpu":
             return "cpu"
         if device.startswith("cuda"):
             if not torch.cuda.is_available():
-                logger.warning(
-                    "Device %r requested but CUDA is not available — falling back to cpu",
-                    device,
-                )
+                logger.warning("CUDA not available — falling back to cpu")
                 return "cpu"
-            # Validate specific device ordinal (e.g. "cuda:3")
             if ":" in device:
                 ordinal = int(device.split(":")[1])
                 if ordinal >= torch.cuda.device_count():
                     logger.warning(
-                        "Device %r requested but only %d GPU(s) visible — falling back to cpu",
+                        "Device %r not available (%d GPU(s)) — falling back to cpu",
                         device, torch.cuda.device_count(),
                     )
                     return "cpu"
             return device
-        # Unknown device string — let PyTorch try, fall back on failure
         try:
             torch.empty(1, device=device)
             return device
         except (RuntimeError, AssertionError):
-            logger.warning(
-                "Device %r is not available — falling back to cpu", device,
-            )
+            logger.warning("Device %r unavailable — falling back to cpu", device)
             return "cpu"
+
+    # ======================================================================
+    # Properties
+    # ======================================================================
 
     @property
     def num_free_blocks(self) -> int:
-        return len(self.free_blocks)
+        return self.pool.get_num_free_blocks()
 
     @property
     def num_used_blocks(self) -> int:
-        return self.num_blocks - len(self.free_blocks)
+        return self.num_blocks - self.pool.get_num_free_blocks()
 
-    def _touch(self, seq_id: int):
-        """Update LRU access tick for a sequence. Pure integer + heap push O(log n)."""
+    # ======================================================================
+    # LRU tracking (sequence level)
+    # ======================================================================
+
+    def _touch(self, seq_id: int) -> None:
+        """Update LRU access tick. O(log n) heap push."""
         self._access_counter += 1
         self._last_access[seq_id] = self._access_counter
         heapq.heappush(self._lru_heap, (self._access_counter, seq_id))
-        # Periodic compaction: if heap has >4x active entries, rebuild
-        if len(self._lru_heap) > max(256, 4 * len(self._active_seq_ids)):
+        active_count = len(self._seq_blocks)
+        if len(self._lru_heap) > max(256, 4 * active_count):
             self._compact_lru_heap()
 
-    def _compact_lru_heap(self):
-        """Remove stale entries from the LRU heap."""
+    def _compact_lru_heap(self) -> None:
         fresh = [
             (tick, sid) for tick, sid in self._lru_heap
-            if sid in self._active_seq_ids and self._last_access.get(sid) == tick
+            if sid in self._seq_blocks
+            and self._last_access.get(sid) == tick
         ]
         heapq.heapify(fresh)
         self._lru_heap = fresh
 
     def _evict_lru(self, num_blocks_needed: int, protect_seq_id: int = -1) -> int:
         """
-        Evict least recently used sequences until we have enough free blocks.
-        Uses a min-heap for O(log n) candidate selection instead of O(n log n) sort.
-
-        Args:
-            num_blocks_needed: how many blocks we need to free
-            protect_seq_id: don't evict this sequence (the one requesting blocks)
-
-        Returns:
-            Number of blocks freed.
+        Evict LRU sequences until num_blocks_needed free blocks are available.
+        Returns total blocks freed.
         """
         freed = 0
         self._evicted_seq_ids.clear()
 
-        # Pop from min-heap to find LRU candidates in O(log n) per eviction
         while freed < num_blocks_needed and self._lru_heap:
-            tick, victim_sid = heapq.heappop(self._lru_heap)
+            tick, victim = heapq.heappop(self._lru_heap)
 
-            # Skip stale entries: seq no longer active, or tick is outdated
-            if victim_sid not in self._active_seq_ids:
+            if victim not in self._seq_blocks:
                 continue
-            if self._last_access.get(victim_sid, 0) != tick:
-                continue  # Stale — this seq was touched again after this entry
-            if victim_sid == protect_seq_id or victim_sid in self._pinned_seq_ids:
-                # Re-push protected/pinned seq so it's not lost from the heap
-                heapq.heappush(self._lru_heap, (tick, victim_sid))
+            if self._last_access.get(victim, 0) != tick:
+                continue
+            if victim == protect_seq_id or victim in self._pinned_seq_ids:
+                heapq.heappush(self._lru_heap, (tick, victim))
                 continue
 
-            # Measure actual freed blocks via free_blocks diff
-            free_before = len(self.free_blocks)
-            self.free_sequence(victim_sid)
-            freed += len(self.free_blocks) - free_before
+            before = self.pool.get_num_free_blocks()
+            self.free_sequence(victim)
+            freed += self.pool.get_num_free_blocks() - before
             self._eviction_count += 1
-            self._evicted_seq_ids.append(victim_sid)
+            self._evicted_seq_ids.append(victim)
 
         return freed
 
     def get_evicted_seq_ids(self) -> List[int]:
-        """Return seq_ids evicted in the last allocate_blocks call (for scheduler sync)."""
         return list(self._evicted_seq_ids)
+
+    # ======================================================================
+    # Block allocation
+    # ======================================================================
 
     def allocate_blocks(self, seq_id: int, num_blocks_needed: int) -> List[int]:
         """
-        Allocate blocks for a sequence. Pure integer operation.
+        Allocate blocks for a sequence.
 
-        With LRU eviction enabled, automatically evicts the least recently
-        used sequences when the cache is full instead of raising OOM.
+        Uses BlockPool.get_new_blocks() which evicts from the LRU tail of the
+        free queue.  If the pool is still short (prefix-cached blocks are being
+        held by other seqs), falls back to sequence-level LRU eviction.
 
-        Returns list of allocated block IDs.
+        Returns list of newly allocated physical block IDs.
         """
-        if num_blocks_needed > len(self.free_blocks):
+        if num_blocks_needed > self.pool.get_num_free_blocks():
             if self.enable_lru_eviction:
-                deficit = num_blocks_needed - len(self.free_blocks)
+                deficit = num_blocks_needed - self.pool.get_num_free_blocks()
                 freed = self._evict_lru(deficit, protect_seq_id=seq_id)
                 if freed < deficit:
                     raise RuntimeError(
                         f"OOM after LRU eviction: need {num_blocks_needed} blocks, "
-                        f"freed {freed}, have {len(self.free_blocks)}"
+                        f"freed {freed}, have {self.pool.get_num_free_blocks()}"
                     )
             else:
                 raise RuntimeError(
-                    f"OOM: need {num_blocks_needed} blocks, have {len(self.free_blocks)}"
+                    f"OOM: need {num_blocks_needed} blocks, "
+                    f"have {self.pool.get_num_free_blocks()}"
                 )
 
-        allocated = []
-        current_blocks = self._block_count.get(seq_id, 0)
+        new_blocks = self.pool.get_new_blocks(num_blocks_needed)
 
-        for i in range(num_blocks_needed):
-            block_id = self.free_blocks.pop()
-            # Lazy zeroing: only zero blocks that were previously used
-            if block_id in self._dirty_blocks:
-                self._zero_block(block_id)
-                self._dirty_blocks.discard(block_id)
-            block_idx = current_blocks + i
-            self.block_table[seq_id, block_idx] = block_id
-            allocated.append(block_id)
+        # Lazy zeroing: zero GPU memory for blocks that were previously used
+        for blk in new_blocks:
+            if blk.block_id in self._dirty_blocks:
+                self._zero_block(blk.block_id)
+                self._dirty_blocks.discard(blk.block_id)
 
-        self._block_count[seq_id] = current_blocks + num_blocks_needed
+        existing = self._seq_blocks.get(seq_id, [])
+        start = len(existing)
+        for i, blk in enumerate(new_blocks):
+            self.block_table[seq_id, start + i] = blk.block_id
+        self._seq_blocks[seq_id] = existing + new_blocks
+
         self._touch(seq_id)
-        self._active_seq_ids.add(seq_id)
-        return allocated
+        return [blk.block_id for blk in new_blocks]
 
+    # ======================================================================
+    # KV read / write
+    # ======================================================================
 
     def write_kv(
         self,
@@ -288,30 +298,20 @@ class PagedKVCache:
         position: int,
         k: torch.Tensor,   # (num_kv_heads, head_dim)
         v: torch.Tensor,   # (num_kv_heads, head_dim)
-    ):
-        """
-        Write K/V to cache at a position.
-
-        Block lookup is integer:
-            block_idx = position // block_size
-            offset = position % block_size
-            physical_block = block_table[seq_id, block_idx]
-        """
+    ) -> None:
         block_idx = position // self.block_size
-        offset = position % self.block_size
-        physical_block = self.block_table[seq_id, block_idx].item()
+        offset    = position % self.block_size
+        physical  = self.block_table[seq_id, block_idx].item()
 
-        if physical_block < 0:
-            # Need to allocate
-            [physical_block] = self.allocate_blocks(seq_id, 1)
+        if physical < 0:
+            [physical] = self.allocate_blocks(seq_id, 1)
 
-        # Copy-on-write: if this block is shared via prefix caching, copy first
-        physical_block = self._cow_if_shared(seq_id, block_idx, physical_block)
+        physical = self._cow_if_shared(seq_id, block_idx, physical)
 
         k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
         v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
-        self.k_caches[layer_idx][physical_block, offset, :, :] = k_kv
-        self.v_caches[layer_idx][physical_block, offset, :, :] = v_kv
+        self.k_caches[layer_idx][physical, offset] = k_kv
+        self.v_caches[layer_idx][physical, offset] = v_kv
         self.seq_lens[seq_id] = max(self.seq_lens[seq_id].item(), position + 1)
         self._touch(seq_id)
 
@@ -321,58 +321,47 @@ class PagedKVCache:
         seq_id: int,
         max_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Read all K/V for a sequence. Vectorized by block to avoid per-token Python loops.
-
-        Returns:
-            k: (seq_len, num_kv_heads, head_dim)
-            v: (seq_len, num_kv_heads, head_dim)
-        """
+        """Read full K/V for a sequence. Returns (seq_len, num_kv_heads, head_dim)."""
         self._touch(seq_id)
         seq_len = self.seq_lens[seq_id].item()
         if max_len is not None:
             seq_len = min(seq_len, max_len)
 
+        empty = lambda: torch.zeros(
+            0, self.num_kv_heads, self.head_dim,
+            dtype=self.compute_dtype, device=self.device,
+        )
         if seq_len == 0:
-            return (
-                torch.zeros(0, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device),
-                torch.zeros(0, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device),
-            )
+            return empty(), empty()
 
-        # Always return in compute dtype (dequantize if FP8)
-        k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device)
-        v_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=self.compute_dtype, device=self.device)
+        k_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim,
+                            dtype=self.compute_dtype, device=self.device)
+        v_out = torch.zeros(seq_len, self.num_kv_heads, self.head_dim,
+                            dtype=self.compute_dtype, device=self.device)
 
-        # Vectorized by block — copy entire block slices instead of per-token
-        num_full_blocks = seq_len // self.block_size
+        num_full = seq_len // self.block_size
         remainder = seq_len % self.block_size
-        total_blocks = num_full_blocks + (1 if remainder > 0 else 0)
-
-        # Fetch all physical block IDs in one tensor op (1 GPU→CPU transfer)
-        if total_blocks > 0:
-            physical_blocks = self.block_table[seq_id, :total_blocks].tolist()
-        else:
-            physical_blocks = []
+        total = num_full + (1 if remainder else 0)
+        physical_ids = self.block_table[seq_id, :total].tolist() if total else []
 
         need_cast = self.kv_dtype != self.compute_dtype
-        for block_idx in range(num_full_blocks):
-            physical_block = physical_blocks[block_idx]
-            if physical_block >= 0:
-                start = block_idx * self.block_size
-                end = start + self.block_size
-                k_block = self.k_caches[layer_idx][physical_block, :self.block_size, :, :]
-                v_block = self.v_caches[layer_idx][physical_block, :self.block_size, :, :]
-                k_out[start:end] = k_block.to(self.compute_dtype) if need_cast else k_block
-                v_out[start:end] = v_block.to(self.compute_dtype) if need_cast else v_block
+        for bidx in range(num_full):
+            pb = physical_ids[bidx]
+            if pb >= 0:
+                s, e = bidx * self.block_size, (bidx + 1) * self.block_size
+                k_b = self.k_caches[layer_idx][pb, :self.block_size]
+                v_b = self.v_caches[layer_idx][pb, :self.block_size]
+                k_out[s:e] = k_b.to(self.compute_dtype) if need_cast else k_b
+                v_out[s:e] = v_b.to(self.compute_dtype) if need_cast else v_b
 
-        if remainder > 0:
-            physical_block = physical_blocks[num_full_blocks]
-            if physical_block >= 0:
-                start = num_full_blocks * self.block_size
-                k_block = self.k_caches[layer_idx][physical_block, :remainder, :, :]
-                v_block = self.v_caches[layer_idx][physical_block, :remainder, :, :]
-                k_out[start:seq_len] = k_block.to(self.compute_dtype) if need_cast else k_block
-                v_out[start:seq_len] = v_block.to(self.compute_dtype) if need_cast else v_block
+        if remainder:
+            pb = physical_ids[num_full]
+            if pb >= 0:
+                s = num_full * self.block_size
+                k_b = self.k_caches[layer_idx][pb, :remainder]
+                v_b = self.v_caches[layer_idx][pb, :remainder]
+                k_out[s:seq_len] = k_b.to(self.compute_dtype) if need_cast else k_b
+                v_out[s:seq_len] = v_b.to(self.compute_dtype) if need_cast else v_b
 
         return k_out, v_out
 
@@ -383,111 +372,81 @@ class PagedKVCache:
         positions: torch.Tensor,   # (n,) int32
         k: torch.Tensor,           # (n, num_kv_heads, head_dim)
         v: torch.Tensor,           # (n, num_kv_heads, head_dim)
-    ):
-        """Batch write K/V for one sequence. Vectorized block table lookups."""
+    ) -> None:
+        """Batch write for one sequence (vectorised block-table lookups)."""
         n = positions.shape[0]
         if n == 0:
             return
 
-        pos_np = positions.cpu().numpy()
+        pos_np       = positions.cpu().numpy()
         block_indices = pos_np // self.block_size
-        offsets = pos_np % self.block_size
+        offsets      = pos_np % self.block_size
 
-        # Pre-allocate any missing blocks — single batch read (1 GPU→CPU transfer)
-        unique_blocks = sorted(set(int(b) for b in block_indices))
-        block_vals = self.block_table[seq_id, unique_blocks].tolist()
-        missing = sum(1 for v in block_vals if v < 0)
-        if missing > 0:
+        unique_bidx = sorted(set(int(b) for b in block_indices))
+        block_vals  = self.block_table[seq_id, unique_bidx].tolist()
+        missing     = sum(1 for bv in block_vals if bv < 0)
+        if missing:
             self.allocate_blocks(seq_id, missing)
-            # Re-read after allocation
-            block_vals = self.block_table[seq_id, unique_blocks].tolist()
+            block_vals = self.block_table[seq_id, unique_bidx].tolist()
 
-        # Copy-on-write: ensure shared prefix blocks get private copies
-        for i, bidx in enumerate(unique_blocks):
+        for i, bidx in enumerate(unique_bidx):
             if block_vals[i] >= 0:
                 self._cow_if_shared(seq_id, bidx, block_vals[i])
-        # Re-read after potential CoW copies
-        block_vals = self.block_table[seq_id, unique_blocks].tolist()
-        block_map = {bidx: block_vals[i] for i, bidx in enumerate(unique_blocks)}
+        block_vals = self.block_table[seq_id, unique_bidx].tolist()
+        block_map  = {bidx: block_vals[i] for i, bidx in enumerate(unique_bidx)}
 
-        # Write using cached block map — skip dtype conversion if already correct
         k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
         v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
+
         if n <= 4:
-            # Small batch: direct writes are faster than grouping overhead
             for t in range(n):
-                physical_block = block_map[int(block_indices[t])]
+                pb  = block_map[int(block_indices[t])]
                 off = int(offsets[t])
-                self.k_caches[layer_idx][physical_block, off, :, :] = k_kv[t]
-                self.v_caches[layer_idx][physical_block, off, :, :] = v_kv[t]
+                self.k_caches[layer_idx][pb, off] = k_kv[t]
+                self.v_caches[layer_idx][pb, off] = v_kv[t]
         else:
-            # Batch by physical block: group writes to same block
             from collections import defaultdict
-            block_groups: dict = defaultdict(list)
+            groups: dict = defaultdict(list)
             for t in range(n):
-                pb = block_map[int(block_indices[t])]
-                block_groups[pb].append((int(offsets[t]), t))
-            for pb, entries in block_groups.items():
+                groups[block_map[int(block_indices[t])]].append((int(offsets[t]), t))
+            for pb, entries in groups.items():
                 offs = [e[0] for e in entries]
                 idxs = [e[1] for e in entries]
-                self.k_caches[layer_idx][pb, offs, :, :] = k_kv[idxs]
-                self.v_caches[layer_idx][pb, offs, :, :] = v_kv[idxs]
+                self.k_caches[layer_idx][pb, offs] = k_kv[idxs]
+                self.v_caches[layer_idx][pb, offs] = v_kv[idxs]
 
         max_pos = int(pos_np.max()) + 1
-        cur_len = int(self.seq_lens[seq_id])
-        self.seq_lens[seq_id] = max(cur_len, max_pos)
+        self.seq_lens[seq_id] = max(int(self.seq_lens[seq_id]), max_pos)
         self._touch(seq_id)
-
-    def get_cache_tensors(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Return raw k/v cache tensors for a layer.
-        Shape: (num_blocks, block_size, num_kv_heads, head_dim) — flash_attn compatible.
-        """
-        return self.k_caches[layer_idx], self.v_caches[layer_idx]
-
-    def get_block_table_for_seqs(self, seq_ids: List[int]) -> torch.Tensor:
-        """Extract block table rows for given sequences. Returns (num_seqs, max_blocks_per_seq) int32."""
-        if self._graph_mode and self._graph_block_table is not None:
-            return self._graph_block_table[:len(seq_ids)]
-        return self.block_table[seq_ids]
-
-    def get_cache_seqlens(self, seq_ids: List[int]) -> torch.Tensor:
-        """Get current sequence lengths. Returns (num_seqs,) int32."""
-        if self._graph_mode and self._graph_cache_seqlens is not None:
-            return self._graph_cache_seqlens[:len(seq_ids)]
-        return self.seq_lens[seq_ids]
 
     def write_kv_decode(
         self,
         layer_idx: int,
-        seq_ids_tensor: torch.Tensor,  # (batch,) long — slot indices
-        positions: torch.Tensor,        # (batch,) long — write positions
+        seq_ids_tensor: torch.Tensor,  # (batch,) long
+        positions: torch.Tensor,        # (batch,) long
         k: torch.Tensor,                # (batch, num_kv_heads, head_dim)
         v: torch.Tensor,                # (batch, num_kv_heads, head_dim)
-    ):
+    ) -> None:
         """
         Tensor-only KV write for decode (1 token per seq). CUDA-graph compatible.
-
-        No Python loops, no .item() calls, no dynamic allocation.
-        Blocks must already be allocated (guaranteed for decode after prefill).
+        No Python loops, no .item() calls.  Blocks must already be allocated.
         """
         block_idx = (positions // self.block_size).long()
-        offset = (positions % self.block_size).long()
+        offset    = (positions % self.block_size).long()
 
         if self._graph_mode and self._graph_block_table is not None:
-            n = seq_ids_tensor.shape[0]
+            n        = seq_ids_tensor.shape[0]
             physical = self._graph_block_table[self._graph_batch_range[:n], block_idx]
         else:
             physical = self.block_table[seq_ids_tensor, block_idx]
 
-        physical = physical.clamp(min=0)  # Guard against -1 padding
+        physical = physical.clamp(min=0)
 
         k_kv = k if k.dtype == self.kv_dtype else k.to(self.kv_dtype)
         v_kv = v if v.dtype == self.kv_dtype else v.to(self.kv_dtype)
         self.k_caches[layer_idx][physical, offset] = k_kv
         self.v_caches[layer_idx][physical, offset] = v_kv
 
-        # Update seqlens (tensor op, graph-safe)
         new_lens = (positions + 1).to(torch.int32)
         if self._graph_mode and self._graph_cache_seqlens is not None:
             n = seq_ids_tensor.shape[0]
@@ -499,32 +458,90 @@ class PagedKVCache:
                 self.seq_lens[seq_ids_tensor], new_lens
             )
 
-    def get_block_table_for_seqs_tensor(self, seq_ids_tensor: torch.Tensor) -> torch.Tensor:
-        """Block table rows for tensor-based seq_ids. Graph-compatible."""
+    # ======================================================================
+    # Cache tensor accessors (for attention kernels)
+    # ======================================================================
+
+    def get_cache_tensors(
+        self, layer_idx: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Raw (k_cache, v_cache) for a layer — flash_attn compatible."""
+        return self.k_caches[layer_idx], self.v_caches[layer_idx]
+
+    def get_block_table_for_seqs(self, seq_ids: List[int]) -> torch.Tensor:
+        if self._graph_mode and self._graph_block_table is not None:
+            return self._graph_block_table[:len(seq_ids)]
+        return self.block_table[seq_ids]
+
+    def get_cache_seqlens(self, seq_ids: List[int]) -> torch.Tensor:
+        if self._graph_mode and self._graph_cache_seqlens is not None:
+            return self._graph_cache_seqlens[:len(seq_ids)]
+        return self.seq_lens[seq_ids]
+
+    def get_block_table_for_seqs_tensor(
+        self, seq_ids_tensor: torch.Tensor
+    ) -> torch.Tensor:
         if self._graph_mode and self._graph_block_table is not None:
             return self._graph_block_table[:seq_ids_tensor.shape[0]]
         return self.block_table[seq_ids_tensor]
 
-    def get_cache_seqlens_tensor(self, seq_ids_tensor: torch.Tensor) -> torch.Tensor:
-        """Cache seqlens for tensor-based seq_ids. Graph-compatible."""
+    def get_cache_seqlens_tensor(
+        self, seq_ids_tensor: torch.Tensor
+    ) -> torch.Tensor:
         if self._graph_mode and self._graph_cache_seqlens is not None:
             return self._graph_cache_seqlens[:seq_ids_tensor.shape[0]]
         return self.seq_lens[seq_ids_tensor]
 
-    def init_graph_buffers(self, max_batch_size: int):
-        """Allocate static buffers for CUDA graph mode (same tensor addresses)."""
+    # ======================================================================
+    # Sequence lifecycle
+    # ======================================================================
+
+    def free_sequence(self, seq_id: int) -> None:
+        """
+        Free all blocks for a sequence.
+
+        Blocks are freed in reverse order (tail first) so the most-recently-
+        written blocks stay at the tail of the free queue — maximising prefix
+        cache reuse for future requests with the same prefix.
+        """
+        blocks = self._seq_blocks.pop(seq_id, [])
+        if not blocks:
+            self.seq_lens[seq_id] = 0
+            self._last_access.pop(seq_id, None)
+            return
+
+        # Mark GPU blocks dirty (lazy zeroing at next allocation)
+        for blk in blocks:
+            self._dirty_blocks.add(blk.block_id)
+
+        # Free via pool (reverse = tail first, better for prefix cache LRU)
+        self.pool.free_blocks(reversed(blocks))
+
+        # Clear block table (blocks were stored contiguously from index 0)
+        n = len(blocks)
+        self.block_table[seq_id, :n] = -1
+
+        self.seq_lens[seq_id] = 0
+        self._last_access.pop(seq_id, None)
+
+    # ======================================================================
+    # CUDA graph support
+    # ======================================================================
+
+    def init_graph_buffers(self, max_batch_size: int) -> None:
+        """Allocate static buffers (same tensor addresses across captures)."""
         self._graph_block_table = torch.full(
-            (max_batch_size, self.max_blocks_per_seq), 0, dtype=torch.int32, device=self.device
+            (max_batch_size, self.max_blocks_per_seq), 0,
+            dtype=torch.int32, device=self.device,
         )
         self._graph_cache_seqlens = torch.zeros(
-            max_batch_size, dtype=torch.int32, device=self.device
+            max_batch_size, dtype=torch.int32, device=self.device,
         )
         self._graph_batch_range = torch.arange(
-            max_batch_size, device=self.device, dtype=torch.long
+            max_batch_size, dtype=torch.long, device=self.device,
         )
 
-    def enter_graph_mode(self, seq_ids: List[int]):
-        """Copy current metadata into static graph buffers and enable graph mode."""
+    def enter_graph_mode(self, seq_ids: List[int]) -> None:
         n = len(seq_ids)
         if self._graph_block_table is None:
             return
@@ -532,219 +549,155 @@ class PagedKVCache:
         self._graph_cache_seqlens[:n].copy_(self.seq_lens[seq_ids])
         self._graph_mode = True
 
-    def exit_graph_mode(self, seq_ids: Optional[List[int]] = None):
-        """Disable graph mode and sync updated seqlens back to ground truth.
-
-        Bug 9 fix: write_kv_decode updates _graph_cache_seqlens precisely
-        (using actual write positions). Sync these back instead of relying
-        on manual += 1 in the engine which can diverge.
+    def exit_graph_mode(self, seq_ids: Optional[List[int]] = None) -> None:
+        """
+        Disable graph mode and sync updated seqlens back to ground truth.
+        (Bug 9 fix: write_kv_decode updates _graph_cache_seqlens precisely.)
         """
         self._graph_mode = False
         if seq_ids is not None and self._graph_cache_seqlens is not None:
             n = len(seq_ids)
-            self.seq_lens[seq_ids] = self._graph_cache_seqlens[:n].to(self.seq_lens.dtype)
+            self.seq_lens[seq_ids] = self._graph_cache_seqlens[:n].to(
+                self.seq_lens.dtype
+            )
 
-    # =====================================================================
-    # Prefix Caching — reuse KV blocks across requests with same prefix
-    # =====================================================================
+    # ======================================================================
+    # Prefix caching
+    # ======================================================================
 
-    def enable_prefix_caching(self):
-        """Enable prefix caching for this cache instance."""
-        self._prefix_cache_enabled = True
-        # Maps prefix_hash → list of (physical_block_id, layer_idx) that hold this prefix
-        self._prefix_hash_to_blocks: Dict[int, List[int]] = {}
-        # Maps physical_block_id → prefix_hash (for refcounting)
-        self._block_to_prefix: Dict[int, int] = {}
-        # Reference count per prefix hash
-        self._prefix_refcount: Dict[int, int] = {}
-        # Maps prefix_hash → actual token tuple for collision detection
-        self._prefix_hash_to_tokens: Dict[int, tuple] = {}
+    def enable_prefix_caching(self) -> None:
+        """Switch the BlockPool to caching mode."""
+        self.pool.enable_caching = True
 
     @property
     def prefix_cache_enabled(self) -> bool:
-        return getattr(self, "_prefix_cache_enabled", False)
+        return self.pool.enable_caching
 
-    @staticmethod
-    def _hash_token_block(token_ids: List[int]) -> int:
-        """Hash a block of token IDs for prefix matching."""
-        h = hashlib.sha256()
-        for tid in token_ids:
-            h.update(int(tid).to_bytes(8, "little", signed=True))
-        return int.from_bytes(h.digest()[:8], "little")
-
-    def try_reuse_prefix(
-        self, seq_id: int, token_ids: List[int]
-    ) -> int:
+    def try_reuse_prefix(self, seq_id: int, token_ids: List[int]) -> int:
         """
-        Try to reuse cached prefix blocks for a new sequence.
-
-        Returns the number of prefix tokens that were reused (always a
-        multiple of block_size). The caller can skip computing attention
-        for these positions.
+        Try to reuse cached prefix blocks.  Returns number of prefix tokens
+        reused (always a multiple of block_size).
         """
-        if not self.prefix_cache_enabled:
+        if not self.pool.enable_caching:
             return 0
 
         reused = 0
+        prev_hash: Optional[bytes] = None
         num_full_blocks = len(token_ids) // self.block_size
 
-        for block_idx in range(num_full_blocks):
-            start = block_idx * self.block_size
-            end = start + self.block_size
+        for bidx in range(num_full_blocks):
+            start = bidx * self.block_size
+            end   = start + self.block_size
             block_tokens = token_ids[start:end]
-            prefix_hash = self._hash_token_block(block_tokens)
+            block_hash   = BlockPool.hash_block(block_tokens, prev_hash)
 
-            if prefix_hash in self._prefix_hash_to_blocks:
-                # Collision detection: verify actual tokens match
-                cached_tokens = self._prefix_hash_to_tokens.get(prefix_hash)
-                if cached_tokens is None or cached_tokens != tuple(block_tokens):
-                    break  # Hash collision or missing metadata — don't reuse
-                # Reuse: point this seq's block table to existing physical block
-                physical_block = self._prefix_hash_to_blocks[prefix_hash][0]
-                self.block_table[seq_id, block_idx] = physical_block
-                self._prefix_refcount[prefix_hash] = self._prefix_refcount.get(prefix_hash, 1) + 1
-                reused += self.block_size
-            else:
-                break  # Can't skip non-contiguous blocks
+            cached = self.pool.get_cached_block(block_hash)
+            if cached is None:
+                break
 
-        if reused > 0:
+            # Touch the cached block (increments ref_cnt, removes from free queue)
+            self.pool.touch([cached])
+            self.block_table[seq_id, bidx] = cached.block_id
+
+            existing = self._seq_blocks.get(seq_id, [])
+            self._seq_blocks[seq_id] = existing + [cached]
+
+            reused    += self.block_size
+            prev_hash  = block_hash
+
+        if reused:
             self.seq_lens[seq_id] = reused
-            # Update block count and LRU tracking so eviction knows about this seq
-            num_reused_blocks = reused // self.block_size
-            self._block_count[seq_id] = self._block_count.get(seq_id, 0) + num_reused_blocks
-            self._active_seq_ids.add(seq_id)
             self._touch(seq_id)
 
         return reused
 
-    def register_prefix_blocks(self, seq_id: int, token_ids: List[int]):
-        """
-        After computing a full prefill, register the resulting KV blocks
-        as reusable prefix blocks for future requests.
-        """
-        if not self.prefix_cache_enabled:
+    def register_prefix_blocks(self, seq_id: int, token_ids: List[int]) -> None:
+        """Register computed KV blocks in the prefix cache for future reuse."""
+        if not self.pool.enable_caching:
             return
 
-        num_full_blocks = len(token_ids) // self.block_size
-        if num_full_blocks == 0:
+        blocks = self._seq_blocks.get(seq_id, [])
+        num_full = min(len(token_ids) // self.block_size, len(blocks))
+        if num_full == 0:
             return
 
-        # Single GPU→CPU transfer for all block IDs
-        physical_blocks = self.block_table[seq_id, :num_full_blocks].tolist()
+        prev_hash: Optional[bytes] = None
+        for bidx in range(num_full):
+            start = bidx * self.block_size
+            end   = start + self.block_size
+            h     = BlockPool.hash_block(token_ids[start:end], prev_hash)
+            self.pool.cache_block(blocks[bidx], h)
+            prev_hash = h
 
-        for block_idx in range(num_full_blocks):
-            start = block_idx * self.block_size
-            end = start + self.block_size
-            block_tokens = token_ids[start:end]
-            prefix_hash = self._hash_token_block(block_tokens)
-
-            physical_block = physical_blocks[block_idx]
-            if physical_block >= 0 and prefix_hash not in self._prefix_hash_to_blocks:
-                self._prefix_hash_to_blocks[prefix_hash] = [physical_block]
-                self._block_to_prefix[physical_block] = prefix_hash
-                self._prefix_refcount[prefix_hash] = 1
-                self._prefix_hash_to_tokens[prefix_hash] = tuple(block_tokens)
-
-    def _cow_if_shared(self, seq_id: int, block_idx: int, physical_block: int) -> int:
-        """Copy-on-write: if block is shared via prefix caching, allocate a private copy."""
-        if not self.prefix_cache_enabled:
+    def _cow_if_shared(
+        self, seq_id: int, block_idx: int, physical_block: int
+    ) -> int:
+        """Copy-on-write: if block is shared via prefix cache, make a private copy."""
+        if not self.pool.enable_caching:
             return physical_block
-        prefix_hash = getattr(self, "_block_to_prefix", {}).get(physical_block)
-        if prefix_hash is None:
+
+        blocks = self._seq_blocks.get(seq_id)
+        if blocks is None or block_idx >= len(blocks):
             return physical_block
-        rc = self._prefix_refcount.get(prefix_hash, 1)
-        if rc <= 1:
-            return physical_block  # Sole owner, no copy needed
-        # Allocate a new block and copy KV data
-        if not self.free_blocks:
-            return physical_block  # Can't copy, no free blocks
-        new_block = self.free_blocks.pop()
-        if new_block in self._dirty_blocks:
-            self._dirty_blocks.discard(new_block)
-        for layer_idx in range(self.num_layers):
-            self.k_caches[layer_idx][new_block].copy_(self.k_caches[layer_idx][physical_block])
-            self.v_caches[layer_idx][new_block].copy_(self.v_caches[layer_idx][physical_block])
-        self.block_table[seq_id, block_idx] = new_block
-        self._prefix_refcount[prefix_hash] = rc - 1
-        return new_block
 
-    def _zero_block(self, block_id: int):
-        """Zero out K/V data in a physical block to prevent stale data leaking."""
-        for layer_idx in range(self.num_layers):
-            self.k_caches[layer_idx][block_id].zero_()
-            self.v_caches[layer_idx][block_id].zero_()
+        blk = blocks[block_idx]
+        if blk.ref_cnt <= 1:
+            return physical_block  # sole owner
 
-    def free_sequence(self, seq_id: int):
-        """Free all blocks for a sequence. Respects prefix cache refcounts."""
-        blocks = self.block_table[seq_id]
-        num_blocks = self._block_count.get(seq_id, 0)
-        # Fast path: if _block_count says 0, no blocks to free
-        if num_blocks == 0:
-            self.seq_lens[seq_id] = 0
-            self._last_access.pop(seq_id, None)
-            self._active_seq_ids.discard(seq_id)
-            return
-        # Single GPU→CPU transfer for all block IDs
-        block_ids = blocks[:num_blocks].tolist()
-        block_to_prefix = getattr(self, "_block_to_prefix", {})
-        for block_id in block_ids:
-            # Check if this block is a shared prefix block
-            prefix_hash = block_to_prefix.get(block_id)
-            if prefix_hash is not None:
-                rc = self._prefix_refcount.get(prefix_hash, 1) - 1
-                if rc <= 0:
-                    # Last user — free the block (lazy zero on next alloc)
-                    self._prefix_hash_to_blocks.pop(prefix_hash, None)
-                    block_to_prefix.pop(block_id, None)
-                    self._prefix_refcount.pop(prefix_hash, None)
-                    self._dirty_blocks.add(block_id)
-                    self.free_blocks.append(block_id)
-                else:
-                    self._prefix_refcount[prefix_hash] = rc
-            else:
-                self._dirty_blocks.add(block_id)
-                self.free_blocks.append(block_id)
-        blocks[:num_blocks] = -1
+        if self.pool.get_num_free_blocks() == 0:
+            return physical_block  # can't copy
 
-        self._block_count.pop(seq_id, None)
-        self.seq_lens[seq_id] = 0
-        self._last_access.pop(seq_id, None)
-        self._active_seq_ids.discard(seq_id)
+        [new_blk] = self.pool.get_new_blocks(1)
+        for layer in range(self.num_layers):
+            self.k_caches[layer][new_blk.block_id].copy_(
+                self.k_caches[layer][physical_block]
+            )
+            self.v_caches[layer][new_blk.block_id].copy_(
+                self.v_caches[layer][physical_block]
+            )
+        self.block_table[seq_id, block_idx] = new_blk.block_id
+        # Decrement ref on the shared block and add new private block to seq
+        blk.ref_cnt -= 1
+        if blk.ref_cnt == 0 and not blk.is_null:
+            self.pool.free_block_queue.append(blk)
+        blocks[block_idx] = new_blk
+        return new_blk.block_id
 
-    # =====================================================================
-    # Swap-to-CPU — preserve KV data in pinned CPU memory
-    # =====================================================================
+    # ======================================================================
+    # Lazy block zeroing
+    # ======================================================================
 
-    def enable_swap(self):
-        """Allocate CPU pinned memory mirror for swap-to-CPU."""
+    def _zero_block(self, block_id: int) -> None:
+        """Zero out GPU KV memory for a block (called lazily at next alloc)."""
+        for layer in range(self.num_layers):
+            self.k_caches[layer][block_id].zero_()
+            self.v_caches[layer][block_id].zero_()
+
+    # ======================================================================
+    # Swap-to-CPU
+    # ======================================================================
+
+    def enable_swap(self) -> None:
+        """Allocate CPU pinned memory mirror."""
         if self.device == "cpu":
-            return  # No point swapping CPU→CPU
+            return
         self._swap_enabled = True
-        cpu_num_blocks = self.num_blocks
         can_pin = torch.cuda.is_available()
-        self._cpu_k_caches = [
-            torch.zeros(
-                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
-                dtype=self.kv_dtype, device="cpu",
-            ).pin_memory() if can_pin else torch.zeros(
-                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
-                dtype=self.kv_dtype, device="cpu",
-            )
-            for _ in range(self.num_layers)
-        ]
-        self._cpu_v_caches = [
-            torch.zeros(
-                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
-                dtype=self.kv_dtype, device="cpu",
-            ).pin_memory() if can_pin else torch.zeros(
-                cpu_num_blocks, self.block_size, self.num_kv_heads, self.head_dim,
+
+        def _cpu_cache():
+            t = torch.zeros(
+                self.num_blocks, self.block_size,
+                self.num_kv_heads, self.head_dim,
                 dtype=self.kv_dtype, device="cpu",
             )
-            for _ in range(self.num_layers)
-        ]
-        self._cpu_free_blocks = list(range(cpu_num_blocks))
+            return t.pin_memory() if can_pin else t
+
+        self._cpu_k_caches = [_cpu_cache() for _ in range(self.num_layers)]
+        self._cpu_v_caches = [_cpu_cache() for _ in range(self.num_layers)]
+        self._cpu_free_blocks = list(range(self.num_blocks))
         self._cpu_block_table = torch.full(
-            (self.max_seqs, self.max_blocks_per_seq), -1, dtype=torch.int32, device="cpu"
+            (self.max_seqs, self.max_blocks_per_seq), -1,
+            dtype=torch.int32, device="cpu",
         )
 
     @property
@@ -752,155 +705,128 @@ class PagedKVCache:
         return self._swap_enabled
 
     def swap_out(self, seq_id: int) -> bool:
-        """
-        Copy KV blocks from GPU to CPU pinned memory, free GPU blocks.
-        Uses a dedicated CUDA stream for async D2H copies (pipelined).
-
-        Returns True on success, False if CPU swap space is full.
-        """
         if not self._swap_enabled:
             return False
-
-        # O(1) block count lookup
-        num_blocks = self._block_count.get(seq_id, 0)
-        blocks = self.block_table[seq_id]
-        block_list = blocks[:num_blocks].tolist() if num_blocks > 0 else []
-
-        if num_blocks == 0:
-            return False
-        if len(self._cpu_free_blocks) < num_blocks:
+        blocks = self._seq_blocks.get(seq_id, [])
+        if not blocks or len(self._cpu_free_blocks) < len(blocks):
             return False
 
-        seq_len = self.seq_lens[seq_id].item()
-        cpu_block_ids = []
+        seq_len    = int(self.seq_lens[seq_id])
+        cpu_blocks = []
+        stream     = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        # Use a dedicated CUDA stream for async D2H copy (pipelined)
-        swap_stream = None
-        if self.device != "cpu" and torch.cuda.is_available():
-            swap_stream = torch.cuda.Stream()
-
-        ctx = torch.cuda.stream(swap_stream) if swap_stream else _nullcontext()
+        ctx = torch.cuda.stream(stream) if stream else _nullcontext()
         with ctx:
-            for i in range(num_blocks):
-                gpu_block = block_list[i]
-                cpu_block = self._cpu_free_blocks.pop()
-                cpu_block_ids.append(cpu_block)
-
+            for i, blk in enumerate(blocks):
+                cpu_id = self._cpu_free_blocks.pop()
+                cpu_blocks.append(cpu_id)
                 for layer in range(self.num_layers):
-                    self._cpu_k_caches[layer][cpu_block].copy_(self.k_caches[layer][gpu_block], non_blocking=True)
-                    self._cpu_v_caches[layer][cpu_block].copy_(self.v_caches[layer][gpu_block], non_blocking=True)
-
-                self._cpu_block_table[seq_id, i] = cpu_block
-                self._dirty_blocks.add(gpu_block)
-                self.free_blocks.append(gpu_block)
+                    self._cpu_k_caches[layer][cpu_id].copy_(
+                        self.k_caches[layer][blk.block_id], non_blocking=True
+                    )
+                    self._cpu_v_caches[layer][cpu_id].copy_(
+                        self.v_caches[layer][blk.block_id], non_blocking=True
+                    )
+                self._cpu_block_table[seq_id, i] = cpu_id
+                self._dirty_blocks.add(blk.block_id)
                 self.block_table[seq_id, i] = -1
 
-        # Sync the swap stream to ensure copies complete before freeing
-        if swap_stream is not None:
-            swap_stream.synchronize()
+        if stream:
+            stream.synchronize()
 
+        self.pool.free_blocks(reversed(blocks))
         self._swapped_seqs[seq_id] = {
-            "cpu_blocks": cpu_block_ids,
+            "cpu_blocks": cpu_blocks,
             "seq_len": seq_len,
-            "num_blocks": num_blocks,
+            "num_blocks": len(blocks),
         }
-        self._block_count.pop(seq_id, None)
+        del self._seq_blocks[seq_id]
         self.seq_lens[seq_id] = 0
         self._swap_count += 1
         return True
 
     def swap_in(self, seq_id: int) -> bool:
-        """
-        Copy KV blocks from CPU back to GPU.
-        Uses a dedicated CUDA stream for async H2D copies (pipelined).
-
-        Returns True on success, False if GPU doesn't have enough free blocks.
-        """
         if seq_id not in self._swapped_seqs:
             return False
+        meta      = self._swapped_seqs[seq_id]
+        cpu_ids   = meta["cpu_blocks"]
+        n_blocks  = len(cpu_ids)
 
-        meta = self._swapped_seqs[seq_id]
-        cpu_block_ids = meta["cpu_blocks"]
-        num_blocks = len(cpu_block_ids)
-
-        if len(self.free_blocks) < num_blocks:
+        if self.pool.get_num_free_blocks() < n_blocks:
             return False
 
-        swap_stream = None
-        if self.device != "cpu" and torch.cuda.is_available():
-            swap_stream = torch.cuda.Stream()
+        new_blocks = self.pool.get_new_blocks(n_blocks)
+        stream     = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        ctx = torch.cuda.stream(swap_stream) if swap_stream else _nullcontext()
+        ctx = torch.cuda.stream(stream) if stream else _nullcontext()
         with ctx:
-            for i, cpu_block in enumerate(cpu_block_ids):
-                gpu_block = self.free_blocks.pop()
-
+            for i, (cpu_id, blk) in enumerate(zip(cpu_ids, new_blocks)):
                 for layer in range(self.num_layers):
-                    self.k_caches[layer][gpu_block].copy_(self._cpu_k_caches[layer][cpu_block], non_blocking=True)
-                    self.v_caches[layer][gpu_block].copy_(self._cpu_v_caches[layer][cpu_block], non_blocking=True)
-
-                self.block_table[seq_id, i] = gpu_block
+                    self.k_caches[layer][blk.block_id].copy_(
+                        self._cpu_k_caches[layer][cpu_id], non_blocking=True
+                    )
+                    self.v_caches[layer][blk.block_id].copy_(
+                        self._cpu_v_caches[layer][cpu_id], non_blocking=True
+                    )
+                self.block_table[seq_id, i] = blk.block_id
                 self._cpu_block_table[seq_id, i] = -1
-                self._cpu_free_blocks.append(cpu_block)
+                self._cpu_free_blocks.append(cpu_id)
 
-        if swap_stream is not None:
-            swap_stream.synchronize()
+        if stream:
+            stream.synchronize()
 
-        self._block_count[seq_id] = num_blocks
-        self.seq_lens[seq_id] = meta["seq_len"]
+        self._seq_blocks[seq_id] = new_blocks
+        self.seq_lens[seq_id]    = meta["seq_len"]
         del self._swapped_seqs[seq_id]
         self._touch(seq_id)
         return True
 
-    def maybe_enable_fp8(self, utilization_threshold: float = 0.70) -> bool:
-        """
-        Auto-enable FP8 KV cache when memory utilization exceeds threshold.
-        Converts existing caches in-place for 2x memory savings.
+    # ======================================================================
+    # FP8 auto-upgrade
+    # ======================================================================
 
-        Returns True if FP8 was activated (or already active).
-        """
+    def maybe_enable_fp8(self, utilization_threshold: float = 0.70) -> bool:
         if self.device == "cpu":
             return False
         if self.kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            return True  # Already FP8
-
-        utilization = self.num_used_blocks / max(self.num_blocks, 1)
-        if utilization < utilization_threshold:
+            return True
+        if self.pool.get_usage() < utilization_threshold:
             return False
-
-        # Convert caches to FP8 in-place
-        target_dtype = torch.float8_e4m3fn
-        for layer_idx in range(self.num_layers):
-            self.k_caches[layer_idx] = self.k_caches[layer_idx].to(target_dtype)
-            self.v_caches[layer_idx] = self.v_caches[layer_idx].to(target_dtype)
-        self.kv_dtype = target_dtype
+        target = torch.float8_e4m3fn
+        for layer in range(self.num_layers):
+            self.k_caches[layer] = self.k_caches[layer].to(target)
+            self.v_caches[layer] = self.v_caches[layer].to(target)
+        self.kv_dtype = target
         return True
 
+    # ======================================================================
+    # Stats
+    # ======================================================================
+
     def get_stats(self) -> dict:
-        """Cache stats — all integers."""
         stats = {
-            "num_blocks": self.num_blocks,
+            "num_blocks":  self.num_blocks,
             "used_blocks": self.num_used_blocks,
             "free_blocks": self.num_free_blocks,
-            "block_size": self.block_size,
-            "active_seqs": int((self.seq_lens > 0).sum().item()),
+            "block_size":  self.block_size,
+            "active_seqs": len(self._seq_blocks),
+            "pool_usage":  round(self.pool.get_usage(), 3),
         }
-        if self.prefix_cache_enabled:
-            stats["prefix_cached_blocks"] = len(getattr(self, "_block_to_prefix", {}))
-            stats["prefix_unique_hashes"] = len(getattr(self, "_prefix_hash_to_blocks", {}))
+        if self.pool.enable_caching:
+            stats["prefix_cached_blocks"] = len(self.pool._hash_to_block)
         if self.enable_lru_eviction:
             stats["lru_evictions_total"] = self._eviction_count
-            stats["lru_tracked_seqs"] = len(self._last_access)
         if self._swap_enabled:
-            stats["swapped_seqs"] = len(self._swapped_seqs)
-            stats["cpu_free_blocks"] = len(self._cpu_free_blocks)
+            stats["swapped_seqs"]     = len(self._swapped_seqs)
+            stats["cpu_free_blocks"]  = len(self._cpu_free_blocks)
             stats["swap_count_total"] = self._swap_count
         return stats
 
 
+# ---------------------------------------------------------------------------
+# Minimal context manager for when no CUDA stream is needed
+# ---------------------------------------------------------------------------
+
 class _nullcontext:
-    """Minimal context manager for when no CUDA stream is needed."""
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        pass
+    def __enter__(self):  return self
+    def __exit__(self, *a): pass
