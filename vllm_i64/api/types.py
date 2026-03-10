@@ -7,7 +7,8 @@ INL - 2025
 
 import hashlib
 import json
-from dataclasses import dataclass, asdict
+import uuid
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional
 
 
@@ -15,8 +16,12 @@ def compute_partition(api_key: Optional[str], user_id: Optional[str], n: int = 6
     """Compute deterministic partition index for cache affinity and load balancing.
 
     partition = sha256(f"{api_key}:{user_id}") % n
+
+    If user_id is None, a random UUID is used → uniform random partition.
+    If user_id is provided, same (api_key, user_id) always maps to the same partition.
     """
-    key = f"{api_key or ''}:{user_id or ''}"
+    uid = user_id if user_id is not None else str(uuid.uuid4())
+    key = f"{api_key or ''}:{uid}"
     digest = hashlib.sha256(key.encode()).digest()
     return int.from_bytes(digest[:4], "big") % n
 
@@ -47,7 +52,7 @@ class CompletionRequest:
     presence_penalty: float = 0.0
     priority: int = 0
     suppress_first_tokens: Optional[List[int]] = None
-    user: Optional[str] = None  # OpenAI-compat user ID for partition affinity
+    user: Optional[str] = field(default=None)  # UUID for partition affinity; auto-generated if absent
 
     def validate(self, max_seq_len: int = 2048) -> Optional[str]:
         if not self.prompt or not self.prompt.strip():
