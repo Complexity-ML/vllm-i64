@@ -573,6 +573,16 @@ class PagedKVCache:
     def prefix_cache_enabled(self) -> bool:
         return self.pool.enable_caching
 
+    @property
+    def _prefix_hash_to_blocks(self) -> dict:
+        """Expose BlockPool hash→block mapping for introspection/testing."""
+        return self.pool._hash_to_block
+
+    @staticmethod
+    def _hash_token_block(token_ids: List[int], prev_hash: Optional[bytes] = None) -> bytes:
+        """Deterministic hash for a token block (delegates to BlockPool.hash_block)."""
+        return BlockPool.hash_block(token_ids, prev_hash)
+
     def try_reuse_prefix(self, seq_id: int, token_ids: List[int]) -> int:
         """
         Try to reuse cached prefix blocks.  Returns number of prefix tokens
@@ -814,6 +824,7 @@ class PagedKVCache:
         }
         if self.pool.enable_caching:
             stats["prefix_cached_blocks"] = len(self.pool._hash_to_block)
+            stats["prefix_unique_hashes"] = len(self.pool._hash_to_block)
         if self.enable_lru_eviction:
             stats["lru_evictions_total"] = self._eviction_count
         if self._swap_enabled:
