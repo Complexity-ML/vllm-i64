@@ -131,6 +131,8 @@ def run_completion(port: int, prompt: str, max_tokens: int, temperature: float) 
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "top_p": 0.9,
+        "repetition_penalty": 1.1,
         "stream": False,
     }).encode()
 
@@ -245,7 +247,7 @@ def main():
                         choices=["float16", "bfloat16", "float32"],
                         help="Weight dtype (default: float32)")
     parser.add_argument("--max-tokens", type=int, default=128)
-    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--prompts", default=None, help="Path to prompts file (one per line)")
     parser.add_argument("--output", default="ablation_results.json")
     parser.add_argument("--no-cuda-graphs", action="store_true",
