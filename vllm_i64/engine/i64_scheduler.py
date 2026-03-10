@@ -399,8 +399,10 @@ class I64Scheduler:
                 chunk_size = min(remaining, prefill_token_budget)
 
                 if chunk_size <= 0:
+                    # Bug 1 fix: use prefill_progress as position (next unwritten slot),
+                    # not prefill_progress-1 which writes to already-cached position.
                     tokens = np.array([req.get_last_token_id()], dtype=np.int64)
-                    positions = np.array([max(req.prefill_progress - 1, 0)], dtype=np.int32)
+                    positions = np.array([max(req.prefill_progress, 0)], dtype=np.int32)
                     is_prefill_arr[i] = 0
                 else:
                     start = req.prefill_progress

@@ -532,9 +532,17 @@ class PagedKVCache:
         self._graph_cache_seqlens[:n].copy_(self.seq_lens[seq_ids])
         self._graph_mode = True
 
-    def exit_graph_mode(self):
-        """Disable graph mode."""
+    def exit_graph_mode(self, seq_ids: Optional[List[int]] = None):
+        """Disable graph mode and sync updated seqlens back to ground truth.
+
+        Bug 9 fix: write_kv_decode updates _graph_cache_seqlens precisely
+        (using actual write positions). Sync these back instead of relying
+        on manual += 1 in the engine which can diverge.
+        """
         self._graph_mode = False
+        if seq_ids is not None and self._graph_cache_seqlens is not None:
+            n = len(seq_ids)
+            self.seq_lens[seq_ids] = self._graph_cache_seqlens[:n].to(self.seq_lens.dtype)
 
     # =====================================================================
     # Prefix Caching — reuse KV blocks across requests with same prefix

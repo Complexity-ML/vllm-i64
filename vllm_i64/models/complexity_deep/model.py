@@ -734,18 +734,27 @@ class ComplexityDeepModel(nn.Module):
         positions: torch.Tensor,
         kv_cache,
         seq_ids_tensor: torch.Tensor,
+        velocity_buf: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Decode-only forward pass. CUDA-graph compatible.
 
         All operations are tensor-based (no Python loops, no .item()).
         Used for GPU decode with captured CUDA graphs. Single PP stage only.
+
+        Args:
+            velocity_buf: [batch, hidden_size] persistent velocity state across tokens.
+                          If provided, used in-place (CUDA-graph safe). If None, zeros.
         """
         from vllm_i64.parallel.pipeline_parallel import is_first_pp_rank, is_last_pp_rank
 
         if is_first_pp_rank():
             hidden = self.embed_tokens(token_ids.long())
-            velocity = torch.zeros_like(hidden)
+            # Bug 2 fix: use persistent velocity instead of always-zero
+            if velocity_buf is not None:
+                velocity = velocity_buf
+            else:
+                velocity = torch.zeros_like(hidden)
             mu_prev = None
         else:
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
@@ -767,6 +776,10 @@ class ComplexityDeepModel(nn.Module):
 
         if not is_last_pp_rank():
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
+
+        # Bug 4 fix: persist velocity for next decode step (in-place = CUDA-graph safe)
+        if velocity_buf is not None:
+            velocity_buf.copy_(velocity)
 
         hidden = self.norm(hidden)
         return self._compute_logits(hidden)

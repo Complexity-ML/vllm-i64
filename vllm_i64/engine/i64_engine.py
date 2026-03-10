@@ -168,6 +168,12 @@ class I64Engine:
         if self.model is not None and hasattr(self.model, 'config'):
             self._init_kv_cache(max_batch_size)
 
+        # === Velocity State (Bug 2 fix: persist PID velocity across decode steps) ===
+        # _seq_velocity: slot_id -> velocity tensor [hidden_size] on device
+        self._seq_velocity: Dict[int, torch.Tensor] = {}
+        # _graph_velocity_buf: static [max_batch, hidden_size] buffer for CUDA graph (Bug 4 fix)
+        self._graph_velocity_buf: Optional[torch.Tensor] = None
+
         # === CUDA Graph Runner ===
         self.cuda_graph_runner = None
         if device != "cpu" and self.model is not None:
@@ -266,16 +272,26 @@ class I64Engine:
                 max_batch_size, dtype=torch.long, device=self.device
             )
 
+            # Bug 4 fix: static velocity buffer captured in CUDA graph
+            if self.model is not None and hasattr(self.model, 'config'):
+                hidden_size = self.model.config.hidden_size
+                dtype = next(self.model.parameters()).dtype
+                self._graph_velocity_buf = torch.zeros(
+                    max_batch_size, hidden_size, dtype=dtype, device=self.device
+                )
+
             has_decode_step = hasattr(self.model, 'decode_step')
 
             def _graph_forward(token_ids, positions, _expert_ids):
                 if has_decode_step and self.kv_cache is not None:
-                    # Graph-compatible path: tensor-only KV writes
+                    bs = token_ids.shape[0]
+                    # Graph-compatible path: tensor-only KV writes + persistent velocity
                     return self.model.decode_step(
                         token_ids=token_ids,
                         positions=positions,
                         kv_cache=self.kv_cache,
-                        seq_ids_tensor=self._graph_seq_ids[:token_ids.shape[0]],
+                        seq_ids_tensor=self._graph_seq_ids[:bs],
+                        velocity_buf=self._graph_velocity_buf[:bs] if self._graph_velocity_buf is not None else None,
                     )
                 else:
                     return self.model(
@@ -369,6 +385,8 @@ class I64Engine:
             slot = self._request_to_slot.pop(request_id)
             if self.kv_cache is not None:
                 self.kv_cache.free_sequence(slot)
+            # Bug 2 fix: also free persistent velocity state for this slot
+            self._seq_velocity.pop(slot, None)
             if slot not in self._slot_pool:
                 self._slot_pool.append(slot)
 
@@ -1054,16 +1072,26 @@ class I64Engine:
                 # Enter graph mode: copy block_table + seqlens to static buffers
                 self.kv_cache.enter_graph_mode(seq_ids)
 
+                # Bug 2+4 fix: load per-seq velocity into static graph buffer
+                if self._graph_velocity_buf is not None:
+                    for i, sid in enumerate(seq_ids):
+                        v = self._seq_velocity.get(sid)
+                        if v is not None:
+                            self._graph_velocity_buf[i].copy_(v)
+                        else:
+                            self._graph_velocity_buf[i].zero_()
+
                 expert_ids = torch.from_numpy(batch.expert_ids).to(self.device)
                 logits = self.cuda_graph_runner.run(token_ids, positions, expert_ids)
 
-                self.kv_cache.exit_graph_mode()
+                # Bug 2+4 fix: save updated velocity back to per-seq store
+                if self._graph_velocity_buf is not None:
+                    for i, sid in enumerate(seq_ids):
+                        self._seq_velocity[sid] = self._graph_velocity_buf[i].clone()
 
-                # Sync real seq_lens from graph (decode adds 1 token per seq)
-                n = len(seq_ids)
-                self._buf_seq_ids[:n] = torch.from_numpy(np.array(seq_ids, dtype=np.int64))
-                seq_ids_tensor = self._buf_seq_ids[:n]
-                self.kv_cache.seq_lens[seq_ids_tensor] += 1
+                # Bug 9 fix: sync precise seqlens from graph buffers back to seq_lens
+                self.kv_cache.exit_graph_mode(seq_ids=seq_ids)
+
                 # Touch LRU tracking
                 for sid in seq_ids:
                     self.kv_cache._touch(sid)
