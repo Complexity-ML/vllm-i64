@@ -33,12 +33,21 @@ ABLATION_MODELS = [
     "run4-no-pid",
 ]
 
+# Pretrain completion prompts (FineWeb-Edu style — text continuation, not Q&A)
 DEFAULT_PROMPTS = [
-    "What is the capital of France?",
-    "Explain what a transformer is in machine learning.",
-    "Write a Python function that computes the Fibonacci sequence.",
-    "What is 17 multiplied by 23?",
-    "Summarize the concept of attention in neural networks.",
+    # --- factual continuation ---
+    "The Eiffel Tower was built in",
+    "In mathematics, a prime number is defined as",
+    "The transformer architecture, introduced in the paper 'Attention is All You Need',",
+    # --- educational text continuation ---
+    "Machine learning is a subfield of artificial intelligence that focuses on",
+    "The water cycle, also known as the hydrological cycle, describes how",
+    # --- code completion ---
+    "def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n    if n <= 1:\n",
+    # --- science ---
+    "Photosynthesis is the process by which plants convert sunlight into",
+    # --- longer reasoning seed ---
+    "The main difference between supervised and unsupervised learning is that",
 ]
 
 # ---------------------------------------------------------------------------
