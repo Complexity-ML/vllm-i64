@@ -232,13 +232,23 @@ class BlockPool:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def hash_block(token_ids: List[int], prev_hash: Optional[bytes] = None) -> bytes:
-        """SHA-256 hash of a token block, chained from prev_hash."""
+    def hash_block(
+        token_ids: List[int],
+        prev_hash: Optional[bytes] = None,
+        namespace: Optional[bytes] = None,
+    ) -> bytes:
+        """SHA-256 hash of a token block, chained from prev_hash.
+
+        namespace isolates the cache per API key — blocks from different
+        keys never collide even if their token sequences are identical.
+        """
         h = hashlib.sha256()
+        if namespace is not None:
+            h.update(namespace)
         if prev_hash is not None:
             h.update(prev_hash)
         for tid in token_ids:
-            h.update(tid.to_bytes(8, "little", signed=True))
+            h.update(int(tid).to_bytes(8, "little", signed=True))
         return h.digest()
 
     def get_cached_block(self, block_hash: bytes) -> Optional[KVCacheBlock]:

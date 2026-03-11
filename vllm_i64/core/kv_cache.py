@@ -579,14 +579,26 @@ class PagedKVCache:
         return self.pool._hash_to_block
 
     @staticmethod
-    def _hash_token_block(token_ids: List[int], prev_hash: Optional[bytes] = None) -> bytes:
+    def _hash_token_block(
+        token_ids: List[int],
+        prev_hash: Optional[bytes] = None,
+        namespace: Optional[bytes] = None,
+    ) -> bytes:
         """Deterministic hash for a token block (delegates to BlockPool.hash_block)."""
-        return BlockPool.hash_block(token_ids, prev_hash)
+        return BlockPool.hash_block(token_ids, prev_hash, namespace)
 
-    def try_reuse_prefix(self, seq_id: int, token_ids: List[int]) -> int:
+    def try_reuse_prefix(
+        self,
+        seq_id: int,
+        token_ids: List[int],
+        namespace: Optional[bytes] = None,
+    ) -> int:
         """
         Try to reuse cached prefix blocks.  Returns number of prefix tokens
         reused (always a multiple of block_size).
+
+        namespace scopes the lookup to a single API key — prevents
+        cross-user cache timing oracle attacks.
         """
         if not self.pool.enable_caching:
             return 0
@@ -599,7 +611,7 @@ class PagedKVCache:
             start = bidx * self.block_size
             end   = start + self.block_size
             block_tokens = token_ids[start:end]
-            block_hash   = BlockPool.hash_block(block_tokens, prev_hash)
+            block_hash   = BlockPool.hash_block(block_tokens, prev_hash, namespace)
 
             cached = self.pool.get_cached_block(block_hash)
             if cached is None:
@@ -621,8 +633,17 @@ class PagedKVCache:
 
         return reused
 
-    def register_prefix_blocks(self, seq_id: int, token_ids: List[int]) -> None:
-        """Register computed KV blocks in the prefix cache for future reuse."""
+    def register_prefix_blocks(
+        self,
+        seq_id: int,
+        token_ids: List[int],
+        namespace: Optional[bytes] = None,
+    ) -> None:
+        """Register computed KV blocks in the prefix cache for future reuse.
+
+        namespace must match the one used in try_reuse_prefix so lookups
+        stay isolated per API key.
+        """
         if not self.pool.enable_caching:
             return
 
@@ -635,7 +656,7 @@ class PagedKVCache:
         for bidx in range(num_full):
             start = bidx * self.block_size
             end   = start + self.block_size
-            h     = BlockPool.hash_block(token_ids[start:end], prev_hash)
+            h     = BlockPool.hash_block(token_ids[start:end], prev_hash, namespace)
             self.pool.cache_block(blocks[bidx], h)
             prev_hash = h
 

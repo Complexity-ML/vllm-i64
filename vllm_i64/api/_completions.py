@@ -6,6 +6,7 @@ INL - 2025
 """
 
 import asyncio
+import hashlib
 import json
 import time
 from typing import AsyncGenerator, Dict, List, Optional
@@ -24,6 +25,19 @@ class CompletionsMixin:
     # Core async generation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _cache_namespace(api_key: Optional[str]) -> Optional[bytes]:
+        """Derive a 16-byte KV cache namespace from the API key.
+
+        Blocks are hashed per-namespace so different API keys never share
+        cached KV blocks — eliminates cross-user timing oracle attacks.
+        Returns None when no API key is present (anonymous requests share
+        an open namespace among themselves, which is acceptable).
+        """
+        if not api_key:
+            return None
+        return hashlib.sha256(api_key.encode()).digest()[:16]
+
     async def _async_complete(
         self,
         request: CompletionRequest,
@@ -33,12 +47,14 @@ class CompletionsMixin:
         t0 = time.monotonic()
         prompt_ids = await self._tokenize_async(request.prompt)
         pixel_values = getattr(request, '_pixel_values', None)
+        ns = self._cache_namespace(api_key)
 
         result = await self.async_engine.generate(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
             pixel_values=pixel_values,
+            cache_namespace=ns,
         )
 
         if len(result.output_tokens) <= 3:
@@ -62,17 +78,19 @@ class CompletionsMixin:
         )
         return resp
 
-    async def _async_stream(self, request: CompletionRequest) -> AsyncGenerator[str, None]:
+    async def _async_stream(self, request: CompletionRequest, api_key: Optional[str] = None) -> AsyncGenerator[str, None]:
         prompt_ids = await self._tokenize_async(request.prompt)
         stream_id = self._next_request_id()
         created = int(time.time())
         output_ids: List[int] = []
         prev_text = ""
         last_token_id = None
+        ns = self._cache_namespace(api_key)
         async for token_id in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
+            cache_namespace=ns,
         ):
             last_token_id = token_id
             output_ids.append(token_id)
@@ -89,11 +107,12 @@ class CompletionsMixin:
         yield "data: [DONE]\n\n"
 
     async def _async_chat_stream(
-        self, request: CompletionRequest, tools: Optional[list] = None,
+        self, request: CompletionRequest, tools: Optional[list] = None, api_key: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         prompt_ids = await self._tokenize_async(request.prompt)
         stream_id = self._next_request_id()
         created = int(time.time())
+        ns = self._cache_namespace(api_key)
 
         yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'created': created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]})}\n\n"
 
@@ -106,6 +125,7 @@ class CompletionsMixin:
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
             pixel_values=pixel_values,
+            cache_namespace=ns,
         ):
             last_token_id = token_id
             output_ids.append(token_id)
@@ -174,7 +194,7 @@ class CompletionsMixin:
                 response.content_type = "text/event-stream"
                 response.headers["Cache-Control"] = "no-cache"
                 await response.prepare(request)
-                gen = self._async_stream(req)
+                gen = self._async_stream(req, api_key=req_api_key)
                 try:
                     async for chunk in gen:
                         await response.write(chunk.encode())
@@ -271,7 +291,7 @@ class CompletionsMixin:
                 response.content_type = "text/event-stream"
                 response.headers["Cache-Control"] = "no-cache"
                 await response.prepare(request)
-                gen = self._async_chat_stream(req, body.get("tools"))
+                gen = self._async_chat_stream(req, body.get("tools"), api_key=req_api_key)
                 try:
                     async for chunk in gen:
                         await response.write(chunk.encode())

@@ -476,6 +476,7 @@ class I64Engine:
         timeout_s: Optional[float] = None,
         sampling_params: Optional[SamplingParams] = None,
         pixel_values: Optional[object] = None,
+        cache_namespace: Optional[bytes] = None,
     ) -> int:
         """Add request. Returns integer request_id."""
         ids = np.array(prompt_token_ids, dtype=np.int64)
@@ -510,7 +511,7 @@ class I64Engine:
                         self._request_deadlines[sec_rid] = time.perf_counter() + t
                     return sec_rid
 
-        request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id)
+        request_id = self.scheduler.add_request(ids, max_new_tokens, eos_token_id=eos_token_id, cache_namespace=cache_namespace)
 
         # Register as merge primary if merging is enabled
         if self._merge_enabled:
@@ -547,7 +548,10 @@ class I64Engine:
             if self.kv_cache.prefix_cache_enabled:
                 slot = self._request_to_slot.get(request_id)
                 if slot is not None:
-                    reused = self.kv_cache.try_reuse_prefix(slot, list(ids))
+                    req_obj = next((r for r in self.scheduler.pending if r.request_id == request_id), None) or \
+                              next((r for r in self.scheduler.running if r.request_id == request_id), None)
+                    _ns = req_obj.cache_namespace if req_obj is not None else None
+                    reused = self.kv_cache.try_reuse_prefix(slot, list(ids), namespace=_ns)
                     if reused > 0:
                         for req in self.scheduler.pending:
                             if req.request_id == request_id:
@@ -1009,7 +1013,7 @@ class I64Engine:
                 if req.request_id in result and req.prefill_complete and req.num_generated == 1:
                     slot = self._request_to_slot.get(req.request_id)
                     if slot is not None:
-                        self.kv_cache.register_prefix_blocks(slot, req.prompt_list)
+                        self.kv_cache.register_prefix_blocks(slot, req.prompt_list, namespace=req.cache_namespace)
 
         # Integer counters
         self.total_steps += 1
@@ -1357,6 +1361,7 @@ class AsyncI64Engine:
         sampling_params: Optional[SamplingParams] = None,
         timeout_s: Optional[float] = None,
         pixel_values: Optional[object] = None,
+        cache_namespace: Optional[bytes] = None,
     ) -> GenerationResult:
         """
         Submit a request and wait for completion.
@@ -1376,6 +1381,7 @@ class AsyncI64Engine:
             prompt_token_ids, max_new_tokens, timeout_s=timeout_s,
             sampling_params=sampling_params,
             pixel_values=pixel_values,
+            cache_namespace=cache_namespace,
         )
         self._pending_futures[request_id] = future
         self._request_times[request_id] = time.perf_counter()
@@ -1391,6 +1397,7 @@ class AsyncI64Engine:
         max_new_tokens: int = 256,
         sampling_params: Optional[SamplingParams] = None,
         pixel_values=None,
+        cache_namespace: Optional[bytes] = None,
     ):
         """
         Submit a request and yield tokens as they are generated.
@@ -1399,6 +1406,7 @@ class AsyncI64Engine:
             prompt_token_ids, max_new_tokens,
             sampling_params=sampling_params,
             pixel_values=pixel_values,
+            cache_namespace=cache_namespace,
         )
         self._request_times[request_id] = time.perf_counter()
         self.active_requests += 1

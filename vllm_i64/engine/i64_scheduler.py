@@ -72,6 +72,10 @@ class I64Request:
     # Arrival order for fairness (integer timestamp)
     arrival_step: int = 0
 
+    # KV cache namespace — SHA-256[:16] of api_key. Isolates prefix cache
+    # per tenant to prevent cross-user timing oracle attacks.
+    cache_namespace: Optional[bytes] = field(default=None, repr=False)
+
     @property
     def prompt_list(self) -> List[int]:
         """Cached prompt as Python list (avoids repeated numpy→list O(n))."""
@@ -224,6 +228,7 @@ class I64Scheduler:
         max_new_tokens: int = 256,
         priority: int = 0,
         eos_token_id: int = 0,
+        cache_namespace: Optional[bytes] = None,
     ) -> int:
         """
         Add a new request. Returns integer request_id.
@@ -239,6 +244,7 @@ class I64Scheduler:
             priority=priority,
             arrival_step=self.step_counter,
             eos_token_id=eos_token_id,
+            cache_namespace=cache_namespace,
         )
         heapq.heappush(self._pending_heap, (req.priority, req.arrival_step, req.request_id, req))
         return request_id
