@@ -591,7 +591,7 @@ class ComplexityDecoderLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         positions: torch.Tensor,
-        velocity: torch.Tensor,
+        velocity: Optional[torch.Tensor],
         token_ids: torch.Tensor,
         mu_prev: Optional[torch.Tensor],
         kv_cache,
@@ -630,7 +630,7 @@ class ComplexityDecoderLayer(nn.Module):
         self,
         hidden: torch.Tensor,
         positions: torch.Tensor,
-        velocity: torch.Tensor,
+        velocity: Optional[torch.Tensor] = None,
         token_ids: Optional[torch.Tensor] = None,
         mu_prev: Optional[torch.Tensor] = None,
         kv_cache=None,
@@ -750,19 +750,18 @@ class ComplexityDeepModel(nn.Module):
 
         if is_first_pp_rank():
             hidden = self.embed_tokens(token_ids.long())
-            # Bug 2 fix: use persistent velocity instead of always-zero
-            if velocity_buf is not None:
-                velocity = velocity_buf
-            else:
-                velocity = torch.zeros_like(hidden)
             mu_prev = None
         else:
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
 
+        # NOTE: velocity is NOT cascaded across layers and NOT persisted across
+        # decode steps.  Each layer independently starts from v=None (→ zeros
+        # inside dynamics).  This matches training where velocity_states=None,
+        # so every layer initialises its own velocity to zero.  (builder.py:144)
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            hidden, velocity, mu_current = layer.decode_step(
-                hidden, positions, velocity,
+            hidden, _layer_velocity, mu_current = layer.decode_step(
+                hidden, positions, None,
                 token_ids=token_ids,
                 mu_prev=mu_prev,
                 kv_cache=kv_cache,
@@ -776,10 +775,6 @@ class ComplexityDeepModel(nn.Module):
 
         if not is_last_pp_rank():
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
-
-        # Bug 4 fix: persist velocity for next decode step (in-place = CUDA-graph safe)
-        if velocity_buf is not None:
-            velocity_buf.copy_(velocity)
 
         hidden = self.norm(hidden)
         return self._compute_logits(hidden)
@@ -800,20 +795,22 @@ class ComplexityDeepModel(nn.Module):
         # First stage: embed tokens
         if is_first_pp_rank():
             hidden = self.embed_tokens(token_ids.long())
-            velocity = torch.zeros_like(hidden)
             mu_prev = None
         else:
             # Receive from previous stage
             assert intermediate_tensors is not None
             hidden = intermediate_tensors["hidden_states"]
-            velocity = intermediate_tensors["velocity_states"]
             mu_prev = intermediate_tensors.get("mu_prev")
 
         # Process only our assigned layers
+        # NOTE: velocity is NOT cascaded across layers — each layer starts from
+        # v=None (→ zeros inside dynamics).  This matches the training framework
+        # where velocity_states=None during training, so every layer independently
+        # initialises its own velocity to zero.  (builder.py:144)
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            hidden, velocity, mu_current = layer(
-                hidden, positions, velocity,
+            hidden, _layer_velocity, mu_current = layer(
+                hidden, positions, None,
                 token_ids=token_ids,
                 mu_prev=mu_prev,
                 kv_cache=kv_cache,
@@ -830,7 +827,6 @@ class ComplexityDeepModel(nn.Module):
         if not is_last_pp_rank():
             return IntermediateTensors({
                 "hidden_states": hidden,
-                "velocity_states": velocity,
                 "mu_prev": mu_prev,
             })
 
