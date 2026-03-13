@@ -6,6 +6,7 @@ CORS, authentication, rate limiting, and load shedding middleware.
 INL - 2025
 """
 
+import asyncio
 import hmac
 import time
 from typing import Optional, Dict
@@ -27,8 +28,14 @@ class TokenBucketRateLimiter:
         self._max_buckets = max_buckets
         self._cleanup_interval = cleanup_interval
         self._last_cleanup = time.monotonic()
+        self._lock = asyncio.Lock()
 
-    def allow(self, ip: str) -> bool:
+    async def allow(self, ip: str) -> bool:
+        async with self._lock:
+            return self._allow_unlocked(ip)
+
+    def _allow_unlocked(self, ip: str) -> bool:
+        """Token bucket check — must be called while holding self._lock."""
         now = time.monotonic()
 
         # Periodic cleanup of stale buckets to prevent memory leaks
@@ -113,7 +120,7 @@ def make_rate_limit_middleware(rate_limiter: TokenBucketRateLimiter):
     async def rate_limit_middleware(request, handler):
         if request.path.startswith("/v1/"):
             ip = request.remote or "unknown"
-            if not rate_limiter.allow(ip):
+            if not await rate_limiter.allow(ip):
                 return web.json_response(
                     {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
                     status=429,

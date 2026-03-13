@@ -222,42 +222,47 @@ class TestInputValidation:
 
 class TestRateLimiter:
 
-    def test_first_request_allowed(self):
+    @pytest.mark.asyncio
+    async def test_first_request_allowed(self):
         rl = TokenBucketRateLimiter(requests_per_minute=60)
-        assert rl.allow("1.2.3.4") is True
+        assert await rl.allow("1.2.3.4") is True
 
-    def test_burst_within_capacity(self):
+    @pytest.mark.asyncio
+    async def test_burst_within_capacity(self):
         rl = TokenBucketRateLimiter(requests_per_minute=10)
         # First 10 requests should be allowed (capacity = 10)
         for i in range(10):
-            assert rl.allow("1.2.3.4") is True
+            assert await rl.allow("1.2.3.4") is True
 
-    def test_burst_exceeds_capacity(self):
+    @pytest.mark.asyncio
+    async def test_burst_exceeds_capacity(self):
         rl = TokenBucketRateLimiter(requests_per_minute=5)
         for _ in range(5):
-            rl.allow("1.2.3.4")
+            await rl.allow("1.2.3.4")
         # 6th request without any time passing should be denied
-        assert rl.allow("1.2.3.4") is False
+        assert await rl.allow("1.2.3.4") is False
 
-    def test_different_ips_independent(self):
+    @pytest.mark.asyncio
+    async def test_different_ips_independent(self):
         rl = TokenBucketRateLimiter(requests_per_minute=2)
-        rl.allow("1.1.1.1")
-        rl.allow("1.1.1.1")
+        await rl.allow("1.1.1.1")
+        await rl.allow("1.1.1.1")
         # IP 1 exhausted, but IP 2 should still work
-        assert rl.allow("2.2.2.2") is True
+        assert await rl.allow("2.2.2.2") is True
 
-    def test_refill_over_time(self):
+    @pytest.mark.asyncio
+    async def test_refill_over_time(self):
         rl = TokenBucketRateLimiter(requests_per_minute=60)
         # Exhaust all tokens
         for _ in range(60):
-            rl.allow("1.1.1.1")
+            await rl.allow("1.1.1.1")
         # Should be denied
-        assert rl.allow("1.1.1.1") is False
+        assert await rl.allow("1.1.1.1") is False
 
         # Manually adjust the last time to simulate passage of time
         bucket = rl._buckets["1.1.1.1"]
         bucket[1] -= 2.0  # 2 seconds ago → ~2 tokens refilled
-        assert rl.allow("1.1.1.1") is True
+        assert await rl.allow("1.1.1.1") is True
 
 
 # =========================================================================

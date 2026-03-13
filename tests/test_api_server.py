@@ -474,28 +474,32 @@ class TestCompletionResponse:
 
 
 class TestTokenBucketRateLimiter:
-    def test_allow_within_limit(self):
+    @pytest.mark.asyncio
+    async def test_allow_within_limit(self):
         limiter = TokenBucketRateLimiter(60)  # 60 req/min
-        assert limiter.allow("1.2.3.4") is True
-        assert limiter.allow("1.2.3.4") is True
+        assert await limiter.allow("1.2.3.4") is True
+        assert await limiter.allow("1.2.3.4") is True
 
-    def test_deny_over_limit(self):
+    @pytest.mark.asyncio
+    async def test_deny_over_limit(self):
         limiter = TokenBucketRateLimiter(1)  # 1 req/min
-        assert limiter.allow("1.2.3.4") is True
-        assert limiter.allow("1.2.3.4") is False
+        assert await limiter.allow("1.2.3.4") is True
+        assert await limiter.allow("1.2.3.4") is False
 
-    def test_different_ips_independent(self):
+    @pytest.mark.asyncio
+    async def test_different_ips_independent(self):
         limiter = TokenBucketRateLimiter(1)
-        assert limiter.allow("1.2.3.4") is True
-        assert limiter.allow("5.6.7.8") is True
+        assert await limiter.allow("1.2.3.4") is True
+        assert await limiter.allow("5.6.7.8") is True
 
-    def test_stale_cleanup(self):
+    @pytest.mark.asyncio
+    async def test_stale_cleanup(self):
         """Stale buckets should be cleaned up."""
         limiter = TokenBucketRateLimiter(60, max_buckets=2)
-        limiter.allow("ip1")
-        limiter.allow("ip2")
+        await limiter.allow("ip1")
+        await limiter.allow("ip2")
         # Third IP should trigger cleanup or eviction
-        limiter.allow("ip3")
+        await limiter.allow("ip3")
         assert len(limiter._buckets) <= 3  # At most max_buckets + 1 during cleanup
 
 
