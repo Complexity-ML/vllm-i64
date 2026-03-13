@@ -96,7 +96,8 @@ class FreeKVCacheBlockQueue:
         if self.num_free_blocks == 0:
             raise RuntimeError("No free blocks in the pool")
         block = self._head.next_free_block
-        assert block is not None and block is not self._tail
+        if block is None or block is self._tail:
+            raise RuntimeError("Free block queue corrupted: head links to tail or None")
         self._remove(block)
         return block
 
@@ -111,7 +112,8 @@ class FreeKVCacheBlockQueue:
     def append(self, block: KVCacheBlock) -> None:
         """Append block to the tail (MRU position = evicted last). O(1)."""
         prev = self._tail.prev_free_block
-        assert prev is not None
+        if prev is None:
+            raise RuntimeError("Free block queue corrupted: tail.prev is None")
         prev.next_free_block   = block
         block.prev_free_block  = prev
         block.next_free_block  = self._tail
@@ -130,7 +132,11 @@ class FreeKVCacheBlockQueue:
     def _remove(self, block: KVCacheBlock) -> None:
         prev = block.prev_free_block
         nxt  = block.next_free_block
-        assert prev is not None and nxt is not None
+        if prev is None or nxt is None:
+            raise RuntimeError(
+                f"Cannot remove block {block.block_id}: broken linked-list pointers "
+                f"(prev={prev}, next={nxt})"
+            )
         prev.next_free_block = nxt
         nxt.prev_free_block  = prev
         block.prev_free_block = None
@@ -163,7 +169,8 @@ class BlockPool:
         enable_caching: bool,
         block_size: int,
     ) -> None:
-        assert num_gpu_blocks > 0
+        if num_gpu_blocks <= 0:
+            raise ValueError(f"num_gpu_blocks must be > 0, got {num_gpu_blocks}")
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.block_size = block_size
@@ -202,7 +209,11 @@ class BlockPool:
         for block in blocks:
             if self.enable_caching:
                 self._evict_cached_block(block)
-            assert block.ref_cnt == 0
+            if block.ref_cnt != 0:
+                raise RuntimeError(
+                    f"Block {block.block_id} has ref_cnt={block.ref_cnt} after "
+                    f"allocation — possible double-allocation"
+                )
             block.ref_cnt = 1
         return blocks
 
