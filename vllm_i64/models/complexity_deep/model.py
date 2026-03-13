@@ -640,8 +640,7 @@ class ComplexityDecoderLayer(nn.Module):
         residual = hidden
         norm_out = self.post_attention_layernorm(hidden)
         x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
-        mlp_mu = None  # MLP never receives mu during training (block.py:147)
-        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mlp_mu, x_preq=x_preq)
+        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mu_current, x_preq=x_preq)
         hidden = residual + hidden
 
         return hidden, velocity, mu_current
@@ -679,8 +678,7 @@ class ComplexityDecoderLayer(nn.Module):
         residual = hidden
         norm_out = self.post_attention_layernorm(hidden)
         x_preq = self.post_attention_layernorm._try_fused_quant(hidden) if hasattr(self.mlp, 'gate_up_int8') or hasattr(self.mlp, 'gate_int8') else None
-        mlp_mu = None  # MLP never receives mu during training (block.py:147)
-        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mlp_mu, x_preq=x_preq)
+        hidden = self.mlp(norm_out, token_ids=token_ids, mu=mu_current, x_preq=x_preq)
         hidden = residual + hidden
 
         return hidden, velocity, mu_current
@@ -836,6 +834,7 @@ class ComplexityDeepModel(nn.Module):
         # Velocity behavior depends on training origin:
         # - complexity-deep (1.5B+): cascade velocity layer→layer (original training)
         # - complexity-framework (tiny): each layer starts from v=None (→ zeros)
+        mu_residual = None
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
             hidden, velocity, mu_current = layer(
@@ -850,9 +849,14 @@ class ComplexityDeepModel(nn.Module):
             if not self.config.dynamics_cascade_velocity:
                 velocity = None
 
-            # Match original training exactly: mu_prev = mu_contextual, no clamp, no residual
+            # Match original training: mu residual highway (complexity_deep/models/modeling.py)
             if mu_current is not None:
-                mu_prev = mu_current
+                if mu_residual is None:
+                    mu_residual = mu_current.clone()
+                    mu_prev = mu_current + 0.1 * mu_residual
+                else:
+                    mu_residual = mu_residual + mu_current
+                    mu_prev = mu_current + 0.1 * mu_residual
 
         # Not last stage: pass tensors to next stage
         if not is_last_pp_rank():

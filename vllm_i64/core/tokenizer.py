@@ -9,11 +9,93 @@ INL - 2025
 
 import logging
 import os
+import re
 from typing import Optional, List
+
+import torch
 
 logger = logging.getLogger("vllm_i64.tokenizer")
 
 from vllm_i64.core.registry import get_model_entry
+
+
+# Patterns for artifact tokens that should be heavily penalized
+_ARTIFACT_RE = re.compile(r'^\[\[|\]\]$|^<\|.*\|>$')
+# Pattern for byte fallback tokens like <0xNN>
+_BYTE_FALLBACK_RE = re.compile(r'^<0x[0-9A-Fa-f]{2}>$')
+
+
+def compute_token_quality_vector(tokenizer, alpha: float = 1.5) -> torch.Tensor:
+    """
+    Pre-compute a per-token quality score vector from the tokenizer vocabulary.
+
+    Scores are based on heuristics (applied before alpha scaling):
+      - Special tokens (EOS, BOS, PAD)          : -inf
+      - <unk> token                              : -10.0
+      - Byte fallback <0xNN>                     : -2.0
+      - Known artifact ([[, ]], <|...|>)          : -5.0
+      - Space-prefixed complete word (▁word)      : +0.3
+      - Multi-char content token                  : +0.2
+
+    The vector is multiplied by alpha and added to logits before sampling.
+
+    Args:
+        tokenizer: HuggingFace fast tokenizer instance
+        alpha: scaling factor for the quality bias
+
+    Returns:
+        (vocab_size,) float32 tensor of logit biases
+    """
+    vocab_size = tokenizer.get_vocab_size()
+    scores = torch.zeros(vocab_size, dtype=torch.float32)
+
+    vocab = tokenizer.get_vocab()
+    id_to_token = {v: k for k, v in vocab.items()}
+
+    for tid in range(vocab_size):
+        token_str = id_to_token.get(tid, "")
+
+        # Special tokens: EOS, PAD, BOS
+        if token_str in ("</s>", "<pad>", "<s>"):
+            scores[tid] = float("-inf")
+            continue
+
+        # Unknown token
+        if token_str == "<unk>":
+            scores[tid] = -10.0
+            continue
+
+        # Byte fallback tokens (some tokenizers use <0xNN>)
+        if _BYTE_FALLBACK_RE.match(token_str):
+            scores[tid] = -2.0
+            continue
+
+        # Known artifacts
+        if _ARTIFACT_RE.match(token_str):
+            scores[tid] = -5.0
+            continue
+
+        # Space-prefixed = word boundary token (SentencePiece ▁)
+        if token_str.startswith("\u2581") or token_str.startswith(" "):
+            scores[tid] += 0.3
+
+        # Multi-character content tokens (more informative than single chars)
+        clean = token_str.lstrip("\u2581 ")
+        if len(clean) > 1:
+            scores[tid] += 0.2
+
+    # Apply alpha scaling (only to finite scores)
+    finite_mask = scores.isfinite()
+    scores[finite_mask] = scores[finite_mask] * alpha
+
+    non_zero = (scores != 0).sum().item()
+    neg_inf = scores.isinf().sum().item()
+    logger.info(
+        "Token quality vector: %d/%d tokens biased (%d suppressed)",
+        non_zero, vocab_size, neg_inf,
+    )
+
+    return scores
 
 
 class I64Tokenizer:
@@ -30,6 +112,7 @@ class I64Tokenizer:
         from tokenizers import Tokenizer
 
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        self._token_quality_vector: Optional[torch.Tensor] = None
 
     def encode(self, text: str) -> List[int]:
         """Text → i64 token IDs. Strips trailing EOS (not part of prompt)."""
@@ -47,6 +130,13 @@ class I64Tokenizer:
     @property
     def vocab_size(self) -> int:
         return self.tokenizer.get_vocab_size()
+
+    @property
+    def token_quality_vector(self) -> torch.Tensor:
+        """Lazily compute and cache the token quality vector."""
+        if self._token_quality_vector is None:
+            self._token_quality_vector = compute_token_quality_vector(self.tokenizer)
+        return self._token_quality_vector
 
     def _find_token(self, candidates: list, fallback: int) -> int:
         """Try multiple token names, return first match or fallback."""

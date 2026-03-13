@@ -398,10 +398,37 @@ def _apply_seed(params: SamplingParams):
         params._generator.manual_seed(params.seed)
 
 
+def apply_token_quality_bias(
+    logits: torch.Tensor,
+    quality_vector: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply pre-computed token quality bias to logits.
+
+    The quality vector is computed once at tokenizer load and penalizes
+    byte fallbacks, artifacts, and control tokens while boosting
+    well-formed word tokens.
+
+    Args:
+        logits: (batch, vocab_size) or (vocab_size,)
+        quality_vector: (vocab_size,) pre-computed bias
+
+    Returns:
+        logits with quality bias applied (in-place for batch dim)
+    """
+    qv = quality_vector.to(device=logits.device, dtype=logits.dtype)
+    if logits.dim() == 1:
+        logits = logits + qv[:logits.shape[0]]
+    else:
+        logits = logits + qv[:logits.shape[-1]].unsqueeze(0)
+    return logits
+
+
 def sample_batch(
     logits: torch.Tensor,
     params: SamplingParams,
     past_tokens_list: Optional[List[List[int]]] = None,
+    token_quality_vector: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Sample tokens for a batch.
@@ -410,11 +437,16 @@ def sample_batch(
         logits: (batch, vocab_size)
         params: sampling parameters
         past_tokens_list: per-request token history (for repetition penalty)
+        token_quality_vector: (vocab_size,) pre-computed quality bias from tokenizer
 
     Returns:
         token_ids: (batch,) i64 tensor
     """
     logits = logits.float()
+
+    # Apply token quality bias (pre-computed, zero runtime cost)
+    if token_quality_vector is not None:
+        logits = apply_token_quality_bias(logits, token_quality_vector)
 
     # Apply repetition penalty before temperature/sampling
     if params.repetition_penalty != 1.0 and past_tokens_list is not None:
@@ -468,6 +500,7 @@ def sample_batch_with_logprobs(
     logits: torch.Tensor,
     params: SamplingParams,
     past_tokens_list: Optional[List[List[int]]] = None,
+    token_quality_vector: Optional[torch.Tensor] = None,
 ) -> SampleOutput:
     """
     Sample tokens for a batch with optional logprob tracking.
@@ -479,11 +512,16 @@ def sample_batch_with_logprobs(
         logits: (batch, vocab_size)
         params: sampling parameters (with logprobs field)
         past_tokens_list: per-request token history
+        token_quality_vector: (vocab_size,) pre-computed quality bias from tokenizer
 
     Returns:
         SampleOutput with token_ids and optional logprobs
     """
     logits = logits.float()
+
+    # Apply token quality bias (pre-computed, zero runtime cost)
+    if token_quality_vector is not None:
+        logits = apply_token_quality_bias(logits, token_quality_vector)
 
     # Apply repetition penalty before anything
     if params.repetition_penalty != 1.0 and past_tokens_list is not None:

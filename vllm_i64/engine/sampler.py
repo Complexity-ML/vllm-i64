@@ -31,10 +31,16 @@ class I64Sampler:
       - Per-request params override
       - Logprobs collection
       - Logit processors (per-request)
+      - Token quality vector (pre-computed bias from tokenizer)
     """
 
     def __init__(self, default_params: Optional[SamplingParams] = None):
         self.default_params = default_params or SamplingParams(temperature=0.0)
+        self.token_quality_vector: Optional[torch.Tensor] = None
+
+    def set_token_quality_vector(self, qv: torch.Tensor) -> None:
+        """Set the pre-computed token quality vector from the tokenizer."""
+        self.token_quality_vector = qv
 
     def sample(
         self,
@@ -48,7 +54,11 @@ class I64Sampler:
         Returns: (batch_size,) i64 numpy array of token IDs.
         """
         p = params or self.default_params
-        token_ids = sample_batch(logits, p, past_tokens_list=past_tokens_list)
+        token_ids = sample_batch(
+            logits, p,
+            past_tokens_list=past_tokens_list,
+            token_quality_vector=self.token_quality_vector,
+        )
         return token_ids.cpu().numpy().astype(np.int64)
 
     def sample_with_logprobs(
@@ -63,4 +73,8 @@ class I64Sampler:
         Returns: SampleOutput with token_ids and logprobs.
         """
         p = params or self.default_params
-        return sample_batch_with_logprobs(logits, p, past_tokens_list=past_tokens_list)
+        return sample_batch_with_logprobs(
+            logits, p,
+            past_tokens_list=past_tokens_list,
+            token_quality_vector=self.token_quality_vector,
+        )

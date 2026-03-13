@@ -117,6 +117,10 @@ class I64Server(HelpersMixin, CompletionsMixin, AdminMixin, RAGMixin, AgentMixin
                 logger.info("Fixing eos_token_id: config=%d → tokenizer=%d", cfg_eos, tok_eos)
                 engine.model.config.eos_token_id = tok_eos
 
+        # Token quality vector — pre-computed logit bias from tokenizer heuristics
+        if tokenizer and engine is not None and hasattr(engine, 'sampler'):
+            engine.sampler.set_token_quality_vector(tokenizer.token_quality_vector)
+
         # Space suppression at step 0 (first-token quality fix)
         self._space_suppress_ids = None
         if tokenizer:
