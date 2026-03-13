@@ -69,6 +69,10 @@ class ComplexityDeepConfig:
     disable_mu_guidance: bool = False   # run3-no-mu: skip mu→Q/K/V and mu routing
     disable_pid_scaler: bool = False    # run4-no-pid: skip INL dynamics entirely
 
+    # Dynamics variant: complexity-deep (1.5B+) uses contextual mu for error,
+    # complexity-framework (tiny/ablation) uses clamped base mu.
+    dynamics_use_contextual_error: bool = True   # default=True for 1.5B+ (complexity-deep)
+
     @property
     def head_dim(self) -> int:
         return self.hidden_size // self.num_attention_heads
@@ -102,5 +106,10 @@ class ComplexityDeepConfig:
         elif data.get("mlp_type") == "swiglu":
             config.use_token_routed_mlp = False
             config.num_experts = 1
+
+        # Framework-trained models (have mlp_type field) use base mu for error;
+        # complexity-deep native models (no mlp_type) use contextual mu.
+        if "mlp_type" in data:
+            config.dynamics_use_contextual_error = False
 
         return config

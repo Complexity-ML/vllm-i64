@@ -56,10 +56,12 @@ class INLDynamics(nn.Module):
       - INT8 (quantized inference): INT8 controller matmuls + LUT activations
     """
 
-    def __init__(self, hidden_size: int, controller_hidden: int = 64, dt: float = 0.1):
+    def __init__(self, hidden_size: int, controller_hidden: int = 64, dt: float = 0.1,
+                 use_contextual_error: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
         self.dt = dt
+        self.use_contextual_error = use_contextual_error
 
         self.mu = nn.Parameter(torch.zeros(hidden_size))
         self.mu_proj = nn.Linear(hidden_size, hidden_size, bias=False)
@@ -100,15 +102,20 @@ class INLDynamics(nn.Module):
         beta = torch.clamp(F.softplus(beta_raw), max=2.0)
         gate = torch.sigmoid(gate_raw)
 
-        # Match training: error uses clamped BASE mu, not contextual mu
-        mu_clamped = torch.clamp(self.mu, 0.0, 2.0)
-        error = h - mu_clamped
+        mu_contextual = self.mu + self.mu_proj(h)
+
+        if self.use_contextual_error:
+            # complexity-deep (1.5B+): error from contextual mu
+            error = h - mu_contextual
+        else:
+            # complexity-framework (tiny/ablation): error from clamped base mu
+            mu_clamped = torch.clamp(self.mu, 0.0, 2.0)
+            error = h - mu_clamped
+            mu_contextual = mu_clamped + self.mu_proj(h)
+
         v_next = alpha * v - beta * error
         v_next = torch.clamp(v_next, min=-10.0, max=10.0)
         h_next = h + self.dt * gate * v_next
-
-        # Contextual mu is separate — used for next-layer guidance, NOT for error
-        mu_contextual = mu_clamped + self.mu_proj(h)
 
         return h_next, v_next, mu_contextual
 
@@ -146,18 +153,24 @@ class INLDynamics(nn.Module):
         gate_q7 = (gate_raw.float() * _Q7).round().to(torch.int32)
         gate = sigmoid_integer(gate_q7).float() / _Q7
 
-        # Match training: error uses clamped BASE mu, not contextual mu
-        mu_clamped = torch.clamp(self.mu, 0.0, 2.0)
-        error = h - mu_clamped
+        if hasattr(self, 'mu_proj_int8'):
+            mu_contextual = self.mu + int8_linear_native(h, self.mu_proj_int8, self.mu_proj_scale)
+        else:
+            mu_contextual = self.mu + self.mu_proj(h)
+
+        if self.use_contextual_error:
+            error = h - mu_contextual
+        else:
+            mu_clamped = torch.clamp(self.mu, 0.0, 2.0)
+            error = h - mu_clamped
+            if hasattr(self, 'mu_proj_int8'):
+                mu_contextual = mu_clamped + int8_linear_native(h, self.mu_proj_int8, self.mu_proj_scale)
+            else:
+                mu_contextual = mu_clamped + self.mu_proj(h)
+
         v_next = alpha * v - beta * error
         v_next = torch.clamp(v_next, min=-10.0, max=10.0)
         h_next = h + self.dt * gate * v_next
-
-        # Contextual mu is separate — used for next-layer guidance, NOT for error
-        if hasattr(self, 'mu_proj_int8'):
-            mu_contextual = mu_clamped + int8_linear_native(h, self.mu_proj_int8, self.mu_proj_scale)
-        else:
-            mu_contextual = mu_clamped + self.mu_proj(h)
 
         return h_next, v_next, mu_contextual
 
@@ -588,6 +601,7 @@ class ComplexityDecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 controller_hidden=config.dynamics_controller_hidden,
                 dt=config.dynamics_dt,
+                use_contextual_error=config.dynamics_use_contextual_error,
             )
 
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
