@@ -54,7 +54,8 @@ class AdminMixin:
             logger.warning("GPU health check failed: %s", e)
             checks["gpu"] = "error"
 
-        health = {"status": status, "model": self.model_name, "uptime_seconds": uptime_s,
+        from vllm_i64 import __version__
+        health = {"status": status, "version": __version__, "model": self.model_name, "uptime_seconds": uptime_s,
                   "requests_served": self.request_counter, "engine": stats,
                   "queue": {"pending": len(self.sync_engine.scheduler.pending),
                             "running": len(self.sync_engine.scheduler.running),
