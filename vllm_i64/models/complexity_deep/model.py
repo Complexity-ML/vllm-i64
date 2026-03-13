@@ -100,11 +100,15 @@ class INLDynamics(nn.Module):
         beta = torch.clamp(F.softplus(beta_raw), max=2.0)
         gate = torch.sigmoid(gate_raw)
 
-        mu_contextual = self.mu + self.mu_proj(h)
-        error = h - mu_contextual
+        # Match training: error uses clamped BASE mu, not contextual mu
+        mu_clamped = torch.clamp(self.mu, 0.0, 2.0)
+        error = h - mu_clamped
         v_next = alpha * v - beta * error
         v_next = torch.clamp(v_next, min=-10.0, max=10.0)
         h_next = h + self.dt * gate * v_next
+
+        # Contextual mu is separate — used for next-layer guidance, NOT for error
+        mu_contextual = mu_clamped + self.mu_proj(h)
 
         return h_next, v_next, mu_contextual
 
@@ -142,16 +146,18 @@ class INLDynamics(nn.Module):
         gate_q7 = (gate_raw.float() * _Q7).round().to(torch.int32)
         gate = sigmoid_integer(gate_q7).float() / _Q7
 
-        # mu projection: INT8 if available
-        if hasattr(self, 'mu_proj_int8'):
-            mu_contextual = self.mu + int8_linear_native(h, self.mu_proj_int8, self.mu_proj_scale)
-        else:
-            mu_contextual = self.mu + self.mu_proj(h)
-
-        error = h - mu_contextual
+        # Match training: error uses clamped BASE mu, not contextual mu
+        mu_clamped = torch.clamp(self.mu, 0.0, 2.0)
+        error = h - mu_clamped
         v_next = alpha * v - beta * error
         v_next = torch.clamp(v_next, min=-10.0, max=10.0)
         h_next = h + self.dt * gate * v_next
+
+        # Contextual mu is separate — used for next-layer guidance, NOT for error
+        if hasattr(self, 'mu_proj_int8'):
+            mu_contextual = mu_clamped + int8_linear_native(h, self.mu_proj_int8, self.mu_proj_scale)
+        else:
+            mu_contextual = mu_clamped + self.mu_proj(h)
 
         return h_next, v_next, mu_contextual
 
