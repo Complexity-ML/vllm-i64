@@ -72,6 +72,11 @@ class I64Request:
     # Arrival order for fairness (integer timestamp)
     arrival_step: int = 0
 
+    # Saved context from preemption (allows resuming partial generation)
+    _saved_output_token_ids: Optional[List[int]] = field(default=None, repr=False)
+    _saved_seq_pos: int = 0
+    _saved_prefill_progress: int = 0
+
     # KV cache namespace — SHA-256[:16] of api_key. Isolates prefix cache
     # per tenant to prevent cross-user timing oracle attacks.
     cache_namespace: Optional[bytes] = field(default=None, repr=False)
@@ -316,8 +321,15 @@ class I64Scheduler:
             if victim.priority <= 0 and not self._pending_heap:
                 continue
 
-            # Preempt
+            # Preempt — save partial generation so it can resume later
             victim.status = RequestStatus.PREEMPTED
+            victim._saved_output_token_ids = list(victim.output_token_ids)
+            victim._saved_seq_pos = victim.seq_pos
+            victim._saved_prefill_progress = victim.prefill_progress
+            _logger.info(
+                "Preempting request %d (priority=%d, %d generated tokens saved)",
+                victim.request_id, victim.priority, len(victim.output_token_ids),
+            )
             self._free_kv_blocks(victim.kv_block_ids)
             freed += len(victim.kv_block_ids)
             victim.kv_block_ids = []
@@ -351,6 +363,8 @@ class I64Scheduler:
         self.running = still_running
 
         # Re-admit preempted requests (they go back to pending with priority boost)
+        # Saved output_token_ids are preserved on the request so they can be
+        # restored once the request is re-scheduled and KV blocks re-allocated.
         for req in self.preempted:
             req.status = RequestStatus.PENDING
             req.priority = min(req.priority, -1)  # Boost priority after preemption
@@ -364,7 +378,13 @@ class I64Scheduler:
             req = self._peek_pending()
             if req is None:
                 break
-            num_blocks_needed = (req.num_prompt_tokens + self.kv_block_size - 1) // self.kv_block_size
+
+            # If the request was previously preempted and has saved tokens,
+            # we need blocks for prompt + saved generated tokens.
+            total_tokens_for_blocks = req.num_prompt_tokens
+            if req._saved_output_token_ids:
+                total_tokens_for_blocks += len(req._saved_output_token_ids)
+            num_blocks_needed = (total_tokens_for_blocks + self.kv_block_size - 1) // self.kv_block_size
             blocks = self._allocate_kv_blocks(num_blocks_needed)
 
             if blocks is None:
@@ -379,6 +399,20 @@ class I64Scheduler:
             self._pop_pending()
             req.kv_block_ids = blocks
             req.status = RequestStatus.RUNNING
+
+            # Restore saved context from preemption so partial generation resumes
+            if req._saved_output_token_ids is not None:
+                req.output_token_ids = req._saved_output_token_ids
+                req.seq_pos = req._saved_seq_pos
+                req.prefill_progress = req._saved_prefill_progress
+                _logger.info(
+                    "Restored request %d with %d saved tokens",
+                    req.request_id, len(req.output_token_ids),
+                )
+                req._saved_output_token_ids = None
+                req._saved_seq_pos = 0
+                req._saved_prefill_progress = 0
+
             self.running.append(req)
 
         if not self.running:
