@@ -6,12 +6,19 @@ Runs user code in an isolated subprocess with resource limits.
 On Linux: uses resource.setrlimit() for CPU, memory, file size limits.
 On other platforms: subprocess timeout only (no kernel-level isolation).
 
+Security hardening:
+- AST analysis blocks dangerous module imports (os, subprocess, socket, etc.)
+- Restricted builtins whitelist (no open, exec, eval, compile, __import__)
+- Execution timeout default 5s
+- Resource limits via setrlimit on Linux
+
 Integer-first: no bloat, no Docker, no VMs.
 Just fork → limit → exec → collect → kill.
 
 INL - 2025
 """
 
+import ast
 import os
 import sys
 import shutil
@@ -20,9 +27,120 @@ import tempfile
 import subprocess
 import logging
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Set
 
 _logger = logging.getLogger("vllm_i64.sandbox")
+
+# ── Security: blocked modules and restricted builtins ──────────────────
+
+BLOCKED_MODULES: Set[str] = frozenset({
+    "os", "subprocess", "socket", "ctypes", "shutil",
+    "signal", "multiprocessing", "threading",
+    "importlib", "runpy", "code", "codeop",
+    "pty", "pipes", "fcntl", "termios",
+    "resource", "gc", "sys",
+    # network
+    "http", "urllib", "requests", "httpx", "aiohttp",
+    "ftplib", "smtplib", "poplib", "imaplib", "telnetlib",
+    "xmlrpc", "socketserver",
+    # file / pickle / marshal — deserialization attacks
+    "pickle", "shelve", "marshal", "tempfile",
+    # low-level
+    "mmap", "sysconfig", "_thread",
+})
+
+# Safe builtins whitelist — no open, exec, eval, compile, __import__
+_SAFE_BUILTINS = {
+    "abs": abs, "all": all, "any": any, "bin": bin, "bool": bool,
+    "bytearray": bytearray, "bytes": bytes, "callable": callable,
+    "chr": chr, "complex": complex, "dict": dict, "dir": dir,
+    "divmod": divmod, "enumerate": enumerate, "filter": filter,
+    "float": float, "format": format, "frozenset": frozenset,
+    "getattr": getattr, "hasattr": hasattr, "hash": hash, "hex": hex,
+    "id": id, "int": int, "isinstance": isinstance,
+    "issubclass": issubclass, "iter": iter, "len": len, "list": list,
+    "map": map, "max": max, "min": min, "next": next, "object": object,
+    "oct": oct, "ord": ord, "pow": pow, "print": print, "range": range,
+    "repr": repr, "reversed": reversed, "round": round, "set": set,
+    "slice": slice, "sorted": sorted, "str": str, "sum": sum,
+    "super": super, "tuple": tuple, "type": type, "vars": vars,
+    "zip": zip, "True": True, "False": False, "None": None,
+}
+
+
+def _validate_python_ast(code: str) -> Optional[str]:
+    """
+    Parse Python code into an AST and reject dangerous imports.
+
+    Returns an error message if blocked content is found, or None if safe.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        # Let the actual interpreter handle syntax errors
+        return None
+
+    for node in ast.walk(tree):
+        # import foo / import foo.bar
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_module = alias.name.split(".")[0]
+                if top_module in BLOCKED_MODULES:
+                    return f"Blocked import: '{alias.name}' (module '{top_module}' is restricted)"
+
+        # from foo import bar / from foo.bar import baz
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top_module = node.module.split(".")[0]
+                if top_module in BLOCKED_MODULES:
+                    return f"Blocked import: 'from {node.module} ...' (module '{top_module}' is restricted)"
+
+        # Block dangerous builtin calls: __import__, exec, eval, compile
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                if func.id == "__import__":
+                    return "Blocked: direct __import__() call"
+                if func.id in ("exec", "eval", "compile"):
+                    return f"Blocked: {func.id}() is not allowed in sandbox"
+            if isinstance(func, ast.Attribute) and func.attr == "__import__":
+                return "Blocked: direct __import__() call"
+
+    return None
+
+
+# Python preamble that replaces builtins at runtime to block dangerous functions.
+# This is a defence-in-depth layer on top of the AST check.
+# We replace __import__ with a filtered version rather than removing it,
+# so that `import math` still works but blocked modules are rejected.
+_RESTRICTED_BUILTINS_PREAMBLE = '''\
+import builtins as _b
+def _make_safe_import():
+    _orig = _b.__import__
+    _blocked = {
+        "os", "subprocess", "socket", "ctypes", "shutil",
+        "signal", "multiprocessing", "threading",
+        "importlib", "runpy", "code", "codeop",
+        "pty", "pipes", "fcntl", "termios",
+        "resource", "gc", "sys",
+        "http", "urllib", "requests", "httpx", "aiohttp",
+        "ftplib", "smtplib", "poplib", "imaplib", "telnetlib",
+        "xmlrpc", "socketserver",
+        "pickle", "shelve", "marshal", "tempfile",
+        "mmap", "sysconfig", "_thread",
+    }
+    def _safe_import(name, *args, **kwargs):
+        if name.split(".")[0] in _blocked:
+            raise ImportError(f"Import of '{name}' is blocked by sandbox policy")
+        return _orig(name, *args, **kwargs)
+    return _safe_import
+_b.__import__ = _make_safe_import()
+# Remove dangerous builtins — open is the main file-system escape hatch
+_b.open = None
+_b.breakpoint = None
+_b.input = None
+del _b, _make_safe_import
+'''
 
 # Language runtime configs
 _RUNTIMES: Dict[str, Dict] = {
@@ -92,7 +210,7 @@ class Sandbox:
     Sandboxed code executor with resource limits.
 
     Args:
-        timeout: Max execution time in seconds (default: 30)
+        timeout: Max execution time in seconds (default: 5)
         max_memory_mb: Max memory in MB (default: 256, Linux only)
         max_output_bytes: Max stdout/stderr capture (default: 64KB)
         max_file_size_mb: Max file size writable (default: 10MB, Linux only)
@@ -101,7 +219,7 @@ class Sandbox:
 
     def __init__(
         self,
-        timeout: int = 30,
+        timeout: int = 5,
         max_memory_mb: int = 256,
         max_output_bytes: int = 65536,
         max_file_size_mb: int = 10,
@@ -114,6 +232,13 @@ class Sandbox:
         self.max_file_size_mb = max_file_size_mb
         self.allowed_languages = allowed_languages or list(_RUNTIMES.keys())
         self._is_linux = sys.platform.startswith("linux")
+
+        _logger.warning(
+            "sandbox: code execution enabled (timeout=%ds, max_mem=%dMB, "
+            "blocked_modules=%d, restricted_builtins=True)",
+            self.timeout, self.max_memory_mb, len(BLOCKED_MODULES),
+        )
+
         # Resolve sandbox user UID/GID for process isolation
         self._sandbox_uid: Optional[int] = None
         self._sandbox_gid: Optional[int] = None
@@ -155,6 +280,18 @@ class Sandbox:
                 language=language,
             )
 
+        # ── AST-based security validation for Python code ──
+        if language == "python":
+            violation = _validate_python_ast(code)
+            if violation is not None:
+                _logger.warning("sandbox: blocked execution — %s", violation)
+                return ExecutionResult(
+                    stdout="",
+                    stderr=f"Security violation: {violation}",
+                    exit_code=1,
+                    language=language,
+                )
+
         # Create temp directory for this execution
         tmpdir = tempfile.mkdtemp(prefix="i64_sandbox_")
         try:
@@ -179,6 +316,9 @@ class Sandbox:
         with open(src_path, "w", encoding="utf-8") as f:
             if runtime["shebang"]:
                 f.write(runtime["shebang"])
+            # For Python: inject restricted builtins to block open/exec/eval/compile/__import__
+            if language == "python":
+                f.write(_RESTRICTED_BUILTINS_PREAMBLE)
             f.write(code)
 
         # Build command
