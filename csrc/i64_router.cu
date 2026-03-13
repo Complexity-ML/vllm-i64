@@ -11,6 +11,25 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <stdexcept>
+
+// =============================================================================
+// CUDA error checking helpers
+// =============================================================================
+
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                        \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess)                                                \
+            throw std::runtime_error(cudaGetErrorString(err));                 \
+    } while (0)
+
+#define CUDA_CHECK_KERNEL()                                                    \
+    do {                                                                        \
+        cudaError_t err = cudaGetLastError();                                  \
+        if (err != cudaSuccess)                                                \
+            throw std::runtime_error(cudaGetErrorString(err));                 \
+    } while (0)
 
 // =============================================================================
 // Core routing kernel — pure integer, zero float
@@ -77,6 +96,7 @@ __global__ void i64_scatter_kernel(
     half* __restrict__ hidden_out,
     const int32_t* __restrict__ expert_ids,
     int32_t* __restrict__ scatter_indices,
+    int32_t* __restrict__ token_order,
     const int32_t* __restrict__ expert_offsets,
     int32_t* __restrict__ expert_counters,
     const int32_t num_tokens,
@@ -91,7 +111,11 @@ __global__ void i64_scatter_kernel(
     int32_t slot;
     if (threadIdx.x == 0) {
         slot = atomicAdd(&expert_counters[expert], 1);
-        scatter_indices[token_idx] = expert_offsets[expert] + slot;
+        const int32_t global_slot = expert_offsets[expert] + slot;
+        scatter_indices[token_idx] = global_slot;
+        // Populate inverse mapping: for each scattered position, record the
+        // original token index so gather can restore original order.
+        token_order[global_slot] = token_idx;
     }
     __syncthreads();
 
@@ -179,6 +203,7 @@ void i64_route_and_scatter(
     half* hidden_out,               // [num_tokens, hidden_dim] scattered
     int32_t* expert_ids,            // [num_tokens] output
     int32_t* scatter_indices,       // [num_tokens] output
+    int32_t* token_order,           // [num_tokens] output — inverse map (scattered pos → original token)
     int32_t* expert_offsets,        // [num_experts] output
     int32_t num_tokens,
     int32_t num_experts,
@@ -190,12 +215,10 @@ void i64_route_and_scatter(
     // Temp buffers
     int32_t* expert_counts;
     int32_t* expert_counters;
-    int32_t* token_order;
-    cudaMallocAsync(&expert_counts, num_experts * sizeof(int32_t), stream);
-    cudaMallocAsync(&expert_counters, num_experts * sizeof(int32_t), stream);
-    cudaMallocAsync(&token_order, num_tokens * sizeof(int32_t), stream);
-    cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int32_t), stream);
-    cudaMemsetAsync(expert_counters, 0, num_experts * sizeof(int32_t), stream);
+    CUDA_CHECK(cudaMallocAsync(&expert_counts, num_experts * sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMallocAsync(&expert_counters, num_experts * sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(expert_counts, 0, num_experts * sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(expert_counters, 0, num_experts * sizeof(int32_t), stream));
 
     // 1. Route — pure i64
     const int threads = 256;
@@ -204,23 +227,25 @@ void i64_route_and_scatter(
         token_ids, expert_ids, token_order, expert_counts,
         num_tokens, expert_mask
     );
+    CUDA_CHECK_KERNEL();
 
     // 2. Prefix sum — tiny kernel
     i64_prefix_sum_kernel<<<1, 1, 0, stream>>>(
         expert_counts, expert_offsets, num_experts
     );
+    CUDA_CHECK_KERNEL();
 
-    // 3. Scatter — group tokens by expert
+    // 3. Scatter — group tokens by expert, populate token_order inverse map
     const int threads_scatter = min(hidden_dim, 256);
     i64_scatter_kernel<<<num_tokens, threads_scatter, 0, stream>>>(
         hidden_in, hidden_out, expert_ids, scatter_indices,
-        expert_offsets, expert_counters,
+        token_order, expert_offsets, expert_counters,
         num_tokens, hidden_dim
     );
+    CUDA_CHECK_KERNEL();
 
-    cudaFreeAsync(expert_counts, stream);
-    cudaFreeAsync(expert_counters, stream);
-    cudaFreeAsync(token_order, stream);
+    CUDA_CHECK(cudaFreeAsync(expert_counts, stream));
+    CUDA_CHECK(cudaFreeAsync(expert_counters, stream));
 }
 
 /**
@@ -239,6 +264,7 @@ void i64_gather(
         expert_out, output, scatter_indices,
         num_tokens, hidden_dim
     );
+    CUDA_CHECK_KERNEL();
 }
 
 }  // extern "C"

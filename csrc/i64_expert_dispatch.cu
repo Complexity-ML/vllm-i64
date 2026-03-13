@@ -14,6 +14,32 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cstdint>
+#include <stdexcept>
+
+// =============================================================================
+// CUDA error checking helpers
+// =============================================================================
+
+#define CUDA_CHECK(call)                                                       \
+    do {                                                                        \
+        cudaError_t err = (call);                                              \
+        if (err != cudaSuccess)                                                \
+            throw std::runtime_error(cudaGetErrorString(err));                 \
+    } while (0)
+
+#define CUDA_CHECK_KERNEL()                                                    \
+    do {                                                                        \
+        cudaError_t err = cudaGetLastError();                                  \
+        if (err != cudaSuccess)                                                \
+            throw std::runtime_error(cudaGetErrorString(err));                 \
+    } while (0)
+
+#define CUBLAS_CHECK(call)                                                     \
+    do {                                                                        \
+        cublasStatus_t status = (call);                                        \
+        if (status != CUBLAS_STATUS_SUCCESS)                                   \
+            throw std::runtime_error("cuBLAS error");                          \
+    } while (0)
 
 // =============================================================================
 // Batched expert MLP — one GEMM per expert, fused gate+up
@@ -128,7 +154,7 @@ extern "C" void i64_expert_dispatch(
     int32_t expert_inter,
     cudaStream_t stream
 ) {
-    cublasSetStream(handle, stream);
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
 
     const half alpha_h = __float2half(1.0f);
     const half beta_h  = __float2half(0.0f);
@@ -139,19 +165,19 @@ extern "C" void i64_expert_dispatch(
     int32_t max_tokens = 0;
     int32_t h_counts[32];  // Max 32 experts
     int32_t h_offsets[32];
-    cudaMemcpyAsync(h_counts, expert_counts, num_experts * sizeof(int32_t),
-                    cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(h_offsets, expert_offsets, num_experts * sizeof(int32_t),
-                    cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
+    CUDA_CHECK(cudaMemcpyAsync(h_counts, expert_counts, num_experts * sizeof(int32_t),
+                    cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_offsets, expert_offsets, num_experts * sizeof(int32_t),
+                    cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int e = 0; e < num_experts; e++) {
         if (h_counts[e] > max_tokens) max_tokens = h_counts[e];
     }
 
-    cudaMallocAsync(&gate_up_buf, max_tokens * 2 * expert_inter * sizeof(half), stream);
+    CUDA_CHECK(cudaMallocAsync(&gate_up_buf, max_tokens * 2 * expert_inter * sizeof(half), stream));
     half* inter_buf;
-    cudaMallocAsync(&inter_buf, max_tokens * expert_inter * sizeof(half), stream);
+    CUDA_CHECK(cudaMallocAsync(&inter_buf, max_tokens * expert_inter * sizeof(half), stream));
 
     // Process each expert — integer control, float compute
     for (int32_t e = 0; e < num_experts; e++) {
@@ -171,7 +197,7 @@ extern "C" void i64_expert_dispatch(
         // --- FLOAT ZONE START ---
 
         // 1. Gate+Up projection: [count, hidden_dim] @ [hidden_dim, 2*expert_inter]
-        cublasHgemm(handle,
+        CUBLAS_CHECK(cublasHgemm(handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
             2 * expert_inter, count, hidden_dim,
             &alpha_h,
@@ -179,16 +205,17 @@ extern "C" void i64_expert_dispatch(
             tokens_e, hidden_dim,
             &beta_h,
             gate_up_buf, 2 * expert_inter
-        );
+        ));
 
         // 2. SiLU + Hadamard
         const int threads = min(expert_inter, 256);
         i64_silu_hadamard_kernel<<<count, threads, 0, stream>>>(
             gate_up_buf, inter_buf, count, expert_inter
         );
+        CUDA_CHECK_KERNEL();
 
         // 3. Down projection: [count, expert_inter] @ [expert_inter, hidden_dim]
-        cublasHgemm(handle,
+        CUBLAS_CHECK(cublasHgemm(handle,
             CUBLAS_OP_N, CUBLAS_OP_N,
             hidden_dim, count, expert_inter,
             &alpha_h,
@@ -196,11 +223,11 @@ extern "C" void i64_expert_dispatch(
             inter_buf, expert_inter,
             &beta_h,
             output_e, hidden_dim
-        );
+        ));
 
         // --- FLOAT ZONE END ---
     }
 
-    cudaFreeAsync(gate_up_buf, stream);
-    cudaFreeAsync(inter_buf, stream);
+    CUDA_CHECK(cudaFreeAsync(gate_up_buf, stream));
+    CUDA_CHECK(cudaFreeAsync(inter_buf, stream));
 }
