@@ -264,7 +264,7 @@ class I64Server(HelpersMixin, CompletionsMixin, AdminMixin, RAGMixin, AgentMixin
         return app
 
     async def handle_root(self, request: web.Request) -> web.Response:
-        raise web.HTTPFound("https://complexity-website.vercel.app/demo")
+        raise web.HTTPFound("https://complexity-ai.fr/demo")
 
     async def _handle_options(self, request: web.Request) -> web.Response:
         return web.Response()
