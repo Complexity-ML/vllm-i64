@@ -27,11 +27,11 @@ from typing import List, Optional
 # Models to evaluate (in order)
 # ---------------------------------------------------------------------------
 ABLATION_MODELS = [
-    "run1-dense",
     "run2-full",
-    "run3-no-mu",
-    "run4-no-pid",
+    "pacific-tiny-chat",
 ]
+
+CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "ablation-150m")
 
 # Pretrain completion prompts (FineWeb-Edu style — text continuation, not Q&A)
 DEFAULT_PROMPTS = [
@@ -76,9 +76,16 @@ class ModelResult:
 # ---------------------------------------------------------------------------
 
 def start_server(model: str, port: int, dtype: str, no_cuda_graphs: bool) -> subprocess.Popen:
+    # pacific-tiny-chat lives at repo root, ablation runs in CHECKPOINT_DIR
+    candidate = os.path.abspath(os.path.join(CHECKPOINT_DIR, model, "final"))
+    if os.path.isdir(candidate):
+        ckpt = candidate
+    else:
+        ckpt = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", model))
     cmd = [
         sys.executable, "-m", "vllm_i64.cli",
         "serve", model,
+        "--checkpoint", ckpt,
         "--port", str(port),
         "--dtype", dtype,
         "--quantization", "none",
@@ -89,9 +96,8 @@ def start_server(model: str, port: int, dtype: str, no_cuda_graphs: bool) -> sub
     print(f"  Starting server: {' '.join(cmd)}")
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
     )
     return proc
 
@@ -117,6 +123,7 @@ def stop_server(proc: subprocess.Popen):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +139,10 @@ def run_completion(port: int, prompt: str, max_tokens: int, temperature: float) 
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": 0.9,
-        "repetition_penalty": 1.1,
+        "min_p": 0.05,           # match website: cuts improbable tokens
+        "typical_p": 0.92,       # match website: entropy-based filter — kills drift
+        "repetition_penalty": 1.4,
+        "min_tokens": 8,         # match website: no premature EOS
         "stream": False,
     }).encode()
 

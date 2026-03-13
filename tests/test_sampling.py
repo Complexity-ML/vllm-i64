@@ -251,12 +251,14 @@ class TestMinP:
         result = apply_min_p(logits, min_p=0.0)
         assert torch.equal(result, original)
 
-    def test_min_p_one_disables(self):
-        """min_p=1.0 should not modify logits (boundary)."""
-        logits = torch.randn(VOCAB_SIZE)
-        original = logits.clone()
+    def test_min_p_one_keeps_top_only(self):
+        """min_p=1.0 should keep only the top token (threshold = 100% of top prob)."""
+        logits = torch.tensor([10.0, 5.0, 1.0, -1.0, -5.0])
         result = apply_min_p(logits, min_p=1.0)
-        assert torch.equal(result, original)
+        probs = torch.softmax(result, dim=-1)
+        # Only the top token should have non-zero probability
+        assert probs[0] > 0.99
+        assert (result[1:] == float("-inf")).all()
 
     def test_min_p_batch_dimension(self):
         """apply_min_p should handle (batch, vocab_size) tensors."""
@@ -879,11 +881,11 @@ class TestEdgeCases:
         assert torch.equal(result, original)
 
     def test_apply_min_p_exactly_one(self):
-        """min_p=1.0 exactly should be disabled."""
-        logits = torch.randn(VOCAB_SIZE)
-        original = logits.clone()
+        """min_p=1.0 should keep only the top token."""
+        logits = torch.tensor([10.0, 5.0, 1.0, -1.0, -5.0])
         result = apply_min_p(logits, min_p=1.0)
-        assert torch.equal(result, original)
+        assert result[0] == 10.0
+        assert (result[1:] == float("-inf")).all()
 
     def test_apply_min_p_above_one(self):
         """min_p > 1.0 should be disabled (would filter everything)."""

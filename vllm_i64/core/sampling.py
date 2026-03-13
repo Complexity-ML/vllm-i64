@@ -155,7 +155,7 @@ def apply_min_p(logits: torch.Tensor, min_p: float) -> torch.Tensor:
     Returns:
         logits with low-probability tokens masked to -inf
     """
-    if min_p <= 0.0 or min_p >= 1.0:
+    if min_p <= 0.0 or min_p > 1.0:
         return logits
 
     probs = torch.softmax(logits, dim=-1)
@@ -523,6 +523,14 @@ def sample_batch_with_logprobs(
         top_k_values, _ = logits.topk(params.top_k, dim=-1)
         threshold = top_k_values[..., -1:]
         logits[logits < threshold] = float("-inf")
+
+    # Min-p (dynamic threshold relative to top token)
+    if params.min_p > 0.0:
+        logits = apply_min_p(logits, params.min_p)
+
+    # Typical sampling (entropy-based selection)
+    if params.typical_p < 1.0:
+        logits = apply_typical_p(logits, params.typical_p)
 
     # Top-p
     if params.top_p < 1.0:

@@ -84,16 +84,19 @@ class CompletionsMixin:
         created = int(time.time())
         output_ids: List[int] = []
         prev_text = ""
-        last_token_id = None
+        finish_reason = "length"
         ns = self._cache_namespace(api_key)
-        async for token_id in self.async_engine.generate_stream(
+        async for item in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
             cache_namespace=ns,
         ):
-            last_token_id = token_id
-            output_ids.append(token_id)
+            # Engine sends ("__done__", finish_reason) as final sentinel
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__done__":
+                finish_reason = item[1]
+                break
+            output_ids.append(item)
             full_text = self._detokenize(output_ids)
             token_text = full_text[len(prev_text):]
             prev_text = full_text
@@ -101,8 +104,6 @@ class CompletionsMixin:
                 continue
             yield f"data: {json.dumps({'id': stream_id, 'object': 'text_completion', 'created': created, 'model': self.model_name, 'choices': [{'index': 0, 'text': token_text, 'finish_reason': None}]})}\n\n"
 
-        eos_id = getattr(self.tokenizer, 'eos_token_id', None)
-        finish_reason = "stop" if last_token_id is None or (eos_id is not None and last_token_id == eos_id) else "length"
         yield f"data: {json.dumps({'id': stream_id, 'object': 'text_completion', 'created': created, 'model': self.model_name, 'choices': [{'index': 0, 'text': '', 'finish_reason': finish_reason}]})}\n\n"
         yield "data: [DONE]\n\n"
 
@@ -118,17 +119,20 @@ class CompletionsMixin:
 
         output_ids: List[int] = []
         prev_text = ""
-        last_token_id = None
+        finish_reason = "length"
         pixel_values = getattr(request, '_pixel_values', None)
-        async for token_id in self.async_engine.generate_stream(
+        async for item in self.async_engine.generate_stream(
             prompt_token_ids=prompt_ids,
             max_new_tokens=request.max_tokens,
             sampling_params=request.to_sampling_params(tokenizer=self.tokenizer),
             pixel_values=pixel_values,
             cache_namespace=ns,
         ):
-            last_token_id = token_id
-            output_ids.append(token_id)
+            # Engine sends ("__done__", finish_reason) as final sentinel
+            if isinstance(item, tuple) and len(item) == 2 and item[0] == "__done__":
+                finish_reason = item[1]
+                break
+            output_ids.append(item)
             full_text = self._detokenize(output_ids)
             token_text = full_text[len(prev_text):]
             prev_text = full_text
@@ -136,8 +140,6 @@ class CompletionsMixin:
                 continue
             yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'created': created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {'content': token_text}, 'finish_reason': None}]})}\n\n"
 
-        eos_id = getattr(self.tokenizer, 'eos_token_id', None)
-        finish_reason = "stop" if last_token_id is None or (eos_id is not None and last_token_id == eos_id) else "length"
         yield f"data: {json.dumps({'id': stream_id, 'object': 'chat.completion.chunk', 'created': created, 'model': self.model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}]})}\n\n"
         yield "data: [DONE]\n\n"
 

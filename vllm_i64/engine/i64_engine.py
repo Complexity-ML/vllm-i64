@@ -906,7 +906,15 @@ class I64Engine:
                 req_logits = logits[i:i+1]
                 req = _running_index.get(rid)
 
-                # Apply min_tokens: suppress EOS until minimum tokens generated
+                past_tokens = None
+                if params.repetition_penalty != 1.0:
+                    if req is not None:
+                        past_tokens = [req.prompt_list + req.output_token_ids]
+                    else:
+                        past_tokens = [[]]
+
+                # Apply min_tokens AFTER repetition penalty so EOS suppression
+                # is not undone by penalty rescaling
                 if params.min_tokens > 0 and req is not None:
                     eos_id = getattr(req, 'eos_token_id', None)
                     if eos_id is not None:
@@ -914,13 +922,6 @@ class I64Engine:
                         req_logits = apply_min_tokens(
                             req_logits, req.num_generated, params.min_tokens, eos_id
                         )
-
-                past_tokens = None
-                if params.repetition_penalty != 1.0:
-                    if req is not None:
-                        past_tokens = [req.prompt_list + req.output_token_ids]
-                    else:
-                        past_tokens = [[]]
 
                 # Apply logits processors if configured
                 if rid in self._request_processors:
@@ -1059,6 +1060,30 @@ class I64Engine:
                 seq_ids.append(slot)
                 valid_indices.append(i)
             tokens_per_seq = [batch.tokens_per_request[i] for i in valid_indices]
+
+            # Filter batch inputs to match valid KV slots (prevents shape mismatch)
+            if len(valid_indices) < len(batch.request_ids):
+                orig_count = len(batch.request_ids)
+                if len(valid_indices) == 0:
+                    logger.error("No valid KV slots in batch — skipping forward pass")
+                    return torch.zeros(0, self.model.config.vocab_size if hasattr(self.model, 'config') else 1, device=self.device)
+                # Build per-token mask from tokens_per_request
+                valid_set = set(valid_indices)
+                token_mask = []
+                for i, tpr in enumerate(batch.tokens_per_request):
+                    token_mask.extend([i in valid_set] * int(tpr))
+                token_mask = np.array(token_mask, dtype=bool)
+                req_mask = np.array([i in valid_set for i in range(orig_count)], dtype=bool)
+                batch.token_ids = batch.token_ids[token_mask]
+                batch.positions = batch.positions[token_mask]
+                batch.expert_ids = batch.expert_ids[token_mask]
+                batch.request_ids = batch.request_ids[req_mask]
+                batch.is_prefill = batch.is_prefill[req_mask]
+                batch.seq_lens = batch.seq_lens[req_mask]
+                batch.kv_block_table = batch.kv_block_table[req_mask]
+                batch.tokens_per_request = np.array(tokens_per_seq, dtype=batch.tokens_per_request.dtype)
+                logger.warning("Filtered batch from %d to %d requests (missing KV slots)",
+                               orig_count, len(valid_indices))
 
         # CUDA graph for pure decode batches. Now supports KV cache via
         # model.decode_step() which uses tensor-only KV writes (graph-safe).
@@ -1339,7 +1364,7 @@ class AsyncI64Engine:
                 if isinstance(target, asyncio.Future) and not target.done():
                     target.cancel()
                 elif isinstance(target, asyncio.Queue):
-                    await target.put(None)
+                    await target.put(("__done__", "cancelled"))
 
         self._running = False
         if self._engine_task:
@@ -1422,6 +1447,10 @@ class AsyncI64Engine:
                 item = await token_queue.get()
                 if item is None:
                     break
+                if isinstance(item, tuple) and len(item) == 2 and item[0] == "__done__":
+                    # Yield finish_reason as final sentinel
+                    yield item
+                    break
                 yield item
         finally:
             # Cancel engine-side request if still running (e.g. client disconnect)
@@ -1476,7 +1505,7 @@ class AsyncI64Engine:
                                 target.set_exception(RuntimeError("Engine step failed — check server logs"))
                                 self.active_requests -= 1
                             elif isinstance(target, asyncio.Queue):
-                                await target.put(None)
+                                await target.put(("__done__", "error"))
                         self.engine._free_kv_blocks_for(req)
                         self.engine._free_slot(rid)
                         self.engine._request_deadlines.pop(rid, None)
@@ -1545,8 +1574,15 @@ class AsyncI64Engine:
                             target.set_result(result)
                             self.active_requests -= 1
                         elif isinstance(target, asyncio.Queue):
-                            # Signal end to generate_stream; its finally block handles active_requests
-                            await target.put(None)
+                            # Compute finish_reason and pass it through the queue
+                            stream_finish = getattr(req, "_finish_reason", None)
+                            if stream_finish is None:
+                                if req.output_token_ids and req.output_token_ids[-1] == req.eos_token_id:
+                                    stream_finish = "stop"
+                                else:
+                                    stream_finish = "length"
+                            # Signal end with finish_reason tuple
+                            await target.put(("__done__", stream_finish))
                         finished_ids.add(rid)
                     else:
                         # Orphan finished request (no future) — clean it up

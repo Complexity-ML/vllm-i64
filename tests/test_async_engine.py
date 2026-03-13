@@ -79,9 +79,14 @@ async def test_generate_stream():
     engine = AsyncI64Engine(model=None, num_experts=4, vocab_size=100, device="cpu")
     await engine.start()
     tokens = []
-    async for token_id in engine.generate_stream([1, 2], max_new_tokens=4):
-        tokens.append(token_id)
+    finish_reason = None
+    async for item in engine.generate_stream([1, 2], max_new_tokens=4):
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "__done__":
+            finish_reason = item[1]
+            break
+        tokens.append(item)
     assert len(tokens) == 4
+    assert finish_reason == "length"
     await engine.stop()
 
 
