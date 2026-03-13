@@ -342,6 +342,17 @@ register_model(
     description="Ablation: no PID scaler (token-routed + mu only)",
 )
 
+# --- Pacific Tiny Chat (space model) ---
+register_model(
+    name="pacific-tiny-chat",
+    model_class=_COMPLEXITY_DEEP[0],
+    config_loader=_COMPLEXITY_DEEP[1],
+    config_path="C:/INL/pacific-prime/pacific-tiny-chat/config.json",
+    checkpoint="C:/INL/pacific-prime/pacific-tiny-chat",
+    parameters="~170M",
+    description="Pacific Tiny Chat — token-routed i64 (space model)",
+)
+
 # --- Vision-Language Models ---
 
 register_model(
