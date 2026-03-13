@@ -770,24 +770,29 @@ class ComplexityDeepModel(nn.Module):
 
         if is_first_pp_rank():
             hidden = self.embed_tokens(token_ids.long())
+            if self.config.dynamics_cascade_velocity:
+                velocity = velocity_buf if velocity_buf is not None else torch.zeros_like(hidden)
+            else:
+                velocity = None
             mu_prev = None
         else:
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
 
-        # NOTE: velocity is NOT cascaded across layers and NOT persisted across
-        # decode steps.  Each layer independently starts from v=None (→ zeros
-        # inside dynamics).  This matches training where velocity_states=None,
-        # so every layer initialises its own velocity to zero.  (builder.py:144)
+        # Velocity behavior depends on training origin:
+        # - complexity-deep (1.5B+): cascade velocity layer→layer + persist via velocity_buf
+        # - complexity-framework (tiny): each layer starts from v=None (→ zeros)
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            hidden, _layer_velocity, mu_current = layer.decode_step(
-                hidden, positions, None,
+            hidden, velocity, mu_current = layer.decode_step(
+                hidden, positions, velocity,
                 token_ids=token_ids,
                 mu_prev=mu_prev,
                 kv_cache=kv_cache,
                 layer_idx=layer_idx,
                 seq_ids_tensor=seq_ids_tensor,
             )
+            if not self.config.dynamics_cascade_velocity:
+                velocity = None
 
             # Match original training exactly: mu_prev = mu_contextual, no clamp, no residual
             if mu_current is not None:
@@ -795,6 +800,10 @@ class ComplexityDeepModel(nn.Module):
 
         if not is_last_pp_rank():
             raise RuntimeError("decode_step with pipeline parallelism not yet supported")
+
+        # Persist velocity for next decode step (complexity-deep only)
+        if self.config.dynamics_cascade_velocity and velocity_buf is not None:
+            velocity_buf.copy_(velocity)
 
         hidden = self.norm(hidden)
         return self._compute_logits(hidden)
@@ -815,22 +824,22 @@ class ComplexityDeepModel(nn.Module):
         # First stage: embed tokens
         if is_first_pp_rank():
             hidden = self.embed_tokens(token_ids.long())
+            velocity = torch.zeros_like(hidden) if self.config.dynamics_cascade_velocity else None
             mu_prev = None
         else:
             # Receive from previous stage
             assert intermediate_tensors is not None
             hidden = intermediate_tensors["hidden_states"]
+            velocity = intermediate_tensors.get("velocity_states")
             mu_prev = intermediate_tensors.get("mu_prev")
 
-        # Process only our assigned layers
-        # NOTE: velocity is NOT cascaded across layers — each layer starts from
-        # v=None (→ zeros inside dynamics).  This matches the training framework
-        # where velocity_states=None during training, so every layer independently
-        # initialises its own velocity to zero.  (builder.py:144)
+        # Velocity behavior depends on training origin:
+        # - complexity-deep (1.5B+): cascade velocity layer→layer (original training)
+        # - complexity-framework (tiny): each layer starts from v=None (→ zeros)
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
-            hidden, _layer_velocity, mu_current = layer(
-                hidden, positions, None,
+            hidden, velocity, mu_current = layer(
+                hidden, positions, velocity,
                 token_ids=token_ids,
                 mu_prev=mu_prev,
                 kv_cache=kv_cache,
@@ -838,6 +847,8 @@ class ComplexityDeepModel(nn.Module):
                 seq_ids=seq_ids,
                 tokens_per_seq=tokens_per_seq,
             )
+            if not self.config.dynamics_cascade_velocity:
+                velocity = None
 
             # Match original training exactly: mu_prev = mu_contextual, no clamp, no residual
             if mu_current is not None:
@@ -847,6 +858,7 @@ class ComplexityDeepModel(nn.Module):
         if not is_last_pp_rank():
             return IntermediateTensors({
                 "hidden_states": hidden,
+                "velocity_states": velocity,
                 "mu_prev": mu_prev,
             })
 
