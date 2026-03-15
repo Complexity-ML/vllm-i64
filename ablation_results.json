@@ -1,0 +1,114 @@
+[
+  {
+    "model": "run2-full",
+    "results": [
+      {
+        "prompt": "The Eiffel Tower was built in",
+        "response": "1756 by King Charles I and was rebuilt as the tower of King Louis XVI. The Tower had a long roof, with two small towers on top (the tower’s height).\nIn 1657 the Tower was finished, but its growth took only four years after it fell to the original tower building. This structure is still visible today (at 7:20)\n- By 1258 the tower has grown again and was completed, making it one of the oldest tower buildings in France at that time",
+        "latency_ms": 12267.0,
+        "tokens_generated": 102
+      },
+      {
+        "prompt": "In mathematics, a prime number is defined as",
+        "response": "the sum of two numbers.\n- The word \"pure\" uses the same root for any real and mathematical data that a prime...\nHierarchy or rule in education",
+        "latency_ms": 6288.7,
+        "tokens_generated": 37
+      },
+      {
+        "prompt": "The transformer architecture, introduced in the paper 'Attention is All You Need',",
+        "response": "which was the first to be constructed by an a-mation. It's made of copper and aluminum alloys with copper and brass alloying a copper alloy, and it uses 1/8 to 2-1/4 ratio.\nAs its name indicates, this type of transformer, while not quite as impressive, has a higher voltage, which makes it more expensive than steel or iron.\nIt also looks like another ale system. In some models, these are called rectifiers, but the most popular were designed for capacitors (like a capacitor). They have many other features that are, like their battery and battery power, though",
+        "latency_ms": 20971.4,
+        "tokens_generated": 128
+      },
+      {
+        "prompt": "Machine learning is a subfield of artificial intelligence that focuses on",
+        "response": "the ability to learn. The brain's capacity for thinking is related to our innate and social abilities, which are also called learning. Learning requires the same processes as human cognitive capacities, such as memory, concentration, and perception.\n- Psychology: Language Acquisition (Biology)\nThis course explores the intellectual capabilities that develop in language acquisition, using words, spoken words and knowledge acquired by reading and writing; a method which attempts to teach linguistic skills through the use process. This approach introduces learners to a variety of languages including English, German, French, Spanish, Portuguese, Russian, Chinese and others. Students will acquire vocabulary from a range",
+        "latency_ms": 17693.0,
+        "tokens_generated": 128
+      },
+      {
+        "prompt": "The water cycle, also known as the hydrological cycle, describes how",
+        "response": "a system of cycles changes its surroundings. The process by which it is called occurs when one Changes Water (or) from another.\nThis description refers to variations in different places on Earth where similar processes are occurring at varying distances and periods such as those that occur during certain times.",
+        "latency_ms": 8802.3,
+        "tokens_generated": 57
+      },
+      {
+        "prompt": "def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n    if n <= 1:\n",
+        "response": "This is a function of to be written in place (not in place) as x. This was added, but it also was omitted, and this was not included.\nThe length of a digit can change with time from 0-1 or 4-5 = 6; where 4/6 would get '7', 3.4+3 + 10^2 - 2...",
+        "latency_ms": 11584.4,
+        "tokens_generated": 77
+      },
+      {
+        "prompt": "Photosynthesis is the process by which plants convert sunlight into",
+        "response": "water. It takes place on land, and in desert or ocean where plant cells are present to form organic compounds that make photosynthesis.\nFast-moving plants, such as mosses and fern, take place from a top of the soil, creating water vapor and carbon dioxide with its energy required for respiration, making it also the primary food source. Fungi also play an important part during this life stage. The same fungi are responsible for growing plants, but these fungal species grow quickly under their own weight, and can survive when they get too large compared to other organisms like spiders.",
+        "latency_ms": 15725.9,
+        "tokens_generated": 119
+      },
+      {
+        "prompt": "The main difference between supervised and unsupervised learning is that",
+        "response": "it takes less effort, so a more efficient training method. The latter is an important distinction; it requires that the teacher needs to be in order (or).\n1) A learner who learns as a learner or teacher does not need to learn what he/she teaches. It depends on how much skill they have taught. In this case the student will probably also be a learners.\n2) Students are required to get their own skills and knowledge for all of the above (see below). This is usually an education which means the same as learning.\n3) Some students may require extra time for learning (as the example above).",
+        "latency_ms": 17020.5,
+        "tokens_generated": 128
+      }
+    ],
+    "avg_latency_ms": 13794.1,
+    "total_tokens": 776,
+    "errors": 0
+  },
+  {
+    "model": "pacific-tiny-chat",
+    "results": [
+      {
+        "prompt": "The Eiffel Tower was built in",
+        "response": "the same time as the old fort, but there were also many smaller buildings and some of the most impressive monuments. The tower is now a UNESCO World Heritage site with an archaeological heritage, although it has been used for more than 200 years (see www.sfredurl-historyrg).\nMore information on the stone towers can be found here: http://www.theeftirford.com/",
+        "latency_ms": 12767.7,
+        "tokens_generated": 86
+      },
+      {
+        "prompt": "In mathematics, a prime number is defined as",
+        "response": "the sum of two or more numbers.\nA prime is any number in a complex quantity which can be multiplied by three (two) but not only to make up a problem with the first order, but also to make up an integer. If there are many small integers and you have all this information then you need to know how long it takes for your solutions to get too large for that reason. For example:\nThe prime number has a value 0 if its prime was 4; 2 = 5 + 1 because it means that there were 6 steps before 4; 3 = 7, so 9 is 8. So 10, 10 is 5",
+        "latency_ms": 16714.9,
+        "tokens_generated": 128
+      },
+      {
+        "prompt": "The transformer architecture, introduced in the paper 'Attention is All You Need',",
+        "response": "- The 'Stop' is a common name for the type of electricity used on the main line.",
+        "latency_ms": 4959.3,
+        "tokens_generated": 23
+      },
+      {
+        "prompt": "Machine learning is a subfield of artificial intelligence that focuses on",
+        "response": "the ability to think and reason about, both in the sense that they are used as information sources.\nThe same principles apply to all types of education; for example, it may be said that there are two primary schools of knowledge: those who use formal research and those who don more than one means. This can also mean that many things can come from studies like psychology or teaching psychology, but which do not lead directly to higher-level skills such as social work (social study).",
+        "latency_ms": 13497.3,
+        "tokens_generated": 98
+      },
+      {
+        "prompt": "The water cycle, also known as the hydrological cycle, describes how",
+        "response": "to find out what you are looking for and when it is not. The hydrology of a river may be affected by changes in its vegetation or because its flow can vary from deep down through into more flowing streams.\nBody types: In general, we know that fish get their body from sea-coast (sea). So does that they grow on land but there's some areas where they need to work so the wind can't affect them too much. There isn't any way to tell if you're going to see them because they don't come near rivers and lakes because they do have dry conditions like the winter months. This",
+        "latency_ms": 16867.0,
+        "tokens_generated": 128
+      },
+      {
+        "prompt": "def fibonacci(n):\n    \"\"\"Return the nth Fibonacci number.\"\"\"\n    if n <= 1:\n",
+        "response": "The following is a list of numbers that can be used to make the number, but it should also be added as this would lead to more exact numbers. The following are some of the other possible combinations which may help in finding the N and U of words.",
+        "latency_ms": 8475.3,
+        "tokens_generated": 53
+      },
+      {
+        "prompt": "Photosynthesis is the process by which plants convert sunlight into",
+        "response": "energy. The amount of light emitted in a plant depends on how much and whether these molecules are absorbed through photosynthesis or other processes that cause the absorption of food, oxygen (CO).\nIn most living things, photosynthesis results when water becomes less abundant during periods of drought. Plants can absorb many more nutrients than they do from soil. They also absorb some vitamins but have little to no nutritional value. Many different species will produce a variety of fruits for their very life span; however, there's a good reason why this is so important: as long as it stays dry after being used up until a few years old, all leaves remain well dried",
+        "latency_ms": 23391.0,
+        "tokens_generated": 128
+      },
+      {
+        "prompt": "The main difference between supervised and unsupervised learning is that",
+        "response": "the training in both are based on a high level of skill, but they do not have to be trained. Training in these different areas can also vary greatly depending upon the education being taught as well as by the students themselves.\n- The main focus is in learning about how children learn better through their parents' instruction, which comes from training in basic skills such as reading and math knowledge, and with some teaching methods such as reading and writing practice, and it's not uncommon for young people to become involved when developing good oral habits or reading skills.",
+        "latency_ms": 16995.5,
+        "tokens_generated": 111
+      }
+    ],
+    "avg_latency_ms": 14208.5,
+    "total_tokens": 755,
+    "errors": 0
+  }
+]
